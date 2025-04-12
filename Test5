@@ -1,0 +1,45 @@
+<Modal
+  isOpen={!!expandedEntry}
+  onRequestClose={() => setExpandedEntry(null)}
+  contentLabel="Expanded Chat"
+  className="w-full max-w-6xl max-h-[80vh] bg-white rounded-lg shadow-lg p-6 relative outline-none flex flex-col"
+  overlayClassName="fixed inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center"
+>
+  {/* Close Button */}
+  <button
+    onClick={() => setExpandedEntry(null)}
+    className="absolute top-2 right-2 text-gray-500 hover:text-gray-800"
+  >
+    Close
+  </button>
+
+  <h2 className="text-lg font-bold text-gray-800 mb-4">Expanded Chat</h2>
+
+  {/* Scrollable Content */}
+  <div className="flex-1 overflow-y-auto pr-2 space-y-4">
+    <div>
+      <p className="font-semibold text-blue-700 break-words">Q: {expandedEntry?.query}</p>
+    </div>
+    <div>
+      <pre className="whitespace-pre-wrap text-gray-800 break-words">
+        A: {expandedEntry?.response}
+      </pre>
+    </div>
+  </div>
+
+  {/* Actions */}
+  <div className="mt-4 flex justify-end gap-4">
+    <button
+      onClick={() => copyToClipboard(`${expandedEntry.query}\n${expandedEntry.response}`)}
+      className="text-sm text-blue-600 hover:underline"
+    >
+      Copy
+    </button>
+    <button
+      onClick={() => exportEntry(expandedEntry)}
+      className="text-sm text-green-600 hover:underline"
+    >
+      Export
+    </button>
+  </div>
+</Modal>
