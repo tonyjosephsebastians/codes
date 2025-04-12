@@ -1,0 +1,62 @@
+import Modal from 'react-modal';
+
+Modal.setAppElement('#root'); // or your root element
+
+<Modal
+  isOpen={!!expandedEntry}
+  onRequestClose={() => setExpandedEntry(null)}
+  contentLabel="Expanded Chat"
+  className="bg-white rounded-lg shadow-lg p-6 outline-none overflow-hidden"
+  style={{
+    content: {
+      width: '600px',
+      height: '400px',
+      margin: 'auto',
+      inset: 'unset', // disable default top/right/bottom/left
+      padding: 0,
+    },
+    overlay: {
+      backgroundColor: 'rgba(0, 0, 0, 0.5)',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      zIndex: 50,
+    },
+  }}
+>
+  {/* Close Button */}
+  <div className="p-6 relative h-full flex flex-col">
+    <button
+      onClick={() => setExpandedEntry(null)}
+      className="absolute top-2 right-2 text-gray-500 hover:text-gray-800"
+    >
+      Close
+    </button>
+
+    <h2 className="text-lg font-bold text-gray-800 mb-4">Expanded Chat</h2>
+
+    {/* Scrollable content with fixed height */}
+    <div className="flex-1 overflow-y-auto pr-2">
+      <p className="font-semibold text-blue-700 break-words">Q: {expandedEntry?.query}</p>
+      <pre className="whitespace-pre-wrap text-gray-800 break-words">
+        A: {expandedEntry?.response}
+      </pre>
+    </div>
+
+    {/* Footer */}
+    <div className="mt-4 flex justify-end gap-4">
+      <button
+        onClick={() => copyToClipboard(`${expandedEntry.query}\n${expandedEntry.response}`)}
+        className="text-sm text-blue-600 hover:underline"
+      >
+        Copy
+      </button>
+      <button
+        onClick={() => exportEntry(expandedEntry)}
+        className="text-sm text-green-600 hover:underline"
+      >
+        Export
+      </button>
+    </div>
+  </div>
+</Modal>
