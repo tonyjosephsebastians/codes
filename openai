@@ -1,16 +1,37 @@
+import requests
 from azure.identity import DefaultAzureCredential
-from openai import AzureOpenAI
 
-client = AzureOpenAI(
-    api_version="2024-10-21",
-    azure_endpoint="https://<your-endpoint>.openai.azure.com/",
-    azure_deployment="gpt-4",  # try guessing here
-    azure_ad_token_provider=DefaultAzureCredential()
-)
+# Fetch token using DefaultAzureCredential
+credential = DefaultAzureCredential()
+token = credential.get_token("https://cognitiveservices.azure.com/.default")
 
-response = client.chat.completions.create(
-    model="gpt-4",
-    messages=[{"role": "user", "content": "Hello!"}]
-)
+# Your variables
+endpoint = "https://<your-openai-endpoint>.openai.azure.com/"  # Example: "https://my-openai-instance.openai.azure.com/"
+deployment_name = "<your-deployment-name>"  # You MUST know the deployment name
+api_version = "2024-10-21"
+access_token = token.token  # Take token string
 
-print(response.choices[0].message.content)
+# Compose URL
+url = f"{endpoint}openai/deployments/{deployment_name}/chat/completions?api-version={api_version}"
+
+# Compose headers
+headers = {
+    "Authorization": f"Bearer {access_token}",
+    "Content-Type": "application/json"
+}
+
+# Your request body
+data = {
+    "messages": [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Tell me a joke."}
+    ],
+    "temperature": 0.7
+}
+
+# Make the POST request
+response = requests.post(url, headers=headers, json=data)
+
+# Print response
+print(response.status_code)
+print(response.json())
