@@ -1,0 +1,33 @@
+from azure.identity import DefaultAzureCredential
+from azure.ai.openai import OpenAIClient
+from langchain.chat_models import ChatOpenAI
+from langchain.prompts import PromptTemplate
+from langchain.chains import LLMChain
+
+# Set your Azure OpenAI endpoint
+endpoint = "https://<your-openai-resource-name>.openai.azure.com/"  # Replace with your Azure OpenAI endpoint
+
+# Create a DefaultAzureCredential instance to authenticate
+credential = DefaultAzureCredential()
+
+# Create an OpenAI client using the Azure OpenAI endpoint and credential
+client = OpenAIClient(endpoint=endpoint, credential=credential)
+
+# Define the model you want to use (e.g., text-davinci-003, gpt-4)
+model_name = "text-davinci-003"  # Replace with your model name
+
+# Create a LangChain ChatOpenAI instance to interact with the model via Azure OpenAI
+chat_model = ChatOpenAI(client=client, model_name=model_name)
+
+# Define your LangChain prompt and chain
+template = "Tell me something about Azure OpenAI."
+prompt = PromptTemplate(input_variables=["text"], template=template)
+
+# Create a LangChain LLMChain
+llm_chain = LLMChain(llm=chat_model, prompt=prompt)
+
+# Run the chain
+response = llm_chain.run({"text": "Azure OpenAI enables scalable and efficient AI models."})
+
+# Output the result
+print(response)
