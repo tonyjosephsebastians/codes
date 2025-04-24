@@ -114,3 +114,33 @@ const handleChat = async () => {
   </button>
 )}
 
+
+{showRahonaModal && (
+  <div className="fixed inset-0 bg-black bg-opacity-50 flex justify-center items-center z-50">
+    <div className="bg-white rounded-lg p-6 w-full max-w-md shadow-lg relative">
+      <h2 className="text-xl font-semibold mb-4">Rahona File Manager</h2>
+
+      {/* Upload Section */}
+      <input type="file" onChange={handleFileUpload} className="mb-4" />
+
+      {/* File List Section */}
+      <div>
+        <h3 className="font-medium">Uploaded Files</h3>
+        <ul className="list-disc pl-5">
+          {files.map((file, index) => (
+            <li key={index}>{file.name}</li>
+          ))}
+        </ul>
+      </div>
+
+      {/* Close Button */}
+      <button
+        onClick={() => setShowRahonaModal(false)}
+        className="absolute top-2 right-2 text-gray-500 hover:text-gray-800"
+      >
+        ✕
+      </button>
+    </div>
+  </div>
+)}
+
