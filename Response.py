@@ -34,8 +34,33 @@
               <button onClick={() => copytoClipBoard(entry.response)} className="hover:text-green-600">📋 Copy</button>
               <button onClick={() => exportEntry(entry)} className="hover:text-blue-600">📤 Export</button>
               <button onClick={() => setExpandedEntry(entry)} className="hover:text-purple-600">🔍 Expand</button>
+
+
+                             
             </div>
           </div>
+
+                             const cleanMarkdown = (text) => {
+  if (!text) return '';
+
+  let cleaned = String(text)
+    .replace(/^A:\s*/i, '')          // Remove leading 'A:'
+    .replace(/^```+/gm, '')           // Remove triple backticks
+    .replace(/^---+/gm, '')           // Remove lone ---
+    .replace(/^\*\s*$/gm, '')          // Remove lone '*' lines
+    .replace(/^-\s*$/gm, '')           // Remove lone '-' lines
+    .replace(/^>\s*$/gm, '')           // Remove lone '>' blockquotes
+    .trim();
+
+  return cleaned;
+};
+
+
+
+
+
+
+                             
         ))}
       </>
     )}
