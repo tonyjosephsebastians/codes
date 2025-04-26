@@ -1,0 +1,34 @@
+// Add a state at top of your component
+const [sidebarOpen, setSidebarOpen] = useState(false);
+
+// Add this button wherever you want (maybe in your Header)
+<button
+  onClick={() => setSidebarOpen(true)}
+  className="p-2 bg-[#007C41] text-white rounded-md fixed top-4 right-4 z-50"
+>
+  Open Chat
+</button>
+
+// Sidebar
+<div
+  className={`fixed top-[97px] right-0 h-[calc(100%-97px)] bg-[#007C41] w-80 transform transition-transform duration-300 ease-in-out z-40 
+  ${sidebarOpen ? 'translate-x-0' : 'translate-x-full'}`}
+>
+  {/* Close button inside sidebar */}
+  <button
+    onClick={() => setSidebarOpen(false)}
+    className="text-white absolute top-4 right-4"
+  >
+    ✕
+  </button>
+
+  {/* Your existing CharSidebar component */}
+  <CharSidebar 
+    sessions={sessions}
+    OnSelect={({ lang, file }) => {
+      setSelectedLanguage(lang);
+      setSelectedFile(file);
+    }}
+    currentsessionIndex={currentsessionIndex}
+  />
+</div>
