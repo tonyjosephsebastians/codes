@@ -1,0 +1,30 @@
+{/* Toggle button */}
+<button
+  onClick={() => setSidebarOpen(!sidebarOpen)}
+  className="p-2 bg-[#007C41] text-white rounded-md"
+>
+  Chat
+</button>
+
+{/* Sidebar with slide animation */}
+<div
+  className={`fixed top-[97px] right-0 h-[calc(100%-97px)] bg-[#007C41] shadow-lg transform transition-transform duration-300 ease-in-out
+  ${sidebarOpen ? 'translate-x-0' : 'translate-x-full'} w-80 z-50`}
+>
+  <CharSidebar 
+    sessions={sessions}
+    OnSelect={({ lang, file }) => {
+      setSelectedLanguage(lang);
+      setSelectedFile(file);
+    }}
+    currentsessionIndex={currentsessionIndex}
+  />
+</div>
+
+{/* Dark background overlay */}
+{sidebarOpen && (
+  <div
+    onClick={() => setSidebarOpen(false)}
+    className="fixed inset-0 bg-black opacity-50 z-40"
+  ></div>
+)}
