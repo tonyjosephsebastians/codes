@@ -11,3 +11,33 @@
   
   {error && <p className="text-red-500 text-center mt-4">{error}</p>}
 </div>
+
+
+
+
+{/* Chat History */}
+<div className="flex flex-col h-[500px] bg-white rounded-lg overflow-hidden shadow-md">
+  <div className="flex-1 overflow-y-auto p-6 bg-gray-50 space-y-6">
+    {currentsessionIndex && sessions[currentsessionIndex]?.length > 0 && (
+      <>
+        {sessions[currentsessionIndex].map((entry, idx) => (
+          <div key={idx} className="space-y-3">
+            <div className="bg-blue-100 p-4 rounded-md">
+              <p className="text-md font-semibold text-gray-800">{entry.query}</p>
+            </div>
+            <div className="bg-gray-100 p-4 rounded-md">
+              <div className="prose prose-sm max-w-none text-gray-900">
+                <ReactMarkdown>{entry.response}</ReactMarkdown>
+              </div>
+            </div>
+            <div className="flex gap-4 text-gray-600 text-sm">
+              <button onClick={() => copytoClipBoard(entry.response)} className="hover:text-green-600">📋 Copy</button>
+              <button onClick={() => exportEntry(entry)} className="hover:text-blue-600">📤 Export</button>
+              <button onClick={() => setExpandedEntry(entry)} className="hover:text-purple-600">🔍 Expand</button>
+            </div>
+          </div>
+        ))}
+      </>
+    )}
+  </div>
+</div>
