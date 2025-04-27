@@ -132,3 +132,21 @@ const cleanMarkdown = (text) => {
 
   return cleaned.join('\n');
 };
+
+
+
+import { marked } from 'marked';
+import DOMPurify from 'dompurify'; // optional but safer
+
+const renderMarkdown = (markdownText) => {
+  const dirtyHTML = marked.parse(markdownText || '');
+  const cleanHTML = DOMPurify.sanitize(dirtyHTML); // prevent XSS
+  return { __html: cleanHTML };
+};
+
+// In your component:
+<div
+  className="prose prose-sm max-w-none text-gray-900"
+  dangerouslySetInnerHTML={renderMarkdown(entry.response)}
+></div>
+
