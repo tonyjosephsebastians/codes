@@ -88,3 +88,47 @@ const cleanMarkdown = (text) => {
     .filter(line => line.trim() !== '')     // Remove fully empty lines
     .join('\n');                           // Join lines back
 };
+
+
+const cleanMarkdown = (text) => {
+  if (!text) return '';
+
+  const lines = String(text).split('\n');
+
+  let insideCodeBlock = false;
+  const cleaned = [];
+
+  for (let line of lines) {
+    line = line
+      .replace(/^A:\s*/i, '')    // Remove leading 'A:'
+      .replace(/^,+/, '')        // Remove leading commas
+      .replace(/^\*\s*$/, '')    // Remove lone '*'
+      .replace(/^-\s*$/, '')     // Remove lone '-'
+      .replace(/^>\s*$/, '')     // Remove lone '>'
+      .trim();
+
+    if (line === '```') {
+      insideCodeBlock = !insideCodeBlock; // Toggle code block
+      continue; // Remove standalone ```
+    }
+
+    if (line !== '') {
+      cleaned.push(line);
+    }
+  }
+
+  // If code block was opened but not closed, close it
+  if (insideCodeBlock) {
+    cleaned.push('```');
+  }
+
+  // If first line starts weird (like '`' or ','), fix
+  if (cleaned.length > 0) {
+    cleaned[0] = cleaned[0]
+      .replace(/^`+/, '')   // remove leading `
+      .replace(/^,+/, '')   // remove leading ,
+      .trim();
+  }
+
+  return cleaned.join('\n');
+};
