@@ -66,3 +66,25 @@
     )}
   </div>
 </div>
+
+
+
+const cleanMarkdown = (text) => {
+  if (!text) return '';
+
+  return String(text)
+    .split('\n')                          // Split text into lines
+    .map(line =>
+      line
+        .replace(/^A:\s*/i, '')            // Remove 'A:' prefix
+        .replace(/^```+$/g, '')             // Remove '```' lines
+        .replace(/^---+$/g, '')             // Remove '---' lines
+        .replace(/^,+/, '')                // Remove commas at start
+        .replace(/^\*\s*$/g, '')            // Remove lines that are only '*'
+        .replace(/^-\s*$/g, '')             // Remove lines that are only '-'
+        .replace(/^>\s*$/g, '')             // Remove lines that are only '>'
+        .trimStart()                       // Remove leading spaces
+    )
+    .filter(line => line.trim() !== '')     // Remove fully empty lines
+    .join('\n');                           // Join lines back
+};
