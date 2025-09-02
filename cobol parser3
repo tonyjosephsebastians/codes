@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+COBOL backtracker (no copybooks) — robust sentence parser
+
+- Looks in ./cobol for .cbl/.cob/.txt
+- Parses ALL DATA DIVISION level items (not just under FD)
+- Joins multi-line sentences to catch MOVE/COMPUTE/READ/SELECT split across lines
+- Builds declaration tree, DD bindings, assignment deps
+- Writes variables.csv
+- Set QUERY to print backtracks to DD/ASSIGN
+
+Example chain it can produce (from your screenshots):
+ALS-BOOKING-DATE <- NMFMBKDT <- RECORD-51-52-54 <- WS-COMMON-AREA  (DD=INPUT-FILE; ASSIGN=IFILE)
+"""
+
+import os, re, io, csv, glob
+from collections import defaultdict, deque
+
+# ===================== CONFIG =====================
+COBOL_DIR   = os.path.join(os.getcwd(), "cobol")
+OUTPUT_CSV  = os.path.join(os.getcwd(), "variables.csv")
+QUERY       = ""   # e.g. "ALS-BOOKING-DATE"; "" to skip backtrack print
+# ==================================================
+
+# ----------- Helpers ----------
+IDENT = r"[A-Z0-9][A-Z0-9\-]*"
+WS    = r"[ \t]+"      # already quantified
+DOT   = r"\."
+
+# Division & section cues
+RE_DIVISION   = re.compile(rf"\b(IDENTIFICATION|ENVIRONMENT|DATA|PROCEDURE){WS}DIVISION\b", re.I)
+RE_SECTION    = re.compile(rf"\b([A-Z0-9\-]+){WS}SECTION\b", re.I)
+
+# Declarations
+RE_01         = re.compile(rf"^\s*01{WS}({IDENT})\b", re.I)
+RE_LEVEL_ITEM = re.compile(rf"^\s*(\d{{2}}){WS}({IDENT})\b", re.I)
+RE_FD_OR_SD   = re.compile(rf"^\s*(FD|SD){WS}({IDENT})\s*{DOT}", re.I)
+
+# Sentence-level patterns (use \s* for optional spaces, WS for required)
+RE_SELECT_ASSIGN = re.compile(rf"\bSELECT{WS}({IDENT}){WS}ASSIGN{WS}TO{WS}([^\.\n]+){DOT}", re.I)
+RE_READ_INTO     = re.compile(rf"\bREAD{WS}({IDENT})(?:{WS}INTO{WS}({IDENT}))?", re.I)
+RE_MOVE          = re.compile(rf"\bMOVE{WS}(.+?){WS}TO{WS}(.+?){DOT}", re.I)
+RE_COMPUTE       = re.compile(rf"\bCOMPUTE{WS}({IDENT})\s*=\s*(.+?){DOT}", re.I)
+
+def norm(s: str) -> str:
+    return re.sub(r"\s+", "", s.upper()) if isinstance(s, str) else s
+
+def read_text(path: str) -> str:
+    with io.open(path, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
+
+def is_comment_cobol(line: str) -> bool:
+    # fixed-format column 7 '*' or '/' comments, or leading '*'
+    if not line: return False
+    if len(line) >= 7 and line[6] in ('*', '/'): return True
+    if line.lstrip().startswith('*'): return True
+    return False
+
+def strip_inline_cobol(line: str) -> str:
+    # remove inline '*> ...'
+    return re.sub(r"\*\>.*$", "", line)
+
+def ids_in(text: str) -> set[str]:
+    return set(norm(x) for x in re.findall(IDENT, text or "", flags=re.I))
+
+def sentence_stream(text: str):
+    """
+    Yield COBOL sentences by concatenating lines until a terminal period '.'.
+    Ignores comment/blank lines. Leaves inner spaces so regexes can span lines.
+    """
+    buf = []
+    for raw in text.splitlines():
+        line = strip_inline_cobol(raw.rstrip("\n"))
+        if not line.strip() or is_comment_cobol(line):
+            continue
+        buf.append(line.strip())
+        if line.strip().endswith('.'):
+            yield " ".join(buf)
+            buf = []
+    if buf:  # last partial (no period) — still yield for safety
+        yield " ".join(buf)
+
+# ----------- Data store -----------
+class Store:
+    def __init__(self):
+        self.vars = defaultdict(lambda: {
+            "origin_file": None,
+            "defined_at": None,           # (file, line) of first sight/decl
+            "parent_record": None,        # nearest higher-level name
+            "from_dd": set(),             # DDs inferred for this var
+            "assign_target": set(),       # ASSIGN literal(s) for DDs
+        })
+        self.parent_of = {}               # child -> parent
+        self.children  = defaultdict(set) # parent -> children
+        self.level     = {}               # var -> level int (01=1)
+        self.deps      = defaultdict(set) # target -> {sources} via MOVE/COMPUTE
+        self.record_to_dd = {}            # record/buffer -> DD (READ INTO, FD/SD 01)
+        self.dd_assign    = {}            # DD -> ASSIGN literal
+
+    def ensure_var(self, name: str, file: str, line: int):
+        k = norm(name)
+        v = self.vars[k]
+        if v["origin_file"] is None:
+            v["origin_file"] = file
+        if v["defined_at"] is None:
+            v["defined_at"] = (file, line)
+        return k
+
+    def set_parent(self, child: str, parent: str, level: int):
+        c = norm(child); p = norm(parent)
+        self.parent_of[c] = p
+        self.children[p].add(c)
+        self.level[c] = level
+        self.vars[c]["parent_record"] = p
+
+# ----------- COBOL file scanner -----------
+def scan_cobol(path: str, store: Store):
+    text = read_text(path)
+
+    # 1) PASS A: declarations line-by-line (area/levels in DATA DIVISION)
+    current_div = None
+    current_01  = None
+    current_dd  = None
+    stack       = []  # [(level_int, name)]
+
+    for ln, raw in enumerate(text.splitlines(), 1):
+        line = strip_inline_cobol(raw.rstrip("\n"))
+        if not line.strip() or is_comment_cobol(line): continue
+
+        m = RE_DIVISION.search(line)
+        if m:
+            current_div = m.group(1).upper()
+            # Leaving FD/SD context when division changes
+            if current_div != "DATA":
+                current_01 = None; current_dd = None; stack = []
+            continue
+
+        # FD/SD (kept for record_to_dd binding)
+        m = RE_FD_OR_SD.match(line)
+        if m and current_div == "DATA":
+            current_dd = norm(m.group(2))
+            current_01 = None
+            stack = []
+            continue
+
+        # 01 level anywhere in DATA-DIVISION
+        m = RE_01.match(line)
+        if m and current_div == "DATA":
+            current_01 = norm(m.group(1))
+            store.ensure_var(current_01, path, ln)
+            store.level[current_01] = 1
+            stack = [(1, current_01)]
+            # If FD/SD is active, tie this record to that DD
+            if current_dd:
+                store.record_to_dd.setdefault(current_01, current_dd)
+            continue
+
+        # Other level items (02..49)
+        m = RE_LEVEL_ITEM.match(line)
+        if m and current_div == "DATA":
+            lvl = int(m.group(1)); name = norm(m.group(2))
+            store.ensure_var(name, path, ln)
+            # find parent with lower level
+            while stack and stack[-1][0] >= lvl:
+                stack.pop()
+            parent = stack[-1][1] if stack else current_01
+            if parent:
+                store.set_parent(name, parent, lvl)
+            stack.append((lvl, name))
+            continue
+
+    # 2) PASS B: sentence-level parsing (statements may span multiple lines)
+    for sent in sentence_stream(text):
+        # SELECT … ASSIGN …
+        m = RE_SELECT_ASSIGN.search(sent)
+        if m:
+            dd, assign = norm(m.group(1)), m.group(2).strip()
+            store.dd_assign[dd] = assign
+            continue
+
+        # READ DD [INTO buffer]
+        m = RE_READ_INTO.search(sent)
+        if m:
+            dd = norm(m.group(1))
+            into = m.group(2)
+            if into:
+                buf = norm(into)
+                store.ensure_var(buf, path, 0)
+                store.record_to_dd.setdefault(buf, dd)
+            continue
+
+        # MOVE src TO tgt1, tgt2, ...
+        m = RE_MOVE.search(sent)
+        if m:
+            srcs = ids_in(m.group(1))
+            # target list can be space/comma separated; split carefully
+            tgt_raw = m.group(2).strip()
+            tgts = [norm(t) for t in re.split(r"[,\s]+", tgt_raw) if t]
+            for t in tgts:
+                store.ensure_var(t, path, 0)
+                for s in srcs:
+                    store.ensure_var(s, path, 0)
+                    store.deps[t].add(s)
+            continue
+
+        # COMPUTE tgt = expr  (treat expr identifiers as sources)
+        m = RE_COMPUTE.search(sent)
+        if m:
+            tgt = norm(m.group(1))
+            srcs = ids_in(m.group(2))
+            store.ensure_var(tgt, path, 0)
+            for s in srcs:
+                store.ensure_var(s, path, 0)
+                store.deps[tgt].add(s)
+            continue
+
+    # 3) Propagate DDs down any record/buffer tree
+    for rec, dd in list(store.record_to_dd.items()):
+        q = deque([rec]); seen = {rec}
+        while q:
+            cur = q.popleft()
+            store.vars[cur]["from_dd"].add(dd)
+            for ch in store.children.get(cur, []):
+                if ch not in seen:
+                    seen.add(ch); q.append(ch)
+
+    # 4) Inherit parent's DDs & attach ASSIGN literal
+    for var, meta in store.vars.items():
+        p = store.parent_of.get(var)
+        if p:
+            meta["parent_record"] = p
+            for dd in store.vars[p]["from_dd"]:
+                meta["from_dd"].add(dd)
+        for dd in list(meta["from_dd"]):
+            at = store.dd_assign.get(dd)
+            if at: meta["assign_target"].add(at)
+
+# ----------- CSV writer -----------
+def write_csv(store: Store, path: str):
+    with io.open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "variable","origin_file","defined_at","parent_record",
+            "from_dd","assign_target","direct_sources"
+        ])
+        for v, meta in sorted(store.vars.items()):
+            loc = f"{meta['defined_at'][0]}:{meta['defined_at'][1]}" if meta["defined_at"] else ""
+            w.writerow([
+                v,
+                meta.get("origin_file") or "",
+                loc,
+                meta.get("parent_record") or "",
+                ";".join(sorted(meta.get("from_dd", []))) or "",
+                ";".join(sorted(meta.get("assign_target", []))) or "",
+                ";".join(sorted(store.deps.get(v, set()))) or "",
+            ])
+
+# ----------- Backtrack a variable to DD/ASSIGN -----------
+def backtrack(store: Store, varname: str, max_depth: int = 40):
+    start = norm(varname)
+    if start not in store.vars:
+        return [f"{varname}: not found"]
+    q = deque([[start]])
+    seen_edges = set()
+    results = []
+
+    def end_at_dd(v):
+        cur = v; hops = 0
+        while cur and hops <= 16:
+            if store.vars[cur]["from_dd"]:
+                dd = sorted(store.vars[cur]["from_dd"])[0]
+                at = store.dd_assign.get(dd, "")
+                return True, dd, at
+            cur = store.parent_of.get(cur); hops += 1
+        return False, "", ""
+
+    while q:
+        path = q.popleft()
+        cur = path[-1]
+        ok, dd, at = end_at_dd(cur)
+        if ok:
+            results.append((path, dd, at)); continue
+        if len(path) > max_depth: continue
+        for src in sorted(store.deps.get(cur, set())):
+            edge = (cur, src)
+            if edge not in seen_edges:
+                seen_edges.add(edge)
+                q.append(path + [src])
+
+    if not results:
+        return [f"{varname}: no DD/ASSIGN origin found via MOVE/COMPUTE chains."]
+    lines = []
+    for path, dd, at in results:
+        lines.append(f"{'  <-  '.join(path)}    (DD={dd}; ASSIGN={at})")
+    return lines
+
+# ----------- Driver -----------
+def main():
+    store = Store()
+    for path in glob.glob(os.path.join(COBOL_DIR, "**/*"), recursive=True):
+        if os.path.isfile(path) and path.upper().endswith((".CBL",".COB",".TXT")):
+            scan_cobol(path, store)
+
+    write_csv(store, OUTPUT_CSV)
+    print(f"Wrote {OUTPUT_CSV} with {len(store.vars)} variables.")
+
+    if QUERY:
+        print("\nBacktrack:")
+        for line in backtrack(store, QUERY):
+            print(" -", line)
+
+if __name__ == "__main__":
+    main()
