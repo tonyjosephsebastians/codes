@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+cobol_search_table.py — COBOL-only variable search table + query (no COPY inlining).
+
+What it builds
+--------------
+- A CSV table (variables.csv) with columns:
+  variable, parent_record, source_fields, transitive_sources, related_subroutines,
+  logic_fields, from_dd, assign_target, defined_at, origin_file, is_copybook
+
+- A query mode: given --query VAR, it traverses assignments to find
+  input-file variables (fields that belong to an FD/01 record tied to a DD),
+  and prints: variable, parent_record, dd, assign_target, origin_file.
+
+Assumptions (by design)
+-----------------------
+- We DO parse COPY statements in main files to *associate* a DD to a copybook member,
+  but we DO NOT inline. Instead we parse copybook files directly to collect their records/fields.
+- If a main FD contains "COPY XYZ.", we attach DD of that FD to all (record, field) found in copybook XYZ.
+- If main code has "READ INDD INTO SOME-REC", we tie SOME-REC -> INDD too.
+
+Usage
+-----
+python cobol_search_table.py \
+  --src-roots /code/cobol1:/code/cobol2 \
+  --copybook-roots /code/copy1:/code/copy2 \
+  --out variables.csv
+# optional search:
+python cobol_search_table.py --src-roots /code/cobol --copybook-roots /code/copy --out variables.csv --query CUSTOMER-NAME
+"""
+
+from __future__ import annotations
+import argparse, os, re, io, csv, glob, sys
+from collections import defaultdict, deque
+
+# --------------------- helpers
+
+IDENT = r"[A-Z0-9][A-Z0-9\-]*"
+WS = r"[ \t]+"
+DOT = r"\."
+
+def norm(s: str) -> str:
+    return re.sub(r"\s+", "", s.upper())
+
+def read_text(path: str) -> str:
+    with io.open(path, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
+
+def is_comment_cobol(line: str) -> bool:
+    if not line: return False
+    if len(line) >= 7 and line[6] in ('*', '/'):  # fixed-format column 7
+        return True
+    if line.lstrip().startswith('*'):
+        return True
+    return False
+
+def strip_inline_cobol(line: str) -> str:
+    return re.sub(r"\*\>.*$", "", line)
+
+def ids_in(text: str) -> set[str]:
+    return set(norm(x) for x in re.findall(IDENT, text or "", flags=re.I))
+
+# --------------------- regexes
+
+re_copy_stmt      = re.compile(rf"^\s*COPY{WS}+({IDENT})(?:{WS}+REPLACING\b.*)?{DOT}", re.I)
+re_select_assign  = re.compile(rf"\bSELECT{WS}+({IDENT}){WS}+ASSIGN{WS}+TO{WS}+([^\.\n]+){DOT}", re.I)
+re_fd             = re.compile(rf"^\s*FD{WS}+({IDENT})\s*{DOT}", re.I)
+re_sd             = re.compile(rf"^\s*SD{WS}+({IDENT})\s*{DOT}", re.I)
+re_01             = re.compile(rf"^\s*01{WS}+({IDENT})\b", re.I)
+re_level_item     = re.compile(rf"^\s*(\d{{2}}){WS}+({IDENT})\b", re.I)
+re_read_into      = re.compile(rf"\bREAD{WS}+({IDENT})(?:{WS}+INTO{WS}+({IDENT}))?", re.I)
+re_move           = re.compile(rf"\bMOVE{WS}+(.+?){WS}+TO{WS}+(.+?){DOT}", re.I)
+re_compute        = re.compile(rf"\bCOMPUTE{WS}+({IDENT}){WS}*={WS}*(.+?){DOT}", re.I)
+re_call_using     = re.compile(rf"\bCALL{WS}+'([^']+)'{WS}+USING{WS}+(.+?){DOT}", re.I)
+re_if_sentence    = re.compile(rf"\bIF{WS}+(.+?){DOT}", re.I)
+re_division       = re.compile(rf"\b(PROCEDURE|ENVIRONMENT|DATA|IDENTIFICATION){WS}+DIVISION\b", re.I)
+
+# --------------------- data store (hash tables)
+
+class Store:
+    def __init__(self):
+        # variables gathered from both main files and copybooks
+        self.var_meta = defaultdict(lambda: {
+            "parent_record": None,
+            "source_fields": set(),        # direct upstream vars
+            "transitive_sources": set(),   # filled later
+            "related_subroutines": set(),
+            "logic_fields": set(),
+            "from_dd": set(),
+            "assign_target": set(),
+            "defined_at": None,            # (file, line)
+            "origin_file": None,           # file variable was seen in
+            "is_copybook": False,
+        })
+        # record and DD linkages
+        self.record_to_dd: dict[str, str] = {}   # record -> DD
+        self.dd_assign: dict[str, str] = {}      # DD -> ASSIGN target
+        # bookkeeping for FD → COPY relations in main sources
+        self.fd_active_copy_members_by_file = defaultdict(set)  # file -> {copy_members under FD}
+        self.copy_member_to_records = defaultdict(set)          # COPY member -> {01 records}
+        self.copy_member_to_fields  = defaultdict(set)          # COPY member -> {(record, field)}
+        self.copy_member_files = {}                             # member -> file path
+        # dependency edges (target -> {sources}) from MOVE/COMPUTE across all files
+        self.deps = defaultdict(set)
+
+    # registers or updates a variable entry
+    def merge_var(self, vname: str, **updates):
+        key = norm(vname)
+        v = self.var_meta[key]
+        for k, val in updates.items():
+            if k in ("source_fields","transitive_sources","related_subroutines","logic_fields","from_dd","assign_target"):
+                if isinstance(val, (set, list, tuple)):
+                    v[k].update(val)
+                elif isinstance(val, str) and val:
+                    v[k].add(val)
+            elif k in ("defined_at", "origin_file", "is_copybook"):
+                v[k] = val if k != "is_copybook" else bool(val)
+            elif k == "parent_record":
+                if v["parent_record"] is None and val:
+                    v["parent_record"] = norm(val)
+            else:
+                v[k] = val
+
+# --------------------- scan copybooks (separate, no inlining)
+
+def scan_copybook_file(path: str, store: Store):
+    member = norm(os.path.splitext(os.path.basename(path))[0])
+    text = read_text(path)
+    current_record = None
+    in_data = True  # copybooks usually contain data clauses only
+
+    for ln, raw in enumerate(text.splitlines(), 1):
+        line = strip_inline_cobol(raw.rstrip("\n"))
+        if is_comment_cobol(line) or not line.strip():
+            continue
+
+        m = re_01.match(line)
+        if m and in_data:
+            current_record = norm(m.group(1))
+            store.copy_member_to_records[member].add(current_record)
+            continue
+
+        m = re_level_item.match(line)
+        if m and in_data and current_record:
+            data_name = norm(m.group(2))
+            store.copy_member_to_fields[member].add((current_record, data_name))
+            # register the variable with its parent (marked as copybook-origin)
+            store.merge_var(data_name,
+                            parent_record=current_record,
+                            defined_at=(path, ln),
+                            origin_file=path,
+                            is_copybook=True)
+
+    store.copy_member_files[member] = path
+
+# --------------------- scan main COBOL files (no inlining; do map FD <-> COPY)
+
+def scan_main_file(path: str, store: Store):
+    text = read_text(path)
+    in_fd = False
+    current_dd = None
+    current_record = None
+
+    for ln, raw in enumerate(text.splitlines(), 1):
+        line = strip_inline_cobol(raw.rstrip("\n"))
+        if not line.strip() or is_comment_cobol(line):
+            continue
+
+        # SELECT ... ASSIGN TO ...
+        m = re_select_assign.search(line)
+        if m:
+            dd, assign = norm(m.group(1)), m.group(2).strip()
+            store.dd_assign[dd] = assign
+            continue
+
+        # FD/SD start (DD name)
+        m = re_fd.match(line) or re_sd.match(line)
+        if m:
+            in_fd = True
+            current_dd = norm(m.group(1))
+            current_record = None
+            continue
+
+        # COPY member under FD
+        if in_fd:
+            m = re_copy_stmt.match(line)
+            if m:
+                member = norm(m.group(1))
+                store.fd_active_copy_members_by_file[path].add(member)
+                # For every record found in that copybook, tie it to this DD
+                for rec in store.copy_member_to_records.get(member, set()):
+                    store.record_to_dd.setdefault(rec, current_dd)
+                # And for every (record, field) in that copybook, ensure parent and DD
+                for rec, field in store.copy_member_to_fields.get(member, set()):
+                    store.merge_var(field,
+                                    parent_record=rec,
+                                    origin_file=store.copy_member_files.get(member, path),
+                                    is_copybook=True)
+                    # mark DD for that record
+                    store.record_to_dd.setdefault(rec, current_dd)
+                continue
+
+        # 01 record under FD in main (rare if using copybook, but supported)
+        m = re_01.match(line)
+        if m and in_fd:
+            current_record = norm(m.group(1))
+            # If we have a current DD, tie the record to DD
+            if current_dd:
+                store.record_to_dd.setdefault(current_record, current_dd)
+            continue
+
+        # Level items under FD (explicit fields declared in main file)
+        m = re_level_item.match(line)
+        if m and in_fd and current_record:
+            data_name = norm(m.group(2))
+            store.merge_var(data_name,
+                            parent_record=current_record,
+                            defined_at=(path, ln),
+                            origin_file=path,
+                            is_copybook=False)
+            continue
+
+        # READ DD INTO record
+        m = re_read_into.search(line)
+        if m:
+            dd = norm(m.group(1))
+            into = m.group(2)
+            if into:
+                rec = norm(into)
+                store.record_to_dd.setdefault(rec, dd)
+            continue
+
+        # MOVE src TO tgt1 tgt2 ...
+        m = re_move.search(line)
+        if m:
+            src_expr = m.group(1).strip()
+            src_ids = ids_in(src_expr)
+            tgts = [norm(t) for t in re.split(r"[,\s]+", m.group(2).strip()) if t]
+            for t in tgts:
+                store.merge_var(t, defined_at=(path, ln), origin_file=path)
+                store.var_meta[t]["source_fields"].update(src_ids)
+                for s in src_ids:
+                    store.deps[t].add(norm(s))
+            continue
+
+        # COMPUTE tgt = expr
+        m = re_compute.search(line)
+        if m:
+            tgt = norm(m.group(1))
+            expr = m.group(2).strip()
+            src_ids = ids_in(expr)
+            store.merge_var(tgt, defined_at=(path, ln), origin_file=path)
+            store.var_meta[tgt]["source_fields"].update(src_ids)
+            store.var_meta[tgt]["logic_fields"].update(src_ids)
+            for s in src_ids:
+                store.deps[tgt].add(norm(s))
+            continue
+
+        # CALL 'sub' USING a b c
+        m = re_call_using.search(line)
+        if m:
+            sub = m.group(1)
+            using_vars = [norm(x) for x in re.findall(IDENT, m.group(2), flags=re.I)]
+            for v in using_vars:
+                store.var_meta[v]["related_subroutines"].add(sub)
+                # keep origin_file if already set; don't override
+            continue
+
+        # IF ... . attach condition vars as logic fields to any targets on same line
+        m = re_if_sentence.search(line)
+        if m:
+            cond_vars = ids_in(m.group(1))
+            mm = re_move.search(line)
+            if mm:
+                tgts = [norm(t) for t in re.split(r"[,\s]+", mm.group(2).strip()) if t]
+                for t in tgts:
+                    store.var_meta[t]["logic_fields"].update(cond_vars)
+            mc = re_compute.search(line)
+            if mc:
+                t = norm(mc.group(1))
+                store.var_meta[t]["logic_fields"].update(cond_vars)
+            continue
+
+        # Leave FD on PROCEDURE DIVISION
+        if re_division.search(line):
+            in_fd = False
+
+# --------------------- resolution
+
+def propagate_sources(store: Store, max_depth: int = 6):
+    # Fill transitive_sources by following deps (target -> sources)
+    for target in list(store.var_meta.keys()):
+        seen = set()
+        out = set()
+        q = deque([(norm(target), 0)])
+        while q:
+            cur, d = q.popleft()
+            if d >= max_depth: continue
+            for s in store.deps.get(cur, set()):
+                if s not in seen:
+                    seen.add(s)
+                    out.add(s)
+                    q.append((s, d+1))
+        store.var_meta[norm(target)]["transitive_sources"].update(out)
+
+def bind_dds_to_vars(store: Store):
+    # If a var has a parent_record tied to a DD, add that DD and assign_target
+    for vname, meta in store.var_meta.items():
+        parent = meta.get("parent_record")
+        if parent:
+            dd = store.record_to_dd.get(norm(parent))
+            if dd:
+                meta["from_dd"].add(dd)
+                at = store.dd_assign.get(dd)
+                if at: meta["assign_target"].add(at)
+
+# --------------------- query: find input-file variables for a given variable
+
+def find_input_sources(store: Store, varname: str, max_depth: int = 10):
+    """
+    Trace upstream dependencies from 'varname' until we reach variables whose parent_record is
+    tied to a DD. Return a list of dicts describing those input fields.
+    """
+    start = norm(varname)
+    results = []
+    seen = set([start])
+    q = deque([start])
+
+    def is_input_field(vk: str) -> tuple[bool, str|None, str|None]:
+        meta = store.var_meta.get(vk)
+        if not meta: return (False, None, None)
+        parent = meta.get("parent_record")
+        if not parent: return (False, None, None)
+        dd = store.record_to_dd.get(norm(parent))
+        if not dd: return (False, None, None)
+        assign = store.dd_assign.get(dd)
+        return (True, dd, assign)
+
+    while q:
+        cur = q.popleft()
+        ok, dd, assign = is_input_field(cur)
+        if ok:
+            meta = store.var_meta.get(cur, {})
+            results.append({
+                "variable": cur,
+                "parent_record": meta.get("parent_record"),
+                "dd": dd,
+                "assign_target": assign or "",
+                "origin_file": meta.get("origin_file") or "",
+            })
+            # do not expand beyond input field
+            continue
+        for src in store.deps.get(cur, set()) | store.var_meta.get(cur, {}).get("source_fields", set()):
+            s = norm(src)
+            if s not in seen:
+                seen.add(s)
+                if len(seen) <= 10000:  # simple guard
+                    q.append(s)
+    # de-dup on (variable,parent_record,dd)
+    uniq = {}
+    for r in results:
+        key = (r["variable"], r["parent_record"], r["dd"])
+        uniq[key] = r
+    return list(uniq.values())
+
+# --------------------- CSV
+
+def write_csv(store: Store, out_path: str):
+    rows = []
+    for vname, meta in sorted(store.var_meta.items()):
+        dloc = f"{meta['defined_at'][0]}:{meta['defined_at'][1]}" if meta['defined_at'] else ""
+        rows.append([
+            vname,
+            meta.get("parent_record") or "",
+            ";".join(sorted(meta.get("source_fields", set()))) or "",
+            ";".join(sorted(meta.get("transitive_sources", set()))) or "",
+            ";".join(sorted(meta.get("related_subroutines", set()))) or "",
+            ";".join(sorted(meta.get("logic_fields", set()))) or "",
+            ";".join(sorted(meta.get("from_dd", set()))) or "",
+            ";".join(sorted(meta.get("assign_target", set()))) or "",
+            dloc,
+            meta.get("origin_file") or "",
+            "yes" if meta.get("is_copybook") else "no",
+        ])
+    with io.open(out_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["variable","parent_record","source_fields","transitive_sources",
+                    "related_subroutines","logic_fields","from_dd","assign_target",
+                    "defined_at","origin_file","is_copybook"])
+        for r in rows: w.writerow(r)
+
+# --------------------- loader
+
+def scan_copybook_roots(copy_roots: list[str], store: Store):
+    for root in (copy_roots or []):
+        for path in glob.glob(os.path.join(root, "**/*"), recursive=True):
+            if os.path.isfile(path) and path.upper().endswith((".CPY", ".CBL", ".COB", ".COBOL", ".CPB", ".TXT")):
+                try:
+                    scan_copybook_file(path, store)
+                except Exception:
+                    pass
+
+def scan_src_roots(src_roots: list[str], store: Store):
+    for root in (src_roots or []):
+        for path in glob.glob(os.path.join(root, "**/*"), recursive=True):
+            if os.path.isfile(path) and path.upper().endswith((".CBL", ".COB", ".COBOL", ".TXT")):
+                try:
+                    scan_main_file(path, store)
+                except Exception:
+                    pass
+
+# --------------------- main
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="COBOL search table + variable query (no COPY inlining).")
+    ap.add_argument("--src-roots", required=True, help="Colon-separated roots of COBOL sources")
+    ap.add_argument("--copybook-roots", default=None, help="Colon-separated roots of COPY books")
+    ap.add_argument("--out", required=True, help="Output CSV path")
+    ap.add_argument("--query", default=None, help="Variable to trace back to input fields")
+    args = ap.parse_args(argv)
+
+    src_roots = args.src_roots.split(":")
+    copy_roots = args.copybook_roots.split(":") if args.copybook_roots else []
+
+    store = Store()
+    # Parse copybooks first so main files can bind FD->COPY member->(record,fields)
+    scan_copybook_roots(copy_roots, store)
+    scan_src_roots(src_roots, store)
+
+    # Bind DDs/ASSIGNs and propagate sources
+    bind_dds_to_vars(store)
+    propagate_sources(store, max_depth=6)
+
+    write_csv(store, args.out)
+
+    if args.query:
+        hits = find_input_sources(store, args.query, max_depth=10)
+        if not hits:
+            print(f"No input-field sources found for variable '{args.query}'.")
+            sys.exit(0)
+        print("Input sources for", args.query)
+        for h in hits:
+            print(f"- {h['variable']}  (record={h['parent_record']}, dd={h['dd']}, assign={h['assign_target']}, from={h['origin_file']})")
+
+if __name__ == "__main__":
+    main()
