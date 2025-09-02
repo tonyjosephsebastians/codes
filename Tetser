@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+COBOL backtracker (no copybooks)
+
+- Put COBOL files in ./cobol (.cbl/.cob/.txt)
+- Builds variables.csv
+- Set QUERY to print a backtrack to the input DD / ASSIGN target
+"""
+
+import os, re, io, csv, glob
+from collections import defaultdict, deque
+
+# ===================== CONFIG =====================
+COBOL_DIR   = os.path.join(os.getcwd(), "cobol")
+OUTPUT_CSV  = os.path.join(os.getcwd(), "variables.csv")
+QUERY       = "ALS-BOOKING-DATE"   # e.g. "ALS-BOOKING-DATE"; "" to skip
+# ==================================================
+
+# ----------- Helpers / regex ----------
+IDENT = r"[A-Z0-9][A-Z0-9\-]*"
+WS    = r"[ \t]+"     # SINGLE quantifier here; do NOT add another '+' in patterns
+DOT   = r"\."
+
+# NOTE: use {WS} (not {WS}+), since WS already ends with '+'
+re_select_assign = re.compile(rf"\bSELECT{WS}({IDENT}){WS}ASSIGN{WS}TO{WS}([^\.\n]+){DOT}", re.I)
+re_fd_or_sd      = re.compile(rf"^\s*(FD|SD){WS}({IDENT})\s*{DOT}", re.I)
+re_01            = re.compile(rf"^\s*01{WS}({IDENT})\b", re.I)
+re_level_item    = re.compile(rf"^\s*(\d{{2}}){WS}({IDENT})\b", re.I)
+re_read_into     = re.compile(rf"\bREAD{WS}({IDENT})(?:{WS}INTO{WS}({IDENT}))?", re.I)
+re_move          = re.compile(rf"\bMOVE{WS}(.+?){WS}TO{WS}(.+?){DOT}", re.I)
+re_compute       = re.compile(rf"\bCOMPUTE{WS}({IDENT}){WS}*={WS}*(.+?){DOT}", re.I)
+re_division      = re.compile(rf"\b(PROCEDURE|ENVIRONMENT|DATA|IDENTIFICATION){WS}DIVISION\b", re.I)
+
+def norm(s: str) -> str:
+    return re.sub(r"\s+", "", s.upper()) if isinstance(s, str) else s
+
+def read_text(path: str) -> str:
+    with io.open(path, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
+
+def is_comment_cobol(line: str) -> bool:
+    if not line: return False
+    if len(line) >= 7 and line[6] in ('*', '/'):  # fixed-format column 7
+        return True
+    if line.lstrip().startswith('*'):
+        return True
+    return False
+
+def strip_inline_cobol(line: str) -> str:
+    return re.sub(r"\*\>.*$", "", line)  # drop *> comments
+
+def ids_in(text: str) -> set[str]:
+    return set(norm(x) for x in re.findall(IDENT, text or "", flags=re.I))
+
+# ----------- Data store -----------
+class Store:
+    def __init__(self):
+        self.vars = defaultdict(lambda: {
+            "origin_file": None,
+            "defined_at": None,           # (file, line)
+            "parent_record": None,
+            "from_dd": set(),
+            "assign_target": set(),
+        })
+        self.parent_of = {}               # child -> parent
+        self.children  = defaultdict(set) # parent -> children
+        self.level     = {}               # var -> level int
+        self.deps      = defaultdict(set) # target -> {sources}
+        self.record_to_dd = {}            # record/buffer -> DD
+        self.dd_assign    = {}            # DD -> ASSIGN literal
+
+    def ensure_var(self, name: str, file: str, line: int):
+        k = norm(name)
+        v = self.vars[k]
+        if v["origin_file"] is None:
+            v["origin_file"] = file
+        if v["defined_at"] is None:
+            v["defined_at"] = (file, line)
+        return k
+
+    def set_parent(self, child: str, parent: str, level: int):
+        c = norm(child); p = norm(parent)
+        self.parent_of[c] = p
+        self.children[p].add(c)
+        self.level[c] = level
+        self.vars[c]["parent_record"] = p
+
+# ----------- COBOL scanner -----------
+def scan_cobol(path: str, store: Store):
+    text = read_text(path)
+    in_data_div = False
+    in_fd = False
+    current_01 = None
+    current_dd = None
+    stack = []
+
+    for ln, raw in enumerate(text.splitlines(), 1):
+        line = strip_inline_cobol(raw.rstrip("\n"))
+        if not line.strip() or is_comment_cobol(line):
+            continue
+
+        # DIVISIONS
+        m = re_division.search(line)
+        if m:
+            div = m.group(1).upper()
+            in_data_div = (div == "DATA")
+            if not in_data_div:
+                in_fd = False
+            continue
+
+        # SELECT ... ASSIGN TO ...
+        m = re_select_assign.search(line)
+        if m:
+            dd, assign = norm(m.group(1)), m.group(2).strip()
+            store.dd_assign[dd] = assign
+            continue
+
+        # FD/SD start
+        m = re_fd_or_sd.match(line)
+        if m:
+            in_fd = True
+            current_dd = norm(m.group(2))
+            current_01 = None
+            stack = []
+            continue
+
+        # 01 level
+        m = re_01.match(line)
+        if m and in_fd:
+            current_01 = norm(m.group(1))
+            store.ensure_var(current_01, path, ln)
+            store.level[current_01] = 1
+            stack = [(1, current_01)]
+            if current_dd:
+                store.record_to_dd.setdefault(current_01, current_dd)
+            continue
+
+        # 02..49
+        m = re_level_item.match(line)
+        if m and in_fd:
+            lvl = int(m.group(1))
+            name = norm(m.group(2))
+            store.ensure_var(name, path, ln)
+            while stack and stack[-1][0] >= lvl:
+                stack.pop()
+            parent = stack[-1][1] if stack else current_01
+            if parent:
+                store.set_parent(name, parent, lvl)
+            stack.append((lvl, name))
+            continue
+
+        # READ DD [INTO buffer]
+        m = re_read_into.search(line)
+        if m:
+            dd = norm(m.group(1))
+            into = m.group(2)
+            if into:
+                buf = norm(into)
+                store.ensure_var(buf, path, ln)
+                store.record_to_dd.setdefault(buf, dd)
+            continue
+
+        # MOVE src TO tgt1,tgt2...
+        m = re_move.search(line)
+        if m:
+            srcs = ids_in(m.group(1))
+            tgts = [norm(t) for t in re.split(r"[,\s]+", m.group(2).strip()) if t]
+            for t in tgts:
+                store.ensure_var(t, path, ln)
+                for s in srcs:
+                    store.ensure_var(s, path, ln)
+                    store.deps[t].add(s)
+            continue
+
+        # COMPUTE tgt = expr
+        m = re_compute.search(line)
+        if m:
+            tgt = norm(m.group(1))
+            srcs = ids_in(m.group(2))
+            store.ensure_var(tgt, path, ln)
+            for s in srcs:
+                store.ensure_var(s, path, ln)
+                store.deps[tgt].add(s)
+            continue
+
+    # propagate DDs down the record tree
+    for rec, dd in list(store.record_to_dd.items()):
+        q = deque([rec]); seen = {rec}
+        while q:
+            cur = q.popleft()
+            store.vars[cur]["from_dd"].add(dd)
+            for ch in store.children.get(cur, []):
+                if ch not in seen:
+                    seen.add(ch); q.append(ch)
+
+    # inherit parent's DDs & assign target
+    for var, meta in store.vars.items():
+        p = store.parent_of.get(var)
+        if p:
+            meta["parent_record"] = p
+            for dd in store.vars[p]["from_dd"]:
+                meta["from_dd"].add(dd)
+        for dd in list(meta["from_dd"]):
+            at = store.dd_assign.get(dd)
+            if at: meta["assign_target"].add(at)
+
+# ----------- CSV writer -----------
+def write_csv(store: Store, path: str):
+    with io.open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["variable","origin_file","defined_at","parent_record","from_dd","assign_target","direct_sources"])
+        for v, meta in sorted(store.vars.items()):
+            loc = f"{meta['defined_at'][0]}:{meta['defined_at'][1]}" if meta["defined_at"] else ""
+            w.writerow([
+                v,
+                meta.get("origin_file") or "",
+                loc,
+                meta.get("parent_record") or "",
+                ";".join(sorted(meta.get("from_dd", []))) or "",
+                ";".join(sorted(meta.get("assign_target", []))) or "",
+                ";".join(sorted(store.deps.get(v, set()))) or "",
+            ])
+
+# ----------- Backtrack -----------
+def backtrack(store: Store, varname: str, max_depth: int = 20):
+    start = norm(varname)
+    if start not in store.vars:
+        return [f"{varname}: not found"]
+    out_lines = []
+    q = deque([[start]])
+    seen_edges = set()
+
+    def end_at_dd(v):
+        cur = v; hops = 0
+        while cur and hops <= 8:
+            if store.vars[cur]["from_dd"]:
+                dd = sorted(store.vars[cur]["from_dd"])[0]
+                at = store.dd_assign.get(dd, "")
+                return True, dd, at
+            cur = store.parent_of.get(cur); hops += 1
+        return False, "", ""
+
+    results = []
+    while q:
+        path = q.popleft()
+        cur = path[-1]
+        ok, dd, at = end_at_dd(cur)
+        if ok:
+            results.append((path, dd, at))
+            continue
+        if len(path) > max_depth:
+            continue
+        for src in sorted(store.deps.get(cur, set())):
+            edge = (cur, src)
+            if edge not in seen_edges:
+                seen_edges.add(edge)
+                q.append(path + [src])
+
+    if not results:
+        return [f"{varname}: no DD/ASSIGN origin found."]
+    for path, dd, at in results:
+        out_lines.append(f"{'  <-  '.join(path)}    (DD={dd}; ASSIGN={at})")
+    return out_lines
+
+# ----------- Driver -----------
+def main():
+    store = Store()
+    for path in glob.glob(os.path.join(COBOL_DIR, "**/*"), recursive=True):
+        if os.path.isfile(path) and path.upper().endswith((".CBL",".COB",".TXT")):
+            scan_cobol(path, store)
+
+    write_csv(store, OUTPUT_CSV)
+    print(f"Wrote {OUTPUT_CSV} with {len(store.vars)} variables.")
+
+    if QUERY:
+        print("\nBacktrack:")
+        for line in backtrack(store, QUERY):
+            print(" -", line)
+
+if __name__ == "__main__":
+    main()
