@@ -1,0 +1,84 @@
+def query_sources(store, varname, max_paths=50, max_depth=50):
+    """
+    Backtrace `varname` via MOVE/COMPUTE deps to all variables
+    tied to an input DD. Returns a list of dicts:
+
+    {
+      "target": "<your var>",
+      "path":   ["ALS-BOOKING-DATE", "NMFMBKDT", "RECORD-51-52-54", "WS-COMMON-AREA"],
+      "input_node": "WS-COMMON-AREA",        # node where DD was found
+      "input_record": "RECORD-51-52-54",     # nearest record ancestor
+      "dd": "INPUT-FILE",
+      "assign": "IFILE",
+      "files_in_path": [".../ALS1010.txt", ...]
+    }
+    """
+    start = norm(varname)
+    if start not in store.vars:
+        return []
+
+    results = []
+    q = deque([[start]])
+    seen_edges = set()
+
+    def at_dd(v):
+        cur = v; hops = 0
+        while cur and hops <= 20:
+            if store.vars[cur]["from_dd"]:
+                dd = sorted(store.vars[cur]["from_dd"])[0]
+                at = store.dd_assign.get(dd, "")
+                return cur, dd, at
+            cur = store.parent_of.get(cur); hops += 1
+        return None, None, None
+
+    def record_ancestor(node):
+        cur = node; hops = 0
+        while cur and hops <= 20:
+            if store.children.get(cur):
+                return cur
+            cur = store.parent_of.get(cur); hops += 1
+        return None
+
+    while q and len(results) < max_paths:
+        path = q.popleft()
+        cur = path[-1]
+
+        anc, dd, assign = at_dd(cur)
+        if dd:
+            input_record = record_ancestor(anc) or anc
+            files = []
+            for v in path:
+                of = store.vars.get(v, {}).get("origin_file")
+                if of and of not in files:
+                    files.append(of)
+            results.append({
+                "target": start,
+                "path": path[:],
+                "input_node": anc,
+                "input_record": input_record,
+                "dd": dd,
+                "assign": assign or "",
+                "files_in_path": files
+            })
+            continue
+
+        if len(path) < max_depth:
+            for src in sorted(store.deps.get(cur, set())):
+                edge = (cur, src)
+                if edge not in seen_edges:
+                    seen_edges.add(edge)
+                    q.append(path + [src])
+
+    return results
+
+
+def format_query_results(results):
+    if not results:
+        return "No input-file origin found."
+    lines = []
+    for r in results:
+        chain = " <- ".join(r["path"])
+        lines.append(
+            f"{chain}  (DD={r['dd']}; ASSIGN={r['assign']}; INPUT-NODE={r['input_node']}; INPUT-RECORD={r['input_record']})"
+        )
+    return "\n".join(lines)
