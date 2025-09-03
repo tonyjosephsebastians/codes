@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Build PROC/JCL/SAS search index tables, then backtrace COBOL (from variables.csv)
+and extend the final results with dataset information found in those indexes.
+
+Outputs:
+  - procs_index.csv
+  - jcl_index.csv
+  - sas_index.csv
+  - enhanced_backtrace.csv   (one row per backtrace leaf with appended JCL/PROC/SAS info)
+"""
+
+import os, re, csv, io, glob
+from collections import defaultdict
+
+# ---------- Locations ----------
+BASE         = os.getcwd()
+CSV_VARS     = os.path.join(BASE, "variables.csv")    # produced by your COBOL parser
+PROC_DIR     = os.path.join(BASE, "proc")
+JCL_DIR      = os.path.join(BASE, "jcl")
+SAS_DIR      = os.path.join(BASE, "sas")
+
+OUT_PROCS    = os.path.join(BASE, "procs_index.csv")
+OUT_JCL      = os.path.join(BASE, "jcl_index.csv")
+OUT_SAS      = os.path.join(BASE, "sas_index.csv")
+OUT_ENHANCED = os.path.join(BASE, "enhanced_backtrace.csv")
+
+# ---------- Helpers ----------
+IDENT = r"[A-Z0-9][A-Z0-9\-_]*"
+
+def norm(s: str) -> str:
+    return re.sub(r"\s+", "", s.upper()) if isinstance(s, str) else s
+
+def read_text(path: str) -> str:
+    with io.open(path, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
+
+def lines(path: str):
+    for i, raw in enumerate(read_text(path).splitlines(), 1):
+        yield i, raw.rstrip("\n")
+
+def kv_from_dd_tail(tail: str) -> dict:
+    """
+    Pull common JCL DD keywords from the tail part after 'DD'.
+    Example: "DSN=ABC.X, DISP=SHR, DCB=(RECFM=FB,LRECL=185)"
+    """
+    d = {}
+    # simple key=value pairs
+    for key in ["DSN", "DISP", "UNIT", "SPACE", "VOL"]:
+        m = re.search(rf"\b{key}\s*=\s*([^,]+)", tail, re.I)
+        if m:
+            d[key] = m.group(1).strip()
+    # DCB nested fields
+    m = re.search(r"DCB\s*=\s*\(([^)]*)\)", tail, re.I)
+    if m:
+        dcb = m.group(1)
+        for key in ["RECFM","LRECL","BLKSIZE"]:
+            m2 = re.search(rf"\b{key}\s*=\s*([A-Z0-9]+)", dcb, re.I)
+            if m2:
+                d[key] = m2.group(1)
+    return d
+
+# ============================================================
+# 1) PROC / JCL indexers (same grammar; we still write two CSVs)
+# ============================================================
+RE_EXEC  = re.compile(rf"^\s*//({IDENT})?\s*EXEC\b\s+([A-Z0-9=,()]+)", re.I)
+RE_DD    = re.compile(rf"^\s*//({IDENT})\s+DD\b\s+(.*)$", re.I)
+
+def index_jcl_like(src_dir: str, out_csv: str):
+    rows = []
+    for path in glob.glob(os.path.join(src_dir, "**/*"), recursive=True):
+        if not os.path.isfile(path): continue
+        if not path.upper().endswith((".JCL",".PROC",".PRC",".TXT",".CNTL",".CNTLJCL",".CNTLPROC",".CNTLPRC",".CNTL.TXT")):
+            # be permissive: txt in that folder counts
+            if os.path.basename(src_dir).lower() not in ("jcl","proc"): 
+                continue
+        step = ""
+        proc_or_pgm = ""
+        for ln, line in lines(path):
+            # ignore comment //*
+            if line.strip().startswith("//*"): 
+                continue
+            m = RE_EXEC.match(line)
+            if m:
+                step = (m.group(1) or "").upper()
+                proc_or_pgm = m.group(2).upper()
+                continue
+            m = RE_DD.match(line)
+            if m:
+                dd = m.group(1).upper()
+                tail = m.group(2)
+                kv = kv_from_dd_tail(tail)
+                rows.append({
+                    "file": path,
+                    "line": ln,
+                    "step": step,
+                    "exec": proc_or_pgm,
+                    "ddname": dd,
+                    "dsn": kv.get("DSN",""),
+                    "disp": kv.get("DISP",""),
+                    "recfm": kv.get("RECFM",""),
+                    "lrecl": kv.get("LRECL",""),
+                    "blksize": kv.get("BLKSIZE",""),
+                    "raw": tail.strip()
+                })
+    with io.open(out_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["file","line","step","exec","ddname","dsn","disp","recfm","lrecl","blksize","raw"])
+        w.writeheader()
+        for r in rows: w.writerow(r)
+    return rows
+
+# =======================
+# 2) SAS indexer
+# =======================
+RE_DATA_STEP  = re.compile(rf"\bDATA\s+({IDENT})(?:\s*;)?", re.I)
+RE_INFILE     = re.compile(rf"\bINFILE\s+({IDENT})(?:\s+[^;]*)?;", re.I)
+RE_FILE       = re.compile(rf"\bFILE\s+({IDENT})(?:\s+[^;]*)?;", re.I)
+RE_MERGE      = re.compile(rf"\bMERGE\s+(.+?);", re.I)  # we’ll split by spaces later
+RE_SET        = re.compile(rf"\bSET\s+(.+?);", re.I)
+
+def index_sas(src_dir: str, out_csv: str):
+    rows = []
+    for path in glob.glob(os.path.join(src_dir, "**/*"), recursive=True):
+        if not os.path.isfile(path): continue
+        if not path.upper().endswith((".SAS",".TXT",".INC",".SRC",".PGM",".JOB")):
+            continue
+        current_data = ""
+        txt = read_text(path)
+        # Simple pass: line by line; we don't need to reconstruct long statements here
+        for ln, line in lines(path):
+            m = RE_DATA_STEP.search(line)
+            if m:
+                current_data = m.group(1).upper()
+            inf = RE_INFILE.search(line)
+            if inf:
+                rows.append({
+                    "file": path, "line": ln,
+                    "data_step": current_data,
+                    "kind": "INFILE",
+                    "handle_or_ds": inf.group(1).upper(),
+                    "raw": line.strip()
+                })
+            out = RE_FILE.search(line)
+            if out:
+                rows.append({
+                    "file": path, "line": ln,
+                    "data_step": current_data,
+                    "kind": "FILE",
+                    "handle_or_ds": out.group(1).upper(),
+                    "raw": line.strip()
+                })
+            m2 = RE_MERGE.search(line)
+            if m2:
+                items = [x for x in re.split(r"[\s]+", m2.group(1).strip()) if x and x.upper()!="BY"]
+                for it in items:
+                    rows.append({
+                        "file": path, "line": ln,
+                        "data_step": current_data,
+                        "kind": "MERGE",
+                        "handle_or_ds": it.upper().rstrip(";"),
+                        "raw": line.strip()
+                    })
+            m3 = RE_SET.search(line)
+            if m3:
+                items = [x for x in re.split(r"[\s]+", m3.group(1).strip()) if x]
+                for it in items:
+                    rows.append({
+                        "file": path, "line": ln,
+                        "data_step": current_data,
+                        "kind": "SET",
+                        "handle_or_ds": it.upper().rstrip(";"),
+                        "raw": line.strip()
+                    })
+    with io.open(out_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["file","line","data_step","kind","handle_or_ds","raw"])
+        w.writeheader()
+        for r in rows: w.writerow(r)
+    return rows
+
+# ============================================================
+# 3) CSV-only recursive walk from variables.csv (no early stop)
+#    (DD and ASSIGN are represented as pseudo nodes in the path)
+# ============================================================
+def load_vars(csv_vars: str):
+    rows        = {}
+    parent_of   = {}
+    from_dd_of  = defaultdict(set)
+    assign_of   = defaultdict(set)
+    sources_of  = defaultdict(set)
+    origin_file = {}
+
+    with io.open(csv_vars, newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        lower = {k.lower(): k for k in r.fieldnames}
+        def get(row, key, default=""):
+            return row.get(key, row.get(lower.get(key.lower(), ""), default))
+        for row in r:
+            v = norm(get(row, "variable"))
+            if not v: continue
+            rows[v] = row
+            p = norm(get(row, "parent_record"))
+            if p: parent_of[v] = p
+            origin_file[v] = get(row, "origin_file", "") or ""
+            for dd in (x.strip() for x in (get(row,"from_dd","") or "").split(";") if x.strip()):
+                from_dd_of[v].add(norm(dd))
+            for at in (x.strip() for x in (get(row,"assign_target","") or "").split(";") if x.strip()):
+                assign_of[v].add(norm(at))
+            ds = get(row, "direct_sources") or get(row, "source_fields")
+            for s in (x.strip() for x in (ds or "").split(";") if x.strip()):
+                s = norm(s)
+                if s: sources_of[v].add(s)
+
+    # keep only sources that exist in rows
+    known = set(rows.keys())
+    for k in list(sources_of.keys()):
+        sources_of[k] = {s for s in sources_of[k] if s in known}
+
+    return rows, parent_of, from_dd_of, assign_of, sources_of, origin_file
+
+def is_pseudo(node: str) -> bool:
+    return node.startswith("DD:") or node.startswith("ASSIGN:")
+
+def neighbors_vars(idx, node: str):
+    rows, parent_of, from_dd_of, assign_of, sources_of, _ = idx
+    if node.startswith("ASSIGN:"):
+        return set()
+    if node.startswith("DD:"):
+        # DD -> possible ASSIGNs (found on any variable that referenced that DD)
+        dd = node[3:]
+        hops = set()
+        for v, ddset in from_dd_of.items():
+            if dd in ddset:
+                for at in assign_of.get(v, set()):
+                    hops.add(f"ASSIGN:{at}")
+        return hops
+    hops = set()
+    p = parent_of.get(node)
+    if p: hops.add(p)
+    hops |= sources_of.get(node, set())
+    for dd in from_dd_of.get(node, set()):
+        hops.add(f"DD:{dd}")
+    for at in assign_of.get(node, set()):
+        hops.add(f"ASSIGN:{at}")
+    return hops
+
+def all_leaf_paths(idx, start_var: str, max_depth=2000):
+    rows, *rest = idx
+    start = norm(start_var)
+    if start not in rows:
+        return []
+    results = []
+    stack = [[start]]
+    seen_edges = set()
+    while stack:
+        path = stack.pop()
+        cur = path[-1]
+        nxts = neighbors_vars(idx, cur)
+        if not nxts or len(path) > max_depth:
+            results.append(path)
+            continue
+        for nxt in sorted(nxts):
+            edge = (cur, nxt)
+            if edge in seen_edges:
+                continue
+            seen_edges.add(edge)
+            if nxt in path and not is_pseudo(nxt):
+                # cycle on real vars – terminate this branch
+                results.append(path)
+                continue
+            stack.append(path + [nxt])
+    return results
+
+# ============================================================
+# 4) Enhance leaf paths with PROC/JCL/SAS metadata
+#    (match by DD name or ASSIGN literal / SAS handle)
+# ============================================================
+def build_quick_lookups(jcl_rows, proc_rows, sas_rows):
+    by_dd_jcl  = defaultdict(list)   # DD -> rows
+    by_dd_proc = defaultdict(list)
+    for r in jcl_rows:
+        by_dd_jcl[norm(r["ddname"])].append(r)
+    for r in proc_rows:
+        by_dd_proc[norm(r["ddname"])].append(r)
+
+    # SAS: INFILE/FILE handles are typically DD names supplied by JCL step
+    by_handle_sas = defaultdict(list)  # handle -> rows
+    for r in sas_rows:
+        if r["kind"] in ("INFILE","FILE"):
+            by_handle_sas[norm(r["handle_or_ds"])].append(r)
+    return by_dd_jcl, by_dd_proc, by_handle_sas
+
+def enhance_paths(paths, idx, jcl_rows, proc_rows, sas_rows):
+    by_dd_jcl, by_dd_proc, by_handle_sas = build_quick_lookups(jcl_rows, proc_rows, sas_rows)
+    _, _, _, _, _, origin_file = idx
+    enhanced = []
+    for path in paths:
+        dd_hits = [p[3:] for p in path if p.startswith("DD:")]
+        assign_hits = [p[7:] for p in path if p.startswith("ASSIGN:")]
+        # We’ll attach everything we can find
+        # Prefer last DD on the path (closest to leaf)
+        dd = dd_hits[-1] if dd_hits else ""
+        assign = assign_hits[-1] if assign_hits else ""
+
+        jcl_matches  = by_dd_jcl.get(norm(dd), [])
+        proc_matches = by_dd_proc.get(norm(dd), [])
+        sas_matches  = by_handle_sas.get(norm(dd), [])  # SAS INFILE handle often equals DD
+
+        file_hint = ""
+        for n in path:
+            if not is_pseudo(n):
+                fh = origin_file.get(n, "")
+                if fh:
+                    file_hint = fh; break
+
+        def rows_to_str(rows, cols):
+            if not rows: return ""
+            out = []
+            for r in rows:
+                bits = []
+                for c in cols:
+                    bits.append(str(r.get(c,"")))
+                out.append("|".join(bits))
+            return " || ".join(out)
+
+        jcl_info  = rows_to_str(jcl_matches, ["file","step","exec","ddname","dsn","disp","recfm","lrecl"])
+        proc_info = rows_to_str(proc_matches, ["file","step","exec","ddname","dsn","disp","recfm","lrecl"])
+        sas_info  = rows_to_str(sas_matches, ["file","data_step","kind","handle_or_ds"])
+
+        enhanced.append({
+            "trace_path": " <- ".join(path),
+            "dd": dd,
+            "assign": assign,
+            "jcl_matches": jcl_info,
+            "proc_matches": proc_info,
+            "sas_matches": sas_info,
+            "cobol_file_hint": file_hint
+        })
+    return enhanced
+
+# ============================================================
+# Driver
+# ============================================================
+def main():
+    # 1) Index PROC/JCL/SAS
+    proc_rows = index_jcl_like(PROC_DIR, OUT_PROCS)
+    jcl_rows  = index_jcl_like(JCL_DIR,  OUT_JCL)
+    sas_rows  = index_sas(SAS_DIR, OUT_SAS)
+
+    # 2) Load COBOL variables.csv and compute all leaf paths
+    if not os.path.exists(CSV_VARS):
+        print("variables.csv not found next to this script — please run your COBOL parser first.")
+        return
+    idx = load_vars(CSV_VARS)
+
+    # Build a full set of leaf paths for *every* variable in variables.csv
+    rows, *_ = idx
+    all_enhanced = []
+    for var in sorted(rows.keys()):
+        paths = all_leaf_paths(idx, var)
+        all_enhanced.extend(enhance_paths(paths, idx, jcl_rows, proc_rows, sas_rows))
+
+    # 3) Write enhanced_backtrace.csv
+    with io.open(OUT_ENHANCED, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(
+            f,
+            fieldnames=[
+                "trace_path","dd","assign",
+                "jcl_matches","proc_matches","sas_matches",
+                "cobol_file_hint"
+            ]
+        )
+        w.writeheader()
+        for r in all_enhanced:
+            w.writerow(r)
+
+    print(f"Wrote {OUT_PROCS}, {OUT_JCL}, {OUT_SAS}, and {OUT_ENHANCED}")
+
+if __name__ == "__main__":
+    # ensure dirs exist (ok if empty)
+    for d in (PROC_DIR,JCL_DIR,SAS_DIR):
+        os.makedirs(d, exist_ok=True)
+    main()
