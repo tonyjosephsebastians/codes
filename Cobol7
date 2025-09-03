@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Backtrace a COBOL variable **from the CSV only**.
+
+- Expects variables.csv in the current directory (columns from your generator):
+  variable, parent_record, from_dd, assign_target, direct_sources, origin_file, defined_at ...
+- Set QUERY to the variable you want to trace.
+- Prints ALL distinct origin paths that reach a DD/ASSIGN (including via parent records).
+"""
+
+import csv, os, re
+from collections import defaultdict, deque
+
+CSV_PATH = os.path.join(os.getcwd(), "variables.csv")
+QUERY = "ALS-BOOKING-DATE"   # <-- set the variable name here (case/spacing doesn’t matter)
+
+# ---------------- helpers ----------------
+def norm(s: str) -> str:
+    return re.sub(r"\s+", "", s.upper()) if isinstance(s, str) else s
+
+def split_list(s: str) -> list[str]:
+    if not s: return []
+    # fields are ; separated in our CSV
+    return [norm(x) for x in s.split(";") if x.strip()]
+
+# ---------------- load CSV into quick indexes ----------------
+def load_index(csv_path: str):
+    rows = {}
+    parents = {}
+    deps = defaultdict(set)  # target -> {sources}
+    origins = {}             # var -> origin_file (if any)
+    assigns = defaultdict(set)  # var -> assign_target(s) (attached on that row)
+    dds = defaultdict(set)      # var -> from_dd(s)
+
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        # tolerate different column naming from earlier scripts
+        fieldmap = {k.lower(): k for k in r.fieldnames}
+
+        def get(row, key, default=""):
+            # allow either exact or lower
+            return row.get(key, row.get(fieldmap.get(key.lower(), ""), default))
+
+        for row in r:
+            v = norm(get(row, "variable"))
+            if not v: continue
+            rows[v] = row
+
+            parent = norm(get(row, "parent_record"))
+            if parent:
+                parents[v] = parent
+
+            origins[v] = get(row, "origin_file", "") or ""
+
+            for dd in split_list(get(row, "from_dd", "")):
+                dds[v].add(dd)
+
+            for at in split_list(get(row, "assign_target", "")):
+                assigns[v].add(at)
+
+            # direct_sources might live under "direct_sources" or "source_fields"
+            ds = get(row, "direct_sources") or get(row, "source_fields")
+            for s in split_list(ds):
+                deps[v].add(s)
+
+    return {
+        "rows": rows,
+        "parents": parents,
+        "deps": deps,
+        "origins": origins,
+        "dds": dds,
+        "assigns": assigns,
+    }
+
+# ---------------- query: all origin paths ----------------
+def query_sources_from_csv(index, varname: str, max_depth: int = 64, max_paths: int = 500):
+    start = norm(varname)
+    if start not in index["rows"]:
+        return []
+
+    parents  = index["parents"]
+    deps     = index["deps"]
+    dds      = index["dds"]
+    assigns  = index["assigns"]
+    origins  = index["origins"]
+
+    # helper: find any DD/ASSIGN on node or its ancestors
+    def find_origins_here(node: str):
+        out = []
+        seen_dd = set()
+        cur = node
+        hops = 0
+        while cur and hops <= 64:
+            # from_dd on this row?
+            for dd in sorted(dds.get(cur, [])):
+                if dd not in seen_dd:
+                    seen_dd.add(dd)
+                    # prefer assign_target on this cur; fallback to none
+                    at = ""
+                    if assigns.get(cur):
+                        at = sorted(assigns[cur])[0]
+                    out.append({"node": cur, "dd": dd, "assign": at})
+            cur = parents.get(cur)
+            hops += 1
+        return out
+
+    # BFS upstream; at each step also check parent chain for origins
+    results = []
+    q = deque([[start]])
+    seen_edges = set()
+
+    while q and len(results) < max_paths:
+        path = q.popleft()
+        cur = path[-1]
+
+        # check node + ancestors for any DD/ASSIGN
+        origins_here = find_origins_here(cur)
+        if origins_here:
+            for o in origins_here:
+                # find a "record-like" ancestor to show (node with children is not in CSV, so use parent chain)
+                input_record = o["node"]
+                # build list of origin files seen along path (dedup)
+                files = []
+                for v in path:
+                    of = origins.get(v, "")
+                    if of and of not in files:
+                        files.append(of)
+                results.append({
+                    "target": start,
+                    "path": path[:],             # target -> … -> source
+                    "input_node": o["node"],
+                    "input_record": input_record,
+                    "dd": o["dd"],
+                    "assign": o["assign"],
+                    "files_in_path": files
+                })
+            # stop this path (we reached an origin)
+            continue
+
+        # otherwise expand to upstream sources
+        if len(path) < max_depth:
+            for s in sorted(deps.get(cur, set())):
+                edge = (cur, s)
+                if edge not in seen_edges:
+                    seen_edges.add(edge)
+                    q.append(path + [s])
+
+    return results
+
+def format_results(paths: list[dict]) -> str:
+    if not paths: return "No origin found."
+    lines = []
+    for r in paths:
+        chain = " <- ".join(r["path"])
+        dd = r["dd"]; at = r["assign"]
+        # show first file in path that’s not empty (usually where target/source were seen)
+        file_hint = next((f for f in r["files_in_path"] if f), "")
+        lines.append(f"{chain}  (DD={dd}; ASSIGN={at}; FILE≈{file_hint})")
+    return "\n".join(lines)
+
+# --------------- demo run ---------------
+if __name__ == "__main__":
+    idx = load_index(CSV_PATH)
+    hits = query_sources_from_csv(idx, QUERY)
+    print(format_results(hits))
