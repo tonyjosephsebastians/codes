@@ -1,0 +1,126 @@
+# ========================= QUERY (robust) =========================
+from collections import deque
+
+def _gather_origins_on_node_and_ancestors(store, node, max_hops=32):
+    """
+    Look for input origins on `node` and its ancestors:
+      - vars[...]['from_dd'] (already propagated)
+      - store.record_to_dd[...]  (explicit READ ... INTO, FD-01)
+    For each found DD, attach ASSIGN via store.dd_assign[dd] or the node's own assign_target.
+    Returns a list of origin dicts (could be multiple DDs).
+    """
+    out = []
+    cur = node
+    hops = 0
+    seen_dd = set()
+
+    while cur and hops <= max_hops:
+        meta = store.vars.get(cur, {})
+
+        # 1) via from_dd (propagated)
+        for dd in sorted(meta.get("from_dd", [])):
+            if dd not in seen_dd:
+                seen_dd.add(dd)
+                assign = None
+                # prefer assign_target on this node; else global SELECT map
+                ats = meta.get("assign_target", set())
+                if ats:
+                    assign = sorted(ats)[0]
+                if not assign:
+                    assign = store.dd_assign.get(dd, "")
+                out.append({"node": cur, "dd": dd, "assign": assign or ""})
+
+        # 2) via explicit record_to_dd (READ ... INTO / FD-01)
+        dd2 = store.record_to_dd.get(cur)
+        if dd2 and dd2 not in seen_dd:
+            seen_dd.add(dd2)
+            assign2 = store.dd_assign.get(dd2, "")
+            out.append({"node": cur, "dd": dd2, "assign": assign2 or ""})
+
+        cur = store.parent_of.get(cur)
+        hops += 1
+
+    return out
+
+
+def _nearest_record_ancestor(store, node, max_hops=32):
+    """
+    Heuristic: a 'record' is anything that has children (e.g., 01/05).
+    Walk up until we find one; fallback to the node itself.
+    """
+    cur = node
+    hops = 0
+    while cur and hops <= max_hops:
+        if store.children.get(cur):
+            return cur
+        cur = store.parent_of.get(cur)
+        hops += 1
+    return node
+
+
+def query_sources(store, varname, max_paths=200, max_depth=64):
+    """
+    Find **ALL** distinct origins for `varname` by:
+      - checking node & ancestors for DD/ASSIGN,
+      - otherwise traversing upstream direct sources (MOVE/COMPUTE) until found.
+    Returns a list of dicts, one per origin path.
+    """
+    start = norm(varname)
+    if start not in store.vars:
+        return []
+
+    results = []
+    q = deque([[start]])
+    seen_edges = set()
+
+    while q and len(results) < max_paths:
+        path = q.popleft()
+        cur = path[-1]
+
+        # Check this node + ancestors for any DDs (from_dd OR record_to_dd)
+        origins_here = _gather_origins_on_node_and_ancestors(store, cur)
+        if origins_here:
+            # Emit one result per distinct origin discovered at this point
+            for o in origins_here:
+                input_node = o["node"]
+                input_record = _nearest_record_ancestor(store, input_node)
+                # files along the path (de-duped, first-seen order)
+                files = []
+                for v in path:
+                    of = store.vars.get(v, {}).get("origin_file")
+                    if of and of not in files:
+                        files.append(of)
+                results.append({
+                    "target": start,
+                    "path": path[:],                 # left→right: target ... source
+                    "input_node": input_node,
+                    "input_record": input_record,
+                    "dd": o["dd"],
+                    "assign": o["assign"],
+                    "files_in_path": files
+                })
+            # do NOT expand this path further once an origin is found
+            continue
+
+        # No origin here — expand upstream via direct sources
+        if len(path) < max_depth:
+            for src in sorted(store.deps.get(cur, set())):
+                edge = (cur, src)
+                if edge not in seen_edges:
+                    seen_edges.add(edge)
+                    q.append(path + [src])
+
+    return results
+
+
+def format_query_results(results):
+    if not results:
+        return "No input-file origin found."
+    lines = []
+    for r in results:
+        chain = " <- ".join(r["path"])
+        lines.append(
+            f"{chain}  (DD={r['dd']}; ASSIGN={r['assign']}; INPUT-NODE={r['input_node']}; INPUT-RECORD={r['input_record']})"
+        )
+    return "\n".join(lines)
+# ======================= END QUERY (robust) =======================
