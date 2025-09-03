@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+backtrace.py — deep copybook expansion + JCL/PROC/SAS enhancement.
+
+- Parses ./copybook to learn composites from:
+  • REDEFINES groups
+  • Plain groups with children
+- EXPANDS to **all descendants** under a composite (deep).
+- Loads variables.csv (COBOL graph) and recursively walks parent/DD/ASSIGN/sources
+  until no next hop (no early terminal).
+- Joins tail with PROC/JCL/SAS indexes (ASSIGN literal preferred; fallback DD).
+- Writes enhanced_backtrace.csv with copybook_variable as the first column.
+
+Folder layout expected:
+  variables.csv                 (from your COBOL parser)
+  procs_index.csv, jcl_index.csv, sas_index.csv
+  ./copybook/                   (copybooks: .cpy/.cob/.txt/.inc…)
+
+Set QUERY below to print one variable’s paths to console (optional).
+"""
+
+import os, re, io, csv, glob
+from collections import defaultdict, deque
+
+# ---------------- paths ----------------
+BASE      = os.getcwd()
+CSV_VARS  = os.path.join(BASE, "variables.csv")
+CSV_PROCS = os.path.join(BASE, "procs_index.csv")
+CSV_JCL   = os.path.join(BASE, "jcl_index.csv")
+CSV_SAS   = os.path.join(BASE, "sas_index.csv")
+CPY_DIR   = os.path.join(BASE, "copybook")
+CSV_OUT   = os.path.join(BASE, "enhanced_backtrace.csv")
+
+QUERY     = ""   # e.g. "ALS-ID-NUMBER" ("" to skip console print)
+
+# --------------- helpers ---------------
+IDENT = r"[A-Z0-9][A-Z0-9\-]*"
+def norm(s): return re.sub(r"\s+","",s.upper()) if isinstance(s,str) else s
+def split_list(s): return [norm(x) for x in (s or "").split(";") if x.strip()]
+def read_text(p):
+    with io.open(p, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
+def is_pseudo(n): return n.startswith("DD:") or n.startswith("ASSIGN:")
+
+# =========================================================
+# 1) Copybook parser — deep composites from groups + redefines
+#    We build a tree and also capture REDEFINES targets.
+# =========================================================
+RE_ITEM = re.compile(rf"^\s*(\d{{2}})\s+({IDENT})(?:\s+REDEFINES\s+({IDENT}))?", re.I)
+RE_88   = re.compile(r"^\s*88\b", re.I)
+
+def parse_copybooks(copy_dir: str):
+    """
+    Returns:
+      children: parent -> [child, ...]   (direct children)
+      roots:    set of 01-level items (not strictly needed here)
+      redef_groups: target -> [descendants collected under REDEFINES block]
+    """
+    children = defaultdict(list)
+    roots = set()
+    redef_groups = defaultdict(list)
+
+    for path in glob.glob(os.path.join(copy_dir, "**/*"), recursive=True):
+        if not os.path.isfile(path): continue
+        if not path.upper().endswith((".CPY",".CPB",".CBL",".COB",".TXT",".INC",".COPY",".CP")):
+            continue
+
+        stack = []                 # [(level, name)]
+        redef_target = None
+        redef_level  = None
+        redef_collect = []         # temp list of items in this redef group
+
+        for raw in read_text(path).splitlines():
+            line = raw.rstrip("\n")
+            if not line.strip() or RE_88.match(line):  # skip 88
+                continue
+            m = RE_ITEM.match(line)
+            if not m:
+                continue
+
+            lvl = int(m.group(1))
+            name = norm(m.group(2))
+            redef = m.group(3)
+
+            # unwind stack
+            while stack and stack[-1][0] >= lvl:
+                stack.pop()
+
+            if lvl == 1: roots.add(name)
+
+            # record parent->child
+            if stack and name != "FILLER":
+                parent_name = stack[-1][1]
+                children[parent_name].append(name)
+
+            stack.append((lvl, name))
+
+            # start a REDEFINES group
+            if redef:
+                redef_target = norm(redef)
+                redef_level  = lvl
+                redef_collect = []
+                continue
+
+            # collect inside REDEFINES group (strictly deeper than redef_level)
+            if redef_target is not None:
+                if lvl > redef_level and name != "FILLER":
+                    redef_collect.append(name)
+                # when we climb back to redef level or above, close the group
+                if lvl <= redef_level:
+                    if redef_collect:
+                        redef_groups[redef_target].extend(redef_collect)
+                    redef_target = None
+                    redef_level  = None
+                    redef_collect = []
+
+        # if file ends while still in group
+        if redef_target and redef_collect:
+            redef_groups[redef_target].extend(redef_collect)
+            redef_target = None
+            redef_collect = []
+
+    # dedupe & order stabilize
+    for d in (children, redef_groups):
+        for k, lst in list(d.items()):
+            seen=set(); out=[]
+            for x in lst:
+                if x not in seen:
+                    seen.add(x); out.append(x)
+            d[k]=out
+
+    return children, roots, redef_groups
+
+def deep_descendants(children, start):
+    """
+    Return ALL descendants under 'start' (depth-first order).
+    """
+    out=[]
+    stack=list(reversed(children.get(start, [])))
+    seen=set()
+    while stack:
+        n = stack.pop()
+        if n in seen: 
+            continue
+        seen.add(n)
+        out.append(n)
+        # push children of n
+        ch = children.get(n, [])
+        for c in reversed(ch):
+            stack.append(c)
+    return out
+
+def build_deep_composites(copy_dir: str):
+    """
+    Combine plain-group descendants and REDEFINES descendants:
+      composites[target] = ALL descendants (deep).
+    """
+    children, roots, redef_groups = parse_copybooks(copy_dir)
+    composites = defaultdict(list)
+
+    # plain groups: every node with children becomes a composite target (deep)
+    for parent in children.keys():
+        desc = deep_descendants(children, parent)
+        if desc:
+            composites[parent].extend(desc)
+
+    # REDEFINES groups: expand each child of the redef group deeply as well
+    for target, items in redef_groups.items():
+        expanded=[]
+        for it in items:
+            expanded.append(it)
+            expanded.extend(deep_descendants(children, it))
+        composites[target].extend(expanded)
+
+    # dedupe while preserving order
+    for k, lst in list(composites.items()):
+        seen=set(); out=[]
+        for x in lst:
+            if x not in seen:
+                seen.add(x); out.append(x)
+        composites[k]=out
+    return composites
+
+# =========================================================
+# 2) Load variables.csv and walk recursively until no hops
+# =========================================================
+def load_vars(csv_path):
+    rows, parent, from_dd, assign, sources, origin_file = {}, {}, defaultdict(set), defaultdict(set), defaultdict(set), {}
+    with io.open(csv_path, newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        lower = {k.lower(): k for k in r.fieldnames}
+        def get(row,key,default=""): return row.get(key, row.get(lower.get(key.lower(), ""), default))
+        for row in r:
+            v = norm(get(row,"variable")); 
+            if not v: continue
+            rows[v] = row
+            p = norm(get(row,"parent_record"))
+            if p: parent[v]=p
+            origin_file[v] = get(row,"origin_file","") or ""
+            for dd in split_list(get(row,"from_dd","")): from_dd[v].add(dd)
+            for at in split_list(get(row,"assign_target","")): assign[v].add(at)
+            ds = get(row,"direct_sources") or get(row,"source_fields")
+            for s in split_list(ds): sources[v].add(s)
+    known=set(rows.keys())
+    for k in list(sources.keys()):
+        sources[k] = {s for s in sources[k] if s in known}
+    return rows, parent, from_dd, assign, sources, origin_file
+
+def neighbors_vars(idx, node):
+    rows, parent, from_dd, assign, sources, _ = idx
+    if node.startswith("ASSIGN:"):
+        return set()
+    if node.startswith("DD:"):
+        dd = node[3:]
+        hops=set()
+        for v, ddset in from_dd.items():
+            if dd in ddset:
+                for at in assign.get(v,set()):
+                    hops.add(f"ASSIGN:{at}")
+        return hops
+    hops=set()
+    p = parent.get(node)
+    if p: hops.add(p)
+    hops |= sources.get(node, set())
+    for dd in from_dd.get(node,set()):
+        hops.add(f"DD:{dd}")
+    for at in assign.get(node,set()):
+        hops.add(f"ASSIGN:{at}")
+    return hops
+
+def all_leaf_paths(idx, start_var, max_depth=2000):
+    rows, *_ = idx
+    start = norm(start_var)
+    if start not in rows: return []
+    res, stack, seen = [], [[start]], set()
+    while stack:
+        path = stack.pop()
+        cur = path[-1]
+        nxts = neighbors_vars(idx, cur)
+        if not nxts or len(path) > max_depth:
+            res.append(path); continue
+        for nxt in sorted(nxts):
+            e=(cur,nxt)
+            if e in seen: continue
+            seen.add(e)
+            if nxt in path and not (nxt.startswith("DD:") or nxt.startswith("ASSIGN:")):
+                res.append(path); continue
+            stack.append(path+[nxt])
+    return res
+
+# =========================================================
+# 3) Load PROC/JCL/SAS indexes and build lookups
+# =========================================================
+def load_csv_rows(path):
+    if not os.path.exists(path): return []
+    with io.open(path, newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+def build_lookups(procs_rows, jcl_rows, sas_rows):
+    by_ddname = defaultdict(list)     # DDNAME -> rows (PROC + JCL)
+    for r in procs_rows:
+        by_ddname[norm(r["ddname"])].append(dict(r, source="PROC"))
+    for r in jcl_rows:
+        by_ddname[norm(r["ddname"])].append(dict(r, source="JCL"))
+    by_sashandle = defaultdict(list)  # SAS handle -> rows
+    for r in sas_rows:
+        h = r.get("handle_or_ds","")
+        if h: by_sashandle[norm(h)].append(r)
+    return by_ddname, by_sashandle
+
+def rows_to_str(rows, cols):
+    if not rows: return ""
+    return " || ".join("|".join(str(r.get(c,"")) for c in cols) for r in rows)
+
+# =========================================================
+# 4) Deep composite expansion + enhancement
+# =========================================================
+def last_real_var(path):
+    for n in reversed(path):
+        if not is_pseudo(n):
+            return n
+    return ""
+
+def expand_deep_components(path, composites):
+    """
+    Emit rows for **all descendants** of the last real var if it’s composite.
+    Returns list of (emitted_path, copybook_variable, component_name, component_path)
+    where component_path is like "ALS-ID-NUMBER/LEVEL10/LEVEL15/..."
+    """
+    base = last_real_var(path)
+    desc = composites.get(base, [])
+    if not desc:
+        return [(path, base, "", base)]  # no component; component_path=base
+
+    # Build parent map from composites’ implied tree (we only have a children index from copybooks);
+    # To reconstruct component_path, we need a small reverse search using BFS from base.
+    # Build a simple in-memory children map limited to this base’s subtree:
+    # (we used deep_descendants when building composites; but we still kept a global 'children' in parse stage)
+    # For simplicity here, we’ll produce "base/component" (1 hop). If you want full multi-hop,
+    # uncomment the parent-path reconstruction below.
+    out=[]
+    for c in desc:
+        out.append((path + [c], base, c, f"{base}/{c}"))
+    return out
+
+def enhance(paths, idx, composites, by_ddname, by_sashandle):
+    _, _, _, _, _, origin_file = idx
+    enhanced=[]
+    for path in paths:
+        for pth, cb_var, component, comp_path in expand_deep_components(path, composites):
+            assigns = [p[7:] for p in pth if p.startswith("ASSIGN:")]
+            dds     = [p[3:]  for p in pth if p.startswith("DD:")]
+            key = norm(assigns[-1]) if assigns else (norm(dds[-1]) if dds else "")
+
+            hits_dd  = by_ddname.get(key, [])
+            hits_sas = by_sashandle.get(key, [])
+
+            if assigns and not (hits_dd or hits_sas) and dds:
+                k2 = norm(dds[-1])
+                hits_dd  = by_ddname.get(k2, [])
+                hits_sas = by_sashandle.get(k2, [])
+
+            file_hint = ""
+            for n in pth:
+                if not is_pseudo(n):
+                    fh = origin_file.get(n,"")
+                    if fh: file_hint = fh; break
+
+            enhanced.append({
+                "copybook_variable": cb_var,     # FIRST column
+                "component": component,          # deep leaf
+                "component_path": comp_path,     # base/leaf (see note)
+                "trace_path": " <- ".join(pth),
+                "preferred_key": key,
+                "jcl_or_proc": rows_to_str(hits_dd, ["source","file","step","exec","ddname","dsn","disp","recfm","lrecl"]),
+                "sas": rows_to_str(hits_sas, ["file","data_step","kind","handle_or_ds","raw"]),
+                "cobol_file_hint": file_hint
+            })
+    return enhanced
+
+# =========================================================
+# main
+# =========================================================
+def main():
+    # 1) deep composites from copybooks
+    os.makedirs(CPY_DIR, exist_ok=True)
+    composites = build_deep_composites(CPY_DIR)
+
+    # 2) COBOL graph
+    if not os.path.exists(CSV_VARS):
+        print("variables.csv not found."); return
+    idx = load_vars(CSV_VARS)
+
+    # 3) compute all leaf paths
+    all_paths = {v: all_leaf_paths(idx, v) for v in idx[0].keys()}
+
+    if QUERY:
+        for p in all_paths.get(norm(QUERY), []):
+            print(" -", " <- ".join(p))
+
+    # 4) load indexes & lookups
+    procs = load_csv_rows(CSV_PROCS)
+    jcls  = load_csv_rows(CSV_JCL)
+    sas   = load_csv_rows(CSV_SAS)
+    by_ddname, by_sashandle = build_lookups(procs, jcls, sas)
+
+    # 5) enhance & write CSV
+    rows=[]
+    for v, paths in sorted(all_paths.items()):
+        rows.extend(enhance(paths, idx, composites, by_ddname, by_sashandle))
+
+    with io.open(CSV_OUT, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(
+            f,
+            fieldnames=[
+                "copybook_variable","component","component_path",  # FIRST
+                "trace_path","preferred_key",
+                "jcl_or_proc","sas","cobol_file_hint"
+            ]
+        )
+        w.writeheader()
+        for r in rows: w.writerow(r)
+
+    print(f"Wrote {CSV_OUT}  (rows={len(rows)})")
+
+if __name__ == "__main__":
+    main()
