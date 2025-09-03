@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+CSV-only recursive walk (no early terminals).
+
+Neighbors:
+  - parent_record -> variable
+  - direct_sources/source_fields -> variable(s)
+  - from_dd -> pseudo node "DD:<dd>"
+  - assign_target -> pseudo node "ASSIGN:<assign>"
+
+Special:
+  - For "DD:<dd>" nodes, we also add neighbor "ASSIGN:<assign>" if present.
+  - "ASSIGN:<...>" nodes have no neighbors.
+
+Emits ALL leaf paths (walks until no next hops).
+"""
+
+import csv, os, re
+from collections import defaultdict
+
+CSV_IN   = os.path.join(os.getcwd(), "variables.csv")
+CSV_OUT  = os.path.join(os.getcwd(), "origins.csv")   # all leaf paths for all variables
+QUERY    = ""   # e.g. "ALS-BOOKING-DATE" to print leaf paths for one variable
+
+# ---------- helpers ----------
+def norm(s: str) -> str:
+    return re.sub(r"\s+", "", s.upper()) if isinstance(s, str) else s
+
+def split_list(s: str) -> list[str]:
+    if not s: return []
+    return [norm(x) for x in s.split(";") if x.strip()]
+
+def is_pseudo(node: str) -> bool:
+    return node.startswith("DD:") or node.startswith("ASSIGN:")
+
+# ---------- load CSV ----------
+def load_index(csv_path: str):
+    rows        = {}                 # var -> row dict
+    parent_of   = {}                 # var -> parent_record
+    from_dd_of  = defaultdict(set)   # var -> {DDs}
+    assign_of   = defaultdict(set)   # var -> {assign strings}
+    sources_of  = defaultdict(set)   # var -> direct sources (or source_fields)
+    origin_file = {}                 # var -> origin_file (optional hint)
+
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        lower = {k.lower(): k for k in r.fieldnames}
+
+        def get(row, key, default=""):
+            return row.get(key, row.get(lower.get(key.lower(), ""), default))
+
+        for row in r:
+            v = norm(get(row, "variable"))
+            if not v:
+                continue
+            rows[v] = row
+
+            p = norm(get(row, "parent_record"))
+            if p:
+                parent_of[v] = p
+
+            origin_file[v] = get(row, "origin_file", "") or ""
+
+            for dd in split_list(get(row, "from_dd", "")):
+                from_dd_of[v].add(dd)
+
+            for at in split_list(get(row, "assign_target", "")):
+                assign_of[v].add(at)
+
+            ds = get(row, "direct_sources") or get(row, "source_fields")
+            for s in split_list(ds):
+                sources_of[v].add(s)
+
+    # Restrict edges to known variables for variable→variable hops
+    known = set(rows.keys())
+    for tgt in list(sources_of.keys()):
+        sources_of[tgt] = {s for s in sources_of[tgt] if s in known}
+    # parent can point to record names that should exist as variables; keep as-is if present
+    if parent_of:
+        for k, p in list(parent_of.items()):
+            if p and p not in known:
+                # allow missing parent as a dead end
+                pass
+
+    return rows, parent_of, from_dd_of, assign_of, sources_of, origin_file
+
+# ---------- neighbor expansion ----------
+def neighbors(idx, node: str):
+    """
+    Return next hops for a node (variable or pseudo).
+    Variables can go to parent, sources, DD:<dd>, ASSIGN:<lit>.
+    DD:<dd> can go to ASSIGN:<lit> (if assign is known on any var carrying that DD).
+    ASSIGN:<...> ends the chain (no neighbors).
+    """
+    rows, parent_of, from_dd_of, assign_of, sources_of, _ = idx
+
+    # Pseudo nodes
+    if node.startswith("ASSIGN:"):
+        return set()  # terminal by design
+
+    if node.startswith("DD:"):
+        dd = node[3:]
+        # find any assign literal tied to the same DD via any variable row
+        hops = set()
+        # Prefer: if some variable has both this DD and an assign_target, expose ASSIGN:<...>
+        for v, ddset in from_dd_of.items():
+            if dd in ddset:
+                for at in assign_of.get(v, set()):
+                    hops.add(f"ASSIGN:{at}")
+        return hops
+
+    # Variable nodes
+    hops = set()
+    # parent
+    p = parent_of.get(node)
+    if p:
+        hops.add(p)
+    # direct sources
+    hops |= sources_of.get(node, set())
+    # DD pseudo
+    for dd in from_dd_of.get(node, set()):
+        hops.add(f"DD:{dd}")
+    # ASSIGN pseudo (in case assign_target is directly on this variable row)
+    for at in assign_of.get(node, set()):
+        hops.add(f"ASSIGN:{at}")
+    return hops
+
+# ---------- DFS all leaf paths (no early terminal) ----------
+def all_leaf_paths(idx, start_var: str, max_depth=2000):
+    rows, *_ = idx
+    start = norm(start_var)
+    if start not in rows:
+        return []
+
+    results = []
+    stack = [[start]]
+    seen_edges = set()  # avoid infinite loops
+
+    while stack:
+        path = stack.pop()
+        cur = path[-1]
+        nexts = neighbors(idx, cur)
+
+        # Leaf = no neighbors
+        if not nexts or len(path) > max_depth:
+            results.append(path)
+            continue
+
+        for nxt in sorted(nexts):
+            edge = (cur, nxt)
+            if edge in seen_edges:
+                continue
+            seen_edges.add(edge)
+            if nxt in path:
+                # allow revisiting pseudo nodes safely, but avoid cycles on vars
+                if is_pseudo(nxt):
+                    results.append(path + [nxt])  # treat as leaf
+                continue
+            stack.append(path + [nxt])
+
+    return results
+
+# ---------- pretty print ----------
+def fmt_path(path, origin_file):
+    # show a helpful file hint if any variable in the chain has origin_file
+    file_hint = ""
+    for n in path:
+        if not is_pseudo(n):
+            fh = origin_file.get(n, "")
+            if fh:
+                file_hint = fh
+                break
+    return " <- ".join(path) + (f"  (FILE≈{file_hint})" if file_hint else "")
+
+# ---------- write all leaf paths for every variable ----------
+def write_all_origins_csv(idx, out_path):
+    rows, *rest = idx
+    _, _, _, _, _, origin_file = idx
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["variable", "leaf_path"])
+        for v in sorted(rows.keys()):
+            for path in all_leaf_paths(idx, v):
+                w.writerow([v, " <- ".join(path)])
+
+# ---------- run ----------
+if __name__ == "__main__":
+    idx = load_index(CSV_IN)
+
+    # Single variable check (optional)
+    if QUERY:
+        _, _, _, _, _, origin_file = idx
+        paths = all_leaf_paths(idx, QUERY)
+        if not paths:
+            print("No paths found.")
+        else:
+            for p in paths:
+                print(fmt_path(p, origin_file))
+        print()
+
+    # Dump every variable's leaf paths
+    write_all_origins_csv(idx, CSV_OUT)
+    print(f"Wrote {CSV_OUT}")
