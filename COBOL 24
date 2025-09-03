@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+backtrace.py  — produce enhanced_backtrace.csv
+
+Inputs (in current folder):
+  - variables.csv          (from your COBOL parser)
+  - procs_index.csv        (from build_indexes.py)
+  - jcl_index.csv          (from build_indexes.py)
+  - sas_index.csv          (from build_indexes.py)
+
+Output:
+  - enhanced_backtrace.csv with columns:
+      copybook_variable, final_dd, final_assign, trace_path,
+      jcl_rows, proc_rows, sas_rows, cobol_file_hint
+"""
+
+import os, io, csv, re
+from collections import defaultdict
+
+BASE = os.getcwd()
+CSV_VARS  = os.path.join(BASE, "variables.csv")
+CSV_PROCS = os.path.join(BASE, "procs_index.csv")
+CSV_JCL   = os.path.join(BASE, "jcl_index.csv")
+CSV_SAS   = os.path.join(BASE, "sas_index.csv")
+CSV_OUT   = os.path.join(BASE, "enhanced_backtrace.csv")
+
+# Optional: quick console check for one var ("" to skip)
+QUERY = ""  # e.g. "ALS-BOOKING-DATE"
+
+# ----------------- helpers -----------------
+def norm(s): 
+    return re.sub(r"\s+","",s.upper()) if isinstance(s, str) else s
+
+def split_list(s):
+    if not s: return []
+    return [norm(x) for x in s.split(";") if x.strip()]
+
+def is_pseudo(n): 
+    return n.startswith("DD:") or n.startswith("ASSIGN:")
+
+# ----------------- load variables.csv -----------------
+def load_vars(csv_path):
+    rows, parent, from_dd, assign, sources, origin_file = {}, {}, defaultdict(set), defaultdict(set), defaultdict(set), {}
+    with io.open(csv_path, newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        lower = {k.lower(): k for k in r.fieldnames}
+        def get(row, key, default=""): 
+            return row.get(key, row.get(lower.get(key.lower(), ""), default))
+
+        for row in r:
+            v = norm(get(row, "variable"))
+            if not v: 
+                continue
+            rows[v] = row
+
+            p = norm(get(row, "parent_record"))
+            if p:
+                parent[v] = p
+
+            origin_file[v] = get(row, "origin_file", "") or ""
+
+            for dd in split_list(get(row, "from_dd", "")):
+                from_dd[v].add(dd)
+
+            for at in split_list(get(row, "assign_target", "")):
+                assign[v].add(at)
+
+            ds = get(row, "direct_sources") or get(row, "source_fields")
+            for s in split_list(ds):
+                sources[v].add(s)
+
+    # keep only source edges pointing to existing vars
+    known = set(rows.keys())
+    for k in list(sources.keys()):
+        sources[k] = {s for s in sources[k] if s in known}
+    return rows, parent, from_dd, assign, sources, origin_file
+
+# graph expansion
+def neighbors(idx, node):
+    rows, parent, from_dd, assign, sources, _ = idx
+    if node.startswith("ASSIGN:"):
+        return set()
+    if node.startswith("DD:"):
+        dd = node[3:]
+        hops = set()
+        # DD -> any ASSIGN that co-exists on any var bound to that DD
+        for v, ddset in from_dd.items():
+            if dd in ddset:
+                for at in assign.get(v, set()):
+                    hops.add(f"ASSIGN:{at}")
+        return hops
+    hops = set()
+    p = parent.get(node)
+    if p: 
+        hops.add(p)
+    hops |= sources.get(node, set())
+    for dd in from_dd.get(node, set()):
+        hops.add(f"DD:{dd}")
+    for at in assign.get(node, set()):
+        hops.add(f"ASSIGN:{at}")
+    return hops
+
+def all_leaf_paths(idx, start_var, max_depth=2000):
+    rows, *_ = idx
+    start = norm(start_var)
+    if start not in rows:
+        return []
+    results, stack, seen_edges = [], [[start]], set()
+    while stack:
+        path = stack.pop()
+        cur = path[-1]
+        nxts = neighbors(idx, cur)
+        if not nxts or len(path) > max_depth:
+            results.append(path)
+            continue
+        for nxt in sorted(nxts):
+            e = (cur, nxt)
+            if e in seen_edges:
+                continue
+            seen_edges.add(e)
+            # avoid cycles on real variables
+            if nxt in path and not is_pseudo(nxt):
+                results.append(path)
+                continue
+            stack.append(path + [nxt])
+    return results
+
+# ----------------- load JCL / PROC / SAS indexes -----------------
+def load_csv_rows(path):
+    if not os.path.exists(path): 
+        return []
+    with io.open(path, newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+def build_lookups(procs_rows, jcl_rows, sas_rows):
+    # DDNAME lookups (PROC + JCL)
+    by_ddname_proc = defaultdict(list)
+    by_ddname_jcl  = defaultdict(list)
+    for r in procs_rows:
+        by_ddname_proc[norm(r.get("ddname",""))].append(r)
+    for r in jcl_rows:
+        by_ddname_jcl[norm(r.get("ddname",""))].append(r)
+
+    # SAS: INFILE/FILE handle_or_ds lookup
+    by_sashandle = defaultdict(list)
+    for r in sas_rows:
+        h = r.get("handle_or_ds","")
+        if h:
+            by_sashandle[norm(h)].append(r)
+    return by_ddname_proc, by_ddname_jcl, by_sashandle
+
+def rows_to_str(rows, cols):
+    if not rows:
+        return ""
+    out = []
+    for r in rows:
+        out.append("|".join(str(r.get(c,"")) for c in cols))
+    return " || ".join(out)
+
+# ----------------- enhance one path -----------------
+def enhance_one_path(path, idx, lookups):
+    by_ddname_proc, by_ddname_jcl, by_sashandle = lookups
+    _, _, _, _, _, origin_file = idx
+
+    # starting variable (copybook variable to show in 1st col)
+    copybook_var = path[0]
+
+    # collect the *last* ASSIGN and *last* DD on this path
+    assigns = [p[7:] for p in path if p.startswith("ASSIGN:")]
+    dds     = [p[3:]  for p in path if p.startswith("DD:")]
+    final_assign = assigns[-1] if assigns else ""
+    final_dd     = dds[-1] if dds else ""
+
+    # join preference: ASSIGN first, else DD
+    key = norm(final_assign) if final_assign else norm(final_dd)
+
+    proc_rows = by_ddname_proc.get(key, [])
+    jcl_rows  = by_ddname_jcl.get(key, [])
+    sas_rows  = by_sashandle.get(key, [])
+
+    # fallback: if we preferred ASSIGN but got nothing, also try the DD explicitly
+    if final_assign and not (proc_rows or jcl_rows or sas_rows) and final_dd:
+        key2 = norm(final_dd)
+        proc_rows = by_ddname_proc.get(key2, [])
+        jcl_rows  = by_ddname_jcl.get(key2, [])
+        sas_rows  = by_sashandle.get(key2, [])
+
+    # helpful file hint (first real var in the path having origin_file)
+    file_hint = ""
+    for n in path:
+        if not is_pseudo(n):
+            fh = origin_file.get(n,"")
+            if fh:
+                file_hint = fh
+                break
+
+    return {
+        "copybook_variable": copybook_var,
+        "final_dd": final_dd,
+        "final_assign": final_assign,
+        "trace_path": " <- ".join(path),
+        "jcl_rows": rows_to_str(jcl_rows,  ["file","step","exec","ddname","dsn","disp","recfm","lrecl"]),
+        "proc_rows": rows_to_str(proc_rows, ["file","step","exec","ddname","dsn","disp","recfm","lrecl"]),
+        "sas_rows": rows_to_str(sas_rows,   ["file","data_step","kind","handle_or_ds","raw"]),
+        "cobol_file_hint": file_hint
+    }
+
+# ----------------- main -----------------
+def main():
+    if not os.path.exists(CSV_VARS):
+        print("variables.csv not found.")
+        return
+
+    idx = load_vars(CSV_VARS)
+
+    procs_rows = load_csv_rows(CSV_PROCS)
+    jcl_rows   = load_csv_rows(CSV_JCL)
+    sas_rows   = load_csv_rows(CSV_SAS)
+    lookups = build_lookups(procs_rows, jcl_rows, sas_rows)
+
+    # compute leaf paths for every variable in variables.csv
+    all_rows = []
+    for var in sorted(idx[0].keys()):
+        paths = all_leaf_paths(idx, var)
+        if QUERY and norm(var) == norm(QUERY):
+            for p in paths:
+                print(" ->", " <- ".join(p))
+        for p in paths:
+            all_rows.append(enhance_one_path(p, idx, lookups))
+
+    with io.open(CSV_OUT, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(
+            f,
+            fieldnames=[
+                "copybook_variable","final_dd","final_assign","trace_path",
+                "jcl_rows","proc_rows","sas_rows","cobol_file_hint"
+            ]
+        )
+        w.writeheader()
+        for r in all_rows:
+            w.writerow(r)
+
+    print(f"Wrote {CSV_OUT}  (rows={len(all_rows)})")
+
+if __name__ == "__main__":
+    main()
