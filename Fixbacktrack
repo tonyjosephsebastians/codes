@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+backtrace.py — Only copybook variables; collision-safe via scoped nodes.
+
+Fixes:
+- Disambiguates fields that share the same name in different records (01 groups)
+  by scoping every variable under its root ancestor: VAR::<ROOT>::<NAME>.
+- Edges (parent/direct_sources) stay within the same scope; fall back to a global
+  match only if there is exactly ONE candidate to avoid wrong paths.
+
+Inputs in current folder:
+  copybook/               (your copybooks: .cpy/.cob/.txt/.inc…)
+  variables.csv           (from your COBOL parser)
+  procs_index.csv, jcl_index.csv, sas_index.csv  (from build_indexes.py)
+
+Output:
+  enhanced_backtrace.csv with columns:
+    copybook_variable, final_dd, final_assign, trace_path,
+    jcl_rows, proc_rows, sas_rows, cobol_file_hint
+"""
+
+import os, io, re, csv, glob
+from collections import defaultdict
+
+BASE = os.getcwd()
+CPY_DIR   = os.path.join(BASE, "copybook")
+CSV_VARS  = os.path.join(BASE, "variables.csv")
+CSV_PROCS = os.path.join(BASE, "procs_index.csv")
+CSV_JCL   = os.path.join(BASE, "jcl_index.csv")
+CSV_SAS   = os.path.join(BASE, "sas_index.csv")
+CSV_OUT   = os.path.join(BASE, "enhanced_backtrace.csv")
+
+# Optional: force a single copybook variable to test
+QUERY = ""   # e.g. "ALS-COMPANY-NUMBER"
+
+# ---------------- helpers ----------------
+IDENT = r"[A-Z0-9][A-Z0-9\-]*"
+def norm(s): return re.sub(r"\s+","",s.upper()) if isinstance(s,str) else s
+def split_list(s): return [norm(x) for x in (s or "").split(";") if x and x.strip()]
+def is_pseudo(n): return n.startswith("DD:") or n.startswith("ASSIGN:")
+
+def read_text(p):
+    with io.open(p, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
+
+# ---------------- build allow-list strictly from copybooks ----------------
+RE_ITEM = re.compile(rf"^\s*(\d{{2}})\s+({IDENT})\b", re.I)
+RE_88   = re.compile(r"^\s*88\b", re.I)
+
+def build_copybook_allowlist(copy_dir: str):
+    """
+    Return a set of ALL names defined in copybooks (all levels),
+    excluding 88-level and FILLER.
+    """
+    allow = set()
+    for path in glob.glob(os.path.join(copy_dir, "**/*"), recursive=True):
+        if not os.path.isfile(path): 
+            continue
+        if not path.upper().endswith((".CPY",".CPB",".CBL",".COB",".TXT",".INC",".COPY",".CP")):
+            continue
+        for raw in read_text(path).splitlines():
+            line = raw.rstrip("\n")
+            if not line.strip() or RE_88.match(line):
+                continue
+            m = RE_ITEM.match(line)
+            if not m:
+                continue
+            name = norm(m.group(2))
+            if name != "FILLER":
+                allow.add(name)
+    return allow
+
+# ---------------- load variables.csv & build SCOPED graph ----------------
+def load_vars_scoped(csv_path):
+    """
+    Build a scoped graph:
+
+    - root_of[name]: follow parent_record repeatedly to compute each var's root ancestor
+                     (01/group name). If chain is missing, use origin_file as a tie-breaker.
+    - Make node ids as ("VAR", root, name). Display name stays as `name`.
+    - For quick lookups:
+        by_scope_name[(root, name)] -> node
+        by_name[name] -> set of nodes across scopes
+    - Keep per-node edges: parent, sources, from_dd, assign, origin_file
+    """
+    # First pass: raw tables keyed by name (unscoped), as in CSV
+    rows, parent_of, from_dd_of, assign_of, sources_of, origin_file = {}, {}, defaultdict(set), defaultdict(set), defaultdict(set), {}
+    with io.open(csv_path, newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        lower = {k.lower(): k for k in r.fieldnames}
+        def get(row,key,default=""): return row.get(key, row.get(lower.get(key.lower(), ""), default))
+        for row in r:
+            v = norm(get(row,"variable"))
+            if not v: continue
+            rows[v] = row
+            p = norm(get(row,"parent_record"))
+            if p: parent_of[v] = p
+            origin_file[v] = get(row,"origin_file","") or ""
+            for dd in split_list(get(row,"from_dd","")): from_dd_of[v].add(dd)
+            for at in split_list(get(row,"assign_target","")): assign_of[v].add(at)
+            ds = get(row,"direct_sources") or get(row,"source_fields")
+            for s in split_list(ds): sources_of[v].add(s)
+
+    # Compute root ancestor for each variable by walking parent_of chains
+    root_of = {}
+    def root_for(name):
+        seen=set()
+        cur = name
+        while True:
+            if cur in seen:  # cycle guard
+                break
+            seen.add(cur)
+            p = parent_of.get(cur)
+            if not p:
+                break
+            cur = p
+        return cur
+    for v in rows.keys():
+        root_of[v] = root_for(v) or (origin_file.get(v,"") or "GLOBAL")
+
+    # Build scoped node ids
+    def node_id(root, name): return ("VAR", root, name)
+
+    nodes = set()
+    by_scope_name = {}
+    by_name = defaultdict(set)
+    origin_for_node = {}
+    parent_edge = {}          # node -> parent_node (same scope)
+    sources_edges = defaultdict(set)  # node -> set(node) (prefer same scope)
+    from_dd_node = defaultdict(set)   # node -> set(dd)
+    assign_node  = defaultdict(set)   # node -> set(assign)
+
+    # instantiate nodes
+    for name in rows.keys():
+        root = root_of[name]
+        nid = node_id(root, name)
+        nodes.add(nid)
+        by_scope_name[(root, name)] = nid
+        by_name[name].add(nid)
+        origin_for_node[nid] = origin_file.get(name,"")
+
+    # parent edges (always same scope: parent root must equal child root by construction)
+    for name, parent in parent_of.items():
+        r = root_of[name]
+        child = by_scope_name.get((r, name))
+        par   = by_scope_name.get((r, parent))
+        if child and par:
+            parent_edge[child] = par
+
+    # sources edges: prefer same scope; fall back to unique global if only ONE match exists
+    for name, srcs in sources_of.items():
+        r = root_of[name]
+        frm = by_scope_name.get((r, name))
+        if not frm: continue
+        for s in srcs:
+            same = by_scope_name.get((r, s))
+            if same:
+                sources_edges[frm].add(same)
+            else:
+                cands = list(by_name.get(s, []))
+                if len(cands) == 1:
+                    sources_edges[frm].add(cands[0])
+                # else ambiguous across scopes -> skip (avoid wrong hop)
+
+    # dd / assign attachments per node (no scope)
+    for name, dds in from_dd_of.items():
+        r = root_of[name]; frm = by_scope_name.get((r,name))
+        if not frm: continue
+        for dd in dds: from_dd_node[frm].add(dd)
+    for name, ats in assign_of.items():
+        r = root_of[name]; frm = by_scope_name.get((r,name))
+        if not frm: continue
+        for at in ats: assign_node[frm].add(at)
+
+    graph = {
+        "nodes": nodes,
+        "by_scope_name": by_scope_name,
+        "by_name": by_name,
+        "origin_for": origin_for_node,
+        "parent_of": parent_edge,
+        "sources_of": sources_edges,
+        "from_dd_of": from_dd_node,
+        "assign_of": assign_node,
+        "root_of_name": root_of,  # for target lookup
+    }
+    return graph
+
+# ---------------- neighbors (scoped) ----------------
+def neighbors_scoped(G, node):
+    # node is ("VAR", root, name) or "DD:..." or "ASSIGN:..."
+    parent_of  = G["parent_of"]
+    sources_of = G["sources_of"]
+    from_dd_of = G["from_dd_of"]
+    assign_of  = G["assign_of"]
+
+    if isinstance(node, str):
+        if node.startswith("ASSIGN:"):
+            return set()
+        if node.startswith("DD:"):
+            dd = node[3:]
+            hops=set()
+            # DD -> any ASSIGN that co-exists on some variable that references that DD
+            for n, dds in from_dd_of.items():
+                if dd in dds:
+                    for at in assign_of.get(n, set()):
+                        hops.add(f"ASSIGN:{at}")
+            return hops
+
+    hops=set()
+    # parent (same scope)
+    p = parent_of.get(node)
+    if p: hops.add(p)
+    # direct sources (already scoped in build)
+    hops |= sources_of.get(node, set())
+    # pseudo next hops from this variable
+    for dd in from_dd_of.get(node, set()):
+        hops.add(f"DD:{dd}")
+    for at in assign_of.get(node, set()):
+        hops.add(f"ASSIGN:{at}")
+    return hops
+
+# ---------------- leaf walk ----------------
+def all_leaf_paths_scoped(G, start_name, max_depth=2000):
+    root = G["root_of_name"].get(start_name)
+    if not root: 
+        return []
+    start = G["by_scope_name"].get((root, start_name))
+    if not start:
+        return []
+    paths=[]
+    stack=[[start]]
+    seen=set()
+    while stack:
+        path=stack.pop()
+        cur=path[-1]
+        nxts=neighbors_scoped(G, cur)
+        if not nxts or len(path)>max_depth:
+            paths.append(path); continue
+        for nxt in sorted(nxts, key=lambda x: (isinstance(x,tuple), str(x))):
+            e=(cur,nxt)
+            if e in seen: 
+                continue
+            seen.add(e)
+            # avoid cycles on real vars (tuples); allow pseudo strings
+            if isinstance(nxt, tuple) and nxt in path:
+                paths.append(path); continue
+            stack.append(path+[nxt])
+    return paths
+
+# ---------------- load indexes & join ----------------
+def load_csv_rows(path):
+    if not os.path.exists(path): return []
+    with io.open(path, newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+def build_lookups(procs_rows, jcl_rows, sas_rows):
+    by_ddname_proc = defaultdict(list)
+    by_ddname_jcl  = defaultdict(list)
+    by_sashandle   = defaultdict(list)
+    for r in procs_rows:
+        by_ddname_proc[norm(r.get("ddname",""))].append(r)
+    for r in jcl_rows:
+        by_ddname_jcl[norm(r.get("ddname",""))].append(r)
+    for r in sas_rows:
+        h = r.get("handle_or_ds","")
+        if h:
+            by_sashandle[norm(h)].append(r)
+    return by_ddname_proc, by_ddname_jcl, by_sashandle
+
+def rows_to_str(rows, cols):
+    if not rows: return ""
+    return " || ".join("|".join(str(r.get(c,"")) for c in cols) for r in rows)
+
+def display_name(node):
+    if isinstance(node, tuple):  # ("VAR", root, name)
+        return node[2]           # show just the field name
+    return node                  # "DD:..." or "ASSIGN:..."
+
+def enhance_one_path(G, path, lookups):
+    by_ddname_proc, by_ddname_jcl, by_sashandle = lookups
+    origin_for = G["origin_for"]
+
+    # first column: starting copybook variable (name only)
+    start_name = display_name(path[0])
+
+    assigns = [n[7:] for n in map(display_name, path) if isinstance(n, str) and n.startswith("ASSIGN:")]
+    dds     = [n[3:] for n in map(display_name, path) if isinstance(n, str) and n.startswith("DD:")]
+    final_assign = assigns[-1] if assigns else ""
+    final_dd     = dds[-1]     if dds     else ""
+
+    key = norm(final_assign) if final_assign else norm(final_dd)
+    proc_rows = by_ddname_proc.get(key, [])
+    jcl_rows  = by_ddname_jcl.get(key, [])
+    sas_rows  = by_sashandle.get(key, [])
+
+    if final_assign and not (proc_rows or jcl_rows or sas_rows) and final_dd:
+        key2 = norm(final_dd)
+        proc_rows = by_ddname_proc.get(key2, [])
+        jcl_rows  = by_ddname_jcl.get(key2, [])
+        sas_rows  = by_sashandle.get(key2, [])
+
+    # file hint: first real var in the path with origin info
+    file_hint = ""
+    for n in path:
+        if isinstance(n, tuple):
+            fh = origin_for.get(n,"")
+            if fh:
+                file_hint = fh
+                break
+
+    return {
+        "copybook_variable": start_name,
+        "final_dd": final_dd,
+        "final_assign": final_assign,
+        "trace_path": " <- ".join(display_name(n) for n in path),
+        "jcl_rows": rows_to_str(jcl_rows,  ["file","step","exec","ddname","dsn","disp","recfm","lrecl"]),
+        "proc_rows": rows_to_str(proc_rows, ["file","step","exec","ddname","dsn","disp","recfm","lrecl"]),
+        "sas_rows": rows_to_str(sas_rows,   ["file","data_step","kind","handle_or_ds","raw"]),
+        "cobol_file_hint": file_hint
+    }
+
+# ---------------- main ----------------
+def main():
+    # 1) allow-list of copybook vars
+    os.makedirs(CPY_DIR, exist_ok=True)
+    allow = build_copybook_allowlist(CPY_DIR)
+    if not allow:
+        print("Warning: copybook allow-list is empty (check ./copybook).")
+
+    # 2) scoped graph
+    if not os.path.exists(CSV_VARS):
+        print("variables.csv not found."); return
+    G = load_vars_scoped(CSV_VARS)
+
+    # 3) targets = ONLY names that are present in copybooks **and** in variables.csv
+    vars_in_csv = set(G["root_of_name"].keys())
+    targets = sorted(n for n in vars_in_csv if n in allow)
+    if QUERY:
+        targets = [norm(QUERY)] if norm(QUERY) in targets else []
+
+    # 4) indexes
+    procs = load_csv_rows(CSV_PROCS)
+    jcls  = load_csv_rows(CSV_JCL)
+    sas   = load_csv_rows(CSV_SAS)
+    lookups = build_lookups(procs, jcls, sas)
+
+    # 5) walk + enhance
+    out=[]
+    for name in targets:
+        for p in all_leaf_paths_scoped(G, name):
+            out.append(enhance_one_path(G, p, lookups))
+
+    # 6) write CSV
+    with io.open(CSV_OUT, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(
+            f,
+            fieldnames=[
+                "copybook_variable","final_dd","final_assign","trace_path",
+                "jcl_rows","proc_rows","sas_rows","cobol_file_hint"
+            ]
+        )
+        w.writeheader()
+        for r in out: w.writerow(r)
+
+    print(f"Wrote {CSV_OUT}  (rows={len(out)}). Scoped graph prevents cross-record mixups.")
+
+if __name__ == "__main__":
+    main()
