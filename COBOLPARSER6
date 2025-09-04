@@ -1,0 +1,443 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+backtrace_scoped.py — program-aware + dataset lineage
+
+Adds:
+  - Filter PROC/JCL rows to PGM=<owner_program> of the COBOL file.
+  - For the chosen row's DSN, find producer step (same DSN in another step)
+    and list its input DDs (e.g., INFOLOND, LONDAILY, SYSIN member).
+
+Outputs columns:
+  copybook_variable, final_key_type, final_key,
+  jcl_rows, proc_rows, sas_rows,
+  producer_file, producer_step, producer_exec, producer_inputs,
+  trace_path, cobol_file_hint
+"""
+
+import os, io, re, csv, glob
+from collections import defaultdict, Counter
+from heapq import heappush, heappop
+
+# ---- config (kept same as before) ----
+INCLUDE_ONLY_COPYBOOK = True
+ALLOW_CROSS_SCOPE_IF_UNIQUE = True
+PREFER_ASSIGN_OVER_DD = True
+MAX_DEPTH = 2000
+MAX_PATHS_PER_VAR = 50
+RENDER_ROOT_ON_DUPES = True
+
+BASE = os.getcwd()
+CPY_DIR   = os.path.join(BASE, "copybook")
+CSV_VARS  = os.path.join(BASE, "variables.csv")
+CSV_PROCS = os.path.join(BASE, "procs_index.csv")
+CSV_JCL   = os.path.join(BASE, "jcl_index.csv")
+CSV_SAS   = os.path.join(BASE, "sas_index.csv")
+CSV_OUT   = os.path.join(BASE, "enhanced_backtrace.csv")
+
+QUERY = ""  # set to one var to test
+
+IDENT = r"[A-Z0-9][A-Z0-9\-]*"
+RE_ITEM = re.compile(rf"^\s*(\d{{2}})\s+({IDENT})\b", re.I)
+RE_88   = re.compile(r"^\s*88\b", re.I)
+
+def norm(s): return re.sub(r"\s+","",s.upper()) if isinstance(s,str) else s
+def split_list(s): return [norm(x) for x in (s or "").split(";") if x and x.strip()]
+def is_pseudo(n): return isinstance(n,str) and (n.startswith("DD:") or n.startswith("ASSIGN:"))
+
+def read_text(p):
+    with io.open(p,"r",encoding="utf-8",errors="ignore") as f: return f.read()
+
+# ---------- copybook allow-list ----------
+def copybook_names(copy_dir):
+    allow=set()
+    for path in glob.glob(os.path.join(copy_dir,"**/*"), recursive=True):
+        if not os.path.isfile(path): continue
+        if not path.upper().endswith((".CPY",".CPB",".CBL",".COB",".TXT",".INC",".COPY",".CP")): continue
+        for raw in read_text(path).splitlines():
+            line=raw.rstrip("\n")
+            if not line.strip() or RE_88.match(line): continue
+            m=RE_ITEM.match(line)
+            if m:
+                name=norm(m.group(2))
+                if name!="FILLER":
+                    allow.add(name)
+    return allow
+
+# ---------- scoped graph (unchanged core) ----------
+def load_vars_scoped(csv_path, log):
+    rows, parent_of, from_dd_of, assign_of, sources_of, origin_file = {}, {}, defaultdict(set), defaultdict(set), defaultdict(set), {}
+    with io.open(csv_path, newline="", encoding="utf-8") as f:
+        r=csv.DictReader(f)
+        lower={k.lower():k for k in r.fieldnames}
+        def get(row,key,default=""): return row.get(key, row.get(lower.get(key.lower(), ""), default))
+        for row in r:
+            v=norm(get(row,"variable")); 
+            if not v: continue
+            rows[v]=True
+            p=norm(get(row,"parent_record"))
+            if p: parent_of[v]=p
+            origin_file[v]=get(row,"origin_file","") or ""
+            for dd in split_list(get(row,"from_dd","")): from_dd_of[v].add(dd)
+            for at in split_list(get(row,"assign_target","")): assign_of[v].add(at)
+            ds=get(row,"direct_sources") or get(row,"source_fields")
+            for s in split_list(ds): sources_of[v].add(s)
+
+    def root_for(name):
+        seen=set(); cur=name
+        while True:
+            if cur in seen: break
+            seen.add(cur)
+            p=parent_of.get(cur)
+            if not p: break
+            cur=p
+        return cur
+    root_of_name={n: (root_for(n) or (origin_file.get(n,"") or "GLOBAL")) for n in rows.keys()}
+
+    def node_id(root,name): return ("VAR",root,name)
+
+    nodes=set()
+    by_scope_name={}
+    by_name=defaultdict(set)
+    origin_for_node={}
+    root_members=defaultdict(set)
+
+    for name in rows.keys():
+        root=root_of_name[name]
+        nid=node_id(root,name)
+        nodes.add(nid)
+        by_scope_name[(root,name)]=nid
+        by_name[name].add(nid)
+        origin_for_node[nid]=origin_file.get(name,"")
+        root_members[root].add(name)
+
+    parent_edge={}
+    for name,parent in parent_of.items():
+        r=root_of_name[name]
+        child=by_scope_name.get((r,name))
+        par  =by_scope_name.get((r,parent))
+        if child and par: parent_edge[child]=par
+
+    sources_edges=defaultdict(set)
+    for name, srcs in sources_of.items():
+        r=root_of_name[name]; frm=by_scope_name.get((r,name))
+        if not frm: continue
+        for s in srcs:
+            same=by_scope_name.get((r,s))
+            if same:
+                sources_edges[frm].add(same)
+            else:
+                cands=list(by_name.get(s,[]))
+                if ALLOW_CROSS_SCOPE_IF_UNIQUE and len(cands)==1:
+                    sources_edges[frm].add(cands[0])
+                # else suppress ambiguous cross-scope hop
+
+    from_dd_node=defaultdict(set)
+    assign_node =defaultdict(set)
+    for name, dds in from_dd_of.items():
+        r=root_of_name[name]; frm=by_scope_name.get((r,name))
+        if not frm: continue
+        for dd in dds: from_dd_node[frm].add(dd)
+    for name, ats in assign_of.items():
+        r=root_of_name[name]; frm=by_scope_name.get((r,name))
+        if not frm: continue
+        for at in ats: assign_node[frm].add(at)
+
+    return {
+        "nodes": nodes,
+        "by_scope_name": by_scope_name,
+        "by_name": by_name,
+        "origin_for": origin_for_node,
+        "parent_of": parent_edge,
+        "sources_of": sources_edges,
+        "from_dd_of": from_dd_node,
+        "assign_of": assign_node,
+        "root_of_name": root_of_name,
+        "root_members": root_members
+    }
+
+def neighbors(G, node):
+    parent_of  = G["parent_of"]
+    sources_of = G["sources_of"]
+    from_dd_of = G["from_dd_of"]
+    assign_of  = G["assign_of"]
+
+    if is_pseudo(node):
+        if node.startswith("ASSIGN:"): return set()
+        if node.startswith("DD:"):
+            dd = node[3:]
+            hops=set()
+            for n, dds in from_dd_of.items():
+                if dd in dds:
+                    for at in assign_of.get(n,set()):
+                        hops.add(f"ASSIGN:{at}")
+            return hops
+
+    hops=set()
+    p = parent_of.get(node)
+    if p: hops.add(p)
+    hops |= sources_of.get(node, set())
+    for dd in from_dd_of.get(node, set()):
+        hops.add(f"DD:{dd}")
+    for at in assign_of.get(node, set()):
+        hops.add(f"ASSIGN:{at}")
+    return hops
+
+def rank_path(path):
+    tail = path[-1]
+    if is_pseudo(tail):
+        if tail.startswith("ASSIGN:"): class_rank = 0
+        elif tail.startswith("DD:"):    class_rank = 1
+        else:                           class_rank = 2
+    else:
+        class_rank = 2
+    return (class_rank, len(path))
+
+def all_leaf_paths_ranked(G, start_name, max_depth=MAX_DEPTH, cap=MAX_PATHS_PER_VAR):
+    root = G["root_of_name"].get(start_name)
+    if not root: return []
+    start = G["by_scope_name"].get((root, start_name))
+    if not start: return []
+    heap=[]; heappush(heap, (rank_path([start]), [start]))
+    leaves=[]
+    seen=set()
+    while heap and len(leaves) < cap:
+        _, path = heappop(heap)
+        cur = path[-1]
+        nxts = neighbors(G, cur)
+        if not nxts or len(path) > max_depth:
+            leaves.append(path); continue
+        for nxt in sorted(nxts, key=lambda x: (isinstance(x,tuple), str(x))):
+            e=(cur,nxt)
+            if e in seen: continue
+            seen.add(e)
+            if isinstance(nxt,tuple) and nxt in path:
+                leaves.append(path); continue
+            heappush(heap, (rank_path(path+[nxt]), path+[nxt]))
+    return leaves
+
+# ---------- indexes, lookups ----------
+def load_csv_rows(path):
+    if not os.path.exists(path): return []
+    with io.open(path, newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+def build_lookups(procs_rows, jcl_rows, sas_rows):
+    def N(x): return norm(x or "")
+    by_ddname_proc=defaultdict(list); by_ddname_jcl=defaultdict(list); by_sashandle=defaultdict(list)
+    for r in procs_rows: by_ddname_proc[N(r.get("ddname"))].append(r)
+    for r in jcl_rows:  by_ddname_jcl[N(r.get("ddname"))].append(r)
+    for r in sas_rows:
+        h=r.get("handle_or_ds","")
+        if h: by_sashandle[N(h)].append(r)
+    return by_ddname_proc, by_ddname_jcl, by_sashandle
+
+def rows_to_str(rows, cols):
+    if not rows: return ""
+    return " || ".join("|".join(str(r.get(c,"")) for c in cols) for r in rows)
+
+def disp(n, dupes=None):
+    if isinstance(n, tuple):
+        root, name = n[1], n[2]
+        return name
+    return n
+
+# ---------- helpers for program-aware filtering & lineage ----------
+SYS_DDS = {"SYSOUT","SYSPRINT","SYSUDUMP","SYSIN","SYSABOUT"}
+def program_name_from_file(path: str) -> str:
+    if not path: return ""
+    base = os.path.basename(path)
+    # "ALS1010.cbl" -> ALS1010
+    m = re.match(r"([A-Z0-9$#@]+)", base.upper())
+    return m.group(1) if m else base.upper()
+
+def filter_rows_to_program(rows, prog):
+    if not prog: return rows
+    filt = [r for r in rows if (r.get("exec_pgm","") or "").upper()==prog.upper()]
+    return filt or rows  # fall back if none
+
+def find_producer_and_inputs(all_proc_rows, all_jcl_rows, selected_row):
+    """
+    Given a selected PROC/JCL row (the one matched to IFILE),
+    find any other row with the same DSN, prefer a different step (producer),
+    then list that producer step's other inputs.
+    """
+    dsn = (selected_row.get("dsn","") or "").upper()
+    if not dsn:
+        return None, []
+
+    # gather all with same DSN
+    related = [r for r in all_proc_rows if (r.get("dsn","") or "").upper()==dsn]
+    related += [r for r in all_jcl_rows  if (r.get("dsn","") or "").upper()==dsn]
+
+    # prefer producer in a different step or different exec
+    def is_candidate(r):
+        same_step = (r.get("file")==selected_row.get("file") and r.get("step")==selected_row.get("step"))
+        return not same_step
+
+    candidates = [r for r in related if is_candidate(r)]
+    producer = None
+    # heuristics: prefer SAS or SORT producers
+    pref_execs = {"SAS","SORT","ICEMAN","DFSORT"}
+    for r in candidates:
+        pgm=(r.get("exec_pgm","") or "").upper()
+        if pgm in pref_execs:
+            producer=r; break
+    if not producer and candidates:
+        producer = candidates[0]
+
+    if not producer:
+        return None, []
+
+    # collect inputs from producer step (same file+step), excluding SYS*, and excluding the output dd itself
+    p_file, p_step = producer.get("file",""), producer.get("step","")
+    out_dd = (producer.get("ddname","") or "").upper()
+    same_step_rows = [r for r in all_proc_rows if r.get("file","")==p_file and r.get("step","")==p_step]
+    inputs = []
+    for r in same_step_rows:
+        dd = (r.get("ddname","") or "").upper()
+        if dd in SYS_DDS: 
+            # keep SYSIN if it contains a member name (e.g., TD.SASLIB(ALSLOND))
+            if dd=="SYSIN" and r.get("raw",""):
+                inputs.append(f"{dd}={r.get('raw')}")
+            continue
+        if dd == out_dd:
+            continue
+        if r.get("dsn",""):
+            inputs.append(f"{dd}={r.get('dsn')}")
+    return producer, inputs
+
+# ---------- enhance ----------
+def enhance_one(G, path, lookups, dupes, all_proc_rows, all_jcl_rows):
+    by_ddname_proc, by_ddname_jcl, by_sashandle = lookups
+    origin_for = G["origin_for"]
+
+    start_name = disp(path[0], dupes)
+    shows = [disp(n, dupes) for n in path]
+
+    # derive COBOL program from first real node that has origin_file
+    cob_file = ""
+    prog_name = ""
+    for n in path:
+        if isinstance(n,tuple):
+            cob_file = origin_for.get(n,"")
+            if cob_file:
+                prog_name = program_name_from_file(cob_file)
+                break
+
+    assigns=[x[7:] for x in shows if isinstance(x,str) and x.startswith("ASSIGN:")]
+    dds    =[x[3:] for x in shows if isinstance(x,str) and x.startswith("DD:")]
+
+    if PREFER_ASSIGN_OVER_DD:
+        final_key_type = "ASSIGN" if assigns else ("DD" if dds else "")
+        final_key = assigns[-1] if assigns else (dds[-1] if dds else "")
+    else:
+        final_key_type = "DD" if dds else ("ASSIGN" if assigns else "")
+        final_key = dds[-1] if dds else (assigns[-1] if assigns else "")
+
+    key = norm(final_key)
+
+    # base hits
+    proc_rows_all = by_ddname_proc.get(key, [])
+    jcl_rows_all  = by_ddname_jcl.get(key, [])
+    sas_rows      = by_sashandle.get(key, [])
+
+    # PROGRAM-AWARE filter: keep only rows where exec_pgm == owning program
+    proc_rows = filter_rows_to_program(proc_rows_all, prog_name)
+    jcl_rows  = filter_rows_to_program(jcl_rows_all,  prog_name)
+
+    # fallback: if filtering killed everything, fall back to all
+    if not proc_rows and proc_rows_all:
+        proc_rows = proc_rows_all
+    if not jcl_rows and jcl_rows_all:
+        jcl_rows = jcl_rows_all
+
+    # if ASSIGN filter produced nothing, try DD as fallback (and vice versa)
+    if final_key_type=="ASSIGN" and not (proc_rows or jcl_rows or sas_rows) and dds:
+        key2 = norm(dds[-1])
+        proc_rows = filter_rows_to_program(by_ddname_proc.get(key2, []), prog_name) or by_ddname_proc.get(key2, [])
+        jcl_rows  = filter_rows_to_program(by_ddname_jcl.get(key2, []),  prog_name) or by_ddname_jcl.get(key2, [])
+    elif final_key_type=="DD" and not (proc_rows or jcl_rows or sas_rows) and assigns:
+        key2 = norm(assigns[-1])
+        proc_rows = filter_rows_to_program(by_ddname_proc.get(key2, []), prog_name) or by_ddname_proc.get(key2, [])
+        jcl_rows  = filter_rows_to_program(by_ddname_jcl.get(key2, []),  prog_name) or by_ddname_jcl.get(key2, [])
+
+    # DATASET LINEAGE: pick one selected row (prefer PROC), then chase producer & its inputs
+    chosen = (proc_rows[0] if proc_rows else (jcl_rows[0] if jcl_rows else None))
+    producer_file = producer_step = producer_exec = ""
+    producer_inputs = []
+    if chosen:
+        prod, inputs = find_producer_and_inputs(all_proc_rows, all_jcl_rows, chosen)
+        if prod:
+            producer_file = prod.get("file","")
+            producer_step = prod.get("step","")
+            producer_exec = prod.get("exec","")
+            producer_inputs = inputs
+
+    file_hint = cob_file
+
+    return {
+        "copybook_variable": start_name,
+        "final_key_type": final_key_type,
+        "final_key": final_key,
+        "jcl_rows": rows_to_str(jcl_rows,  ["file","step","exec","exec_pgm","ddname","dsn"]),
+        "proc_rows": rows_to_str(proc_rows, ["file","step","exec","exec_pgm","ddname","dsn"]),
+        "sas_rows": rows_to_str(sas_rows,   ["file","data_step","kind","handle_or_ds","raw"]),
+        "producer_file": producer_file,
+        "producer_step": producer_step,
+        "producer_exec": producer_exec,
+        "producer_inputs": "; ".join(producer_inputs),
+        "trace_path": " <- ".join(shows),
+        "cobol_file_hint": file_hint
+    }
+
+# ---------- main ----------
+def main():
+    # allow-list
+    copy_names = copybook_names(CPY_DIR) if INCLUDE_ONLY_COPYBOOK else None
+
+    # graph
+    if not os.path.exists(CSV_VARS):
+        print("variables.csv not found"); return
+    G = load_vars_scoped(CSV_VARS, [])
+
+    name_counts = Counter()
+    for _, _, name in G["nodes"]:
+        name_counts[name] += 1
+    dupes = {n for n,c in name_counts.items() if c>1}
+
+    vars_in_csv = set(G["root_of_name"].keys())
+    targets = sorted(n for n in vars_in_csv if (not INCLUDE_ONLY_COPYBOOK or n in copy_names))
+    if QUERY:
+        q=norm(QUERY); targets = [q] if q in targets else []
+
+    procs = load_csv_rows(CSV_PROCS)
+    jcls  = load_csv_rows(CSV_JCL)
+    sas   = load_csv_rows(CSV_SAS)
+    lookups = build_lookups(procs, jcls, sas)
+
+    out=[]
+    seen=set()
+    for name in targets:
+        for p in all_leaf_paths_ranked(G, name):
+            row = enhance_one(G, p, lookups, dupes, procs, jcls)
+            key=(row["copybook_variable"], row["final_key_type"], row["final_key"], row["trace_path"])
+            if key in seen: 
+                continue
+            seen.add(key)
+            out.append(row)
+
+    with io.open(CSV_OUT,"w",newline="",encoding="utf-8") as f:
+        w=csv.DictWriter(f, fieldnames=[
+            "copybook_variable","final_key_type","final_key",
+            "jcl_rows","proc_rows","sas_rows",
+            "producer_file","producer_step","producer_exec","producer_inputs",
+            "trace_path","cobol_file_hint"
+        ])
+        w.writeheader()
+        for r in out: w.writerow(r)
+
+    print(f"Wrote {CSV_OUT} (rows={len(out)})")
+
+if __name__=="__main__":
+    main()
