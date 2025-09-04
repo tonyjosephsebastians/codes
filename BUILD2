@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+build_indexes.py
+Scan ./proc, ./jcl, ./sas to create:
+  - procs_index.csv (adds exec_pgm)
+  - jcl_index.csv   (adds exec_pgm)
+  - sas_index.csv
+"""
+
+import os, re, io, csv, glob
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+BASE = os.getcwd()
+PROC_DIR  = os.path.join(BASE, "proc")
+JCL_DIR   = os.path.join(BASE, "jcl")
+SAS_DIR   = os.path.join(BASE, "sas")
+
+OUT_PROCS = os.path.join(BASE, "procs_index.csv")
+OUT_JCL   = os.path.join(BASE, "jcl_index.csv")
+OUT_SAS   = os.path.join(BASE, "sas_index.csv")
+
+IDENT = r"[A-Z0-9][A-Z0-9\-_]*"
+
+def read_text(p):
+    with io.open(p, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
+
+def norm(s):
+    import re
+    return re.sub(r"\s+","",s.upper()) if isinstance(s,str) else s
+
+def kv_from_dd_tail(tail: str) -> dict:
+    d = {}
+    for key in ["DSN","DSNAME","DISP","UNIT","SPACE","VOL"]:
+        m = re.search(rf"\b{key}\s*=\s*([^,]+)", tail, re.I)
+        if m:
+            d[key] = m.group(1).strip()
+    m = re.search(r"DCB\s*=\s*\(([^)]*)\)", tail, re.I)
+    if m:
+        dcb = m.group(1)
+        for key in ["RECFM","LRECL","BLKSIZE"]:
+            m2 = re.search(rf"\b{key}\s*=\s*([A-Z0-9]+)", dcb, re.I)
+            if m2: d[key] = m2.group(1)
+    # normalize DSNAME -> DSN
+    if "DSN" not in d and "DSNAME" in d:
+        d["DSN"] = d["DSNAME"]
+    return d
+
+RE_EXEC = re.compile(rf"^\s*//({IDENT})?\s*EXEC\b\s+([A-Z0-9=,()'\"/ +\-]+)", re.I)
+RE_DD   = re.compile(rf"^\s*//({IDENT})\s+DD\b\s+(.*)$", re.I)
+
+def parse_exec_pgm(execspec: str) -> str:
+    if not execspec: return ""
+    # PGM=ALS1010, or EXEC SAS
+    m = re.search(r"\bPGM\s*=\s*([A-Z0-9$#@]+)", execspec, re.I)
+    if m: return m.group(1).upper()
+    # if no PGM=, try first token (e.g., 'SAS', 'IKJEFT01')
+    head = execspec.strip().split(",")[0].strip().upper()
+    return head
+
+def index_jcl_like_one(path):
+    rows=[]
+    step=""; execspec=""
+    for ln, line in enumerate(read_text(path).splitlines(), 1):
+        if line.strip().startswith("//*"):
+            continue
+        m = RE_EXEC.match(line)
+        if m:
+            step = (m.group(1) or "").upper()
+            execspec = m.group(2)
+        m = RE_DD.match(line)
+        if m:
+            dd = m.group(1).upper()
+            tail = m.group(2)
+            kv = kv_from_dd_tail(tail)
+            rows.append({
+                "file": path, "line": ln, "step": step,
+                "exec": execspec, "exec_pgm": parse_exec_pgm(execspec),
+                "ddname": dd,
+                "dsn": (kv.get("DSN","") or "").upper(),
+                "disp": kv.get("DISP",""),
+                "recfm": kv.get("RECFM",""),
+                "lrecl": kv.get("LRECL",""),
+                "blksize": kv.get("BLKSIZE",""),
+                "raw": tail.strip()
+            })
+    return rows
+
+def index_sas_one(path):
+    rows=[]
+    RE_DATA   = re.compile(r"\bDATA\s+([A-Z0-9_]+)\s*;", re.I)
+    RE_INFILE = re.compile(r"\bINFILE\s+([A-Z0-9_]+)\b.*?;", re.I)
+    RE_FILE   = re.compile(r"\bFILE\s+([A-Z0-9_]+)\b.*?;", re.I)
+    RE_MERGE  = re.compile(r"\bMERGE\s+(.+?);", re.I)
+    RE_SET    = re.compile(r"\bSET\s+(.+?);", re.I)
+    cur_data = ""
+    for ln, line in enumerate(read_text(path).splitlines(), 1):
+        m = RE_DATA.search(line)
+        if m: cur_data = m.group(1).upper()
+        for rx, kind in ((RE_INFILE,"INFILE"), (RE_FILE,"FILE")):
+            mm = rx.search(line)
+            if mm:
+                rows.append({"file":path,"line":ln,"data_step":cur_data,"kind":kind,
+                             "handle_or_ds":mm.group(1).upper(),"raw":line.strip()})
+        mm = RE_MERGE.search(line)
+        if mm:
+            toks = [t for t in re.split(r"\s+", mm.group(1).strip()) if t and t.upper()!="BY"]
+            for t in toks:
+                rows.append({"file":path,"line":ln,"data_step":cur_data,"kind":"MERGE",
+                             "handle_or_ds":t.upper().rstrip(";"),"raw":line.strip()})
+        mm = RE_SET.search(line)
+        if mm:
+            toks = [t for t in re.split(r"\s+", mm.group(1).strip()) if t]
+            for t in toks:
+                rows.append({"file":path,"line":ln,"data_step":cur_data,"kind":"SET",
+                             "handle_or_ds":t.upper().rstrip(";"),"raw":line.strip()})
+    return rows
+
+def write_csv(path, fieldnames, rows):
+    with io.open(path,"w",newline="",encoding="utf-8") as f:
+        w=csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader(); [w.writerow(r) for r in rows]
+
+def collect_files(root, exts):
+    return [p for p in glob.glob(os.path.join(root,"**/*"), recursive=True)
+            if os.path.isfile(p) and p.upper().endswith(exts)]
+
+def main():
+    os.makedirs(PROC_DIR, exist_ok=True)
+    os.makedirs(JCL_DIR, exist_ok=True)
+    os.makedirs(SAS_DIR, exist_ok=True)
+
+    proc_files = collect_files(PROC_DIR, (".JCL",".PROC",".PRC",".CNTL",".TXT"))
+    jcl_files  = collect_files(JCL_DIR,  (".JCL",".CNTL",".TXT"))
+    sas_files  = collect_files(SAS_DIR,  (".SAS",".TXT",".INC"))
+
+    prows=[]; jrows=[]; srows=[]
+
+    with ProcessPoolExecutor() as ex:
+        futs = {ex.submit(index_jcl_like_one, p): ("PROC", p) for p in proc_files}
+        futs.update({ex.submit(index_jcl_like_one, p): ("JCL", p) for p in jcl_files})
+        futs.update({ex.submit(index_sas_one, p): ("SAS", p) for p in sas_files})
+        for fut in as_completed(futs):
+            kind, p = futs[fut]
+            rows = fut.result()
+            if kind=="PROC": prows.extend(rows)
+            elif kind=="JCL": jrows.extend(rows)
+            else: srows.extend(rows)
+
+    write_csv(OUT_PROCS, ["file","line","step","exec","exec_pgm","ddname","dsn","disp","recfm","lrecl","blksize","raw"], prows)
+    write_csv(OUT_JCL,   ["file","line","step","exec","exec_pgm","ddname","dsn","disp","recfm","lrecl","blksize","raw"], jrows)
+    write_csv(OUT_SAS,   ["file","line","data_step","kind","handle_or_ds","raw"], srows)
+
+    print(f"Wrote {OUT_PROCS} ({len(prows)}), {OUT_JCL} ({len(jrows)}), {OUT_SAS} ({len(srows)})")
+
+if __name__ == "__main__":
+    main()
