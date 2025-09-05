@@ -6,7 +6,7 @@ import csv, io, os, re
 INPUT  = "variables.csv"
 OUTPUT = "variables_clean.csv"
 
-# first identifier-like token (letters/numbers/_/-)
+# regex: first identifier-like token
 RE_TOK = re.compile(r"[A-Za-z0-9_-]+")
 
 def first_token(s: str) -> str:
@@ -14,17 +14,6 @@ def first_token(s: str) -> str:
         return ""
     m = RE_TOK.search(s)
     return m.group(0).upper() if m else ""
-
-def clean_assign_target(value: str) -> str:
-    """
-    - If multiple values separated by ';', keep only the first non-empty chunk.
-    - From that chunk, extract the first identifier token (uppercased).
-    """
-    if not value:
-        return ""
-    # take first chunk before ';'
-    first = value.split(";")[0].strip()
-    return first_token(first)
 
 def main():
     if not os.path.exists(INPUT):
@@ -34,29 +23,35 @@ def main():
     with io.open(INPUT, newline="", encoding="utf-8") as f_in:
         reader = csv.DictReader(f_in)
         fieldnames = reader.fieldnames or []
-        # find the real header name for assign_target (case-insensitive)
+        # find exact header for assign_target (case-insensitive)
         name_map = {k.lower(): k for k in fieldnames}
         at_col = name_map.get("assign_target")
         if not at_col:
             print("ERROR: 'assign_target' column not found (check header name).")
             return
 
-        rows = list(reader)
+        rows_out = []
+        dropped = 0
+        cleaned = 0
 
-    changed = 0
-    for r in rows:
-        orig = r.get(at_col, "")
-        cleaned = clean_assign_target(orig)
-        if cleaned != orig:
-            changed += 1
-        r[at_col] = cleaned
+        for r in reader:
+            orig = r.get(at_col, "").strip()
+            if ";" in orig:        # multiple assign targets → drop row
+                dropped += 1
+                continue
+            if orig:
+                cleaned_val = first_token(orig)
+                if cleaned_val != orig:
+                    cleaned += 1
+                r[at_col] = cleaned_val
+            rows_out.append(r)
 
     with io.open(OUTPUT, "w", newline="", encoding="utf-8") as f_out:
         writer = csv.DictWriter(f_out, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(rows_out)
 
-    print(f"Done. Wrote {OUTPUT}  (cleaned {changed} rows).")
+    print(f"Done. Wrote {OUTPUT}  (cleaned {cleaned} rows, dropped {dropped} rows).")
 
 if __name__ == "__main__":
     main()
