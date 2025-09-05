@@ -1,0 +1,75 @@
+# --- add near the top of index_cobol.py ---
+import re
+
+IDENT = r"[A-Z0-9$#@-]+"
+RE_SELECT   = re.compile(rf"^\s*SELECT\s+({IDENT})\b", re.I)
+RE_ASSIGNTO = re.compile(
+    rf"\bASSIGN\s+TO\s+({IDENT})"
+    r"(?=\s*\.|\s+(?:FILE|ORGANIZATION|ACCESS|STATUS)\b|$)",
+    re.I,
+)
+
+def _clean_ident(s: str) -> str:
+    if not s:
+        return ""
+    m = re.match(rf"{IDENT}", s.upper())
+    return m.group(0) if m else ""
+
+def extract_select_assign_pairs(cobol_text: str) -> dict[str, str]:
+    """
+    Returns mapping like { 'INPUT-FILE': 'IFILE', 'LONCTX-FILE': 'LONCTX', ... }
+    Works even when ASSIGN TO and other clauses span multiple lines.
+    """
+    pairs: dict[str, str] = {}
+    lines = cobol_text.splitlines()
+
+    in_select = False
+    cur_select = None
+    buf = []
+
+    for raw in lines:
+        line = raw.rstrip("\n")
+
+        # start of a SELECT clause
+        m_sel = RE_SELECT.match(line)
+        if m_sel:
+            # flush previous clause if we somehow missed a period
+            if in_select and cur_select and buf:
+                chunk = " ".join(buf)
+                m_asg = RE_ASSIGNTO.search(chunk)
+                if m_asg:
+                    pairs[_clean_ident(cur_select)] = _clean_ident(m_asg.group(1))
+            # begin new clause
+            in_select = True
+            cur_select = _clean_ident(m_sel.group(1))
+            buf = [line]
+            # if the same line already ends the clause with '.', process immediately
+            if "." in line:
+                chunk = " ".join(buf)
+                m_asg = RE_ASSIGNTO.search(chunk)
+                if m_asg:
+                    pairs[cur_select] = _clean_ident(m_asg.group(1))
+                in_select = False
+                cur_select = None
+                buf = []
+            continue
+
+        if in_select:
+            buf.append(line)
+            if "." in line:  # end of the SELECT clause
+                chunk = " ".join(buf)
+                m_asg = RE_ASSIGNTO.search(chunk)
+                if m_asg:
+                    pairs[_clean_ident(cur_select)] = _clean_ident(m_asg.group(1))
+                in_select = False
+                cur_select = None
+                buf = []
+
+    # safety: flush trailing clause without a dot
+    if in_select and cur_select and buf:
+        chunk = " ".join(buf)
+        m_asg = RE_ASSIGNTO.search(chunk)
+        if m_asg:
+            pairs[_clean_ident(cur_select)] = _clean_ident(m_asg.group(1))
+
+    return pairs
