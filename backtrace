@@ -1,0 +1,18 @@
+# --- inside backtrace_scoped.py ---
+IDENT_TOK = re.compile(r"[A-Z0-9$#@-]+", re.I)
+def _tok_only(s: str) -> str:
+    if not s:
+        return ""
+    m = IDENT_TOK.search(s)
+    return m.group(0).upper() if m else ""
+
+# ... inside load_vars_scoped(), when building 'assign_of' and 'from_dd_of' ...
+for at in split_list(get(row, "assign_target", "")):
+    at_clean = _tok_only(at)           # 'LONCTXFILESTATUS...' -> 'LONCTX'
+    if at_clean:
+        assign_of[v].add(at_clean)
+
+for dd in split_list(get(row, "from_dd", "")):
+    dd_clean = _tok_only(dd)           # defensive clean
+    if dd_clean:
+        from_dd_of[v].add(dd_clean)
