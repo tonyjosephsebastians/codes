@@ -1,0 +1,68 @@
+
+Task:
+- Identify the variable in this chunk most similar to `{state['copybook_variable']}`.
+- If no relevant match, return "NO_MATCH".
+Return only the variable name.
+"""
+        resp = llm.invoke(prompt)
+        candidate = resp.content.strip()
+        if candidate and candidate != "NO_MATCH":
+            best_match = candidate
+            break  # stop at first good match
+
+    state["matched_variable"] = best_match or "NO_MATCH"
+    return state
+
+
+# ---------------- build graph ----------------
+workflow = StateGraph(State)
+workflow.add_node("match_var", match_variable_in_file_node)
+workflow.set_entry_point("match_var")
+workflow.add_edge("match_var", END)
+
+app = workflow.compile()
+
+
+# ---------------- main ----------------
+def main():
+    # Load mapping table
+    if not os.path.exists(CSV_MAP):
+        raise FileNotFoundError("Mapping file final_key_map.csv is missing!")
+
+    map_df = pd.read_csv(CSV_MAP)
+    mapping = dict(zip(map_df["final_key"], map_df["actual_file"]))
+
+    # Load variables
+    df = pd.read_csv(CSV_VARS)
+    results = []
+
+    for _, row in df.iterrows():
+        fk = row["final_key"]
+        actual_file = mapping.get(fk, None)
+
+        if not actual_file:
+            matched_var = "NO_FILE_MAPPING"
+        else:
+            file_path = os.path.join(SOURCE_DIR, actual_file)
+            if not os.path.exists(file_path):
+                matched_var = "FILE_NOT_FOUND"
+            else:
+                init_state = {
+                    "copybook_variable": row["copybook_variable"],
+                    "final_key": fk,
+                    "actual_file": actual_file
+                }
+                out_state = app.invoke(init_state)
+                matched_var = out_state.get("matched_variable", "NO_MATCH")
+
+        row_out = dict(row)
+        row_out["actual_file"] = actual_file or "NO_MAPPING"
+        row_out["matched_variable"] = matched_var
+        results.append(row_out)
+
+    out_df = pd.DataFrame(results)
+    out_df.to_csv(CSV_OUT, index=False)
+    print(f"Wrote {CSV_OUT} with {len(out_df)} rows")
+
+if __name__ == "__main__":
+    main()
