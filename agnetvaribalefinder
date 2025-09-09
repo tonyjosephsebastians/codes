@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import io
+import pandas as pd
+from typing import List
+from langchain_openai import AzureChatOpenAI
+from langgraph.graph import StateGraph, END
+
+# ---------------- config ----------------
+CSV_VARS = os.path.join(os.getcwd(), "variables.csv")        # main input
+CSV_MAP  = os.path.join(os.getcwd(), "final_key_map.csv")    # mapping table: final_key → actual_file
+CSV_OUT  = os.path.join(os.getcwd(), "final_variables.csv")  # output
+SOURCE_DIR = os.path.join(os.getcwd(), "wsfiles")            # real files live here
+
+AZURE_DEPLOYMENT = "gpt-4o"   # GPT-4 Omni
+AZURE_ENDPOINT   = "https://<your-resource>.openai.azure.com/"
+AZURE_KEY        = "<your-key>"
+
+CHUNK_SIZE = 10000   # ~10k characters
+OVERLAP    = 500
+
+
+# ---------------- helpers ----------------
+def read_file_text(filename: str) -> str:
+    """Read COBOL/copybook file text safely"""
+    path = os.path.join(SOURCE_DIR, filename)
+    if not os.path.exists(path):
+        return ""
+    with io.open(path, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
+
+def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = OVERLAP) -> List[str]:
+    """Split text into overlapping chunks for GPT analysis"""
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(start + size, len(text))
+        chunks.append(text[start:end])
+        if end >= len(text):
+            break
+        start = end - overlap
+    return chunks
+
+def get_llm():
+    return AzureChatOpenAI(
+        deployment_name=AZURE_DEPLOYMENT,
+        openai_api_version="2024-02-01",
+        azure_endpoint=AZURE_ENDPOINT,
+        api_key=AZURE_KEY,
+        temperature=0
+    )
+
+
+# ---------------- state ----------------
+class State(dict):
+    copybook_variable: str
+    final_key: str
+    actual_file: str
+    matched_variable: str
+
+
+# ---------------- nodes ----------------
+def match_variable_in_file_node(state: State) -> State:
+    """Use GPT-4o to find best variable match in the mapped actual file"""
+    llm = get_llm()
+
+    file_text = read_file_text(state["actual_file"])
+    if not file_text:
+        state["matched_variable"] = "FILE_NOT_FOUND"
+        return state
+
+    # Decide whether to chunk
+    if len(file_text) < 50000:   # small → process whole file
+        chunks = [file_text]
+    else:                        # large → chunk into 10k segments
+        chunks = chunk_text(file_text)
+
+    best_match = None
+    for chunk in chunks:
+        prompt = f"""
+We are analyzing a COBOL copybook file.
+
+Target variable: `{state['copybook_variable']}`
+
+File chunk:
