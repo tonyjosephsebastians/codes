@@ -22,7 +22,6 @@ CPY_DIR   = os.path.join(BASE, "copybook")
 CSV_VARS  = os.path.join(BASE, "variables.csv")
 CSV_PROCS = os.path.join(BASE, "procs_index.csv")
 CSV_JCL   = os.path.join(BASE, "jcl_index.csv")
-CSV_SAS   = os.path.join(BASE, "sas_index.csv")
 CSV_OUT   = os.path.join(BASE, "enhanced_backtrace.csv")
 
 # Optional: set to a single copybook variable to print just its paths
