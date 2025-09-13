@@ -1,0 +1,48 @@
+import { diff_match_patch, Diff } from "diff-match-patch";
+const dmp = new diff_match_patch();
+
+const handleDiff = () => {
+  if (!parsedDocuments.original?.html || !parsedDocuments.comparison?.html) return;
+
+  const text1 = parsedDocuments.original.html;
+  const text2 = parsedDocuments.comparison.html;
+
+  const diffs: Diff[] = dmp.diff_main(text1, text2);
+  dmp.diff_cleanupSemantic(diffs);
+
+  let changeIndex = 0;
+  const leftHtml = diffs
+    .map(([op, data]) => {
+      switch (op) {
+        case diff_match_patch.DIFF_DELETE:
+          return `<span id="change-${changeIndex++}" class="diff-change bg-red-200">${data}</span>`;
+        case diff_match_patch.DIFF_EQUAL:
+          return data;
+        default:
+          return data;
+      }
+    })
+    .join("");
+
+  changeIndex = 0; // reset for right doc
+  const rightHtml = diffs
+    .map(([op, data]) => {
+      switch (op) {
+        case diff_match_patch.DIFF_INSERT:
+          return `<span id="change-${changeIndex++}" class="diff-change bg-green-200">${data}</span>`;
+        case diff_match_patch.DIFF_EQUAL:
+          return data;
+        default:
+          return data;
+      }
+    })
+    .join("");
+
+  setParsedDocuments((prev) => ({
+    ...prev,
+    original: { ...prev.original, html: leftHtml },
+    comparison: { ...prev.comparison, html: rightHtml },
+  }));
+
+  setCurrentChangeIndex(0);
+};
