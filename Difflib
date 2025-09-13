@@ -1,0 +1,74 @@
+const scrollToChange = (index: number) => {
+  // Select same-indexed change in both viewers
+  const leftEl = document.querySelector(`#left-doc #change-${index}`) as HTMLElement | null;
+  const rightEl = document.querySelector(`#right-doc #change-${index}`) as HTMLElement | null;
+
+  // Clear old highlight
+  document.querySelectorAll(".diff-change").forEach(el => el.classList.remove("diff-active"));
+
+  if (leftEl) {
+    leftEl.classList.add("diff-active");
+    leftEl.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+  if (rightEl) {
+    rightEl.classList.add("diff-active");
+    rightEl.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+
+  setCurrentChangeIndex(index);
+};
+
+const handleNextChange = () => {
+  const total = document.querySelectorAll("#left-doc .diff-change").length;
+  if (total === 0) return;
+  scrollToChange((currentChangeIndex + 1) % total);
+};
+
+const handlePrevChange = () => {
+  const total = document.querySelectorAll("#left-doc .diff-change").length;
+  if (total === 0) return;
+  scrollToChange((currentChangeIndex - 1 + total) % total);
+};
+
+<div id="left-doc" className="bg-gray-50 rounded-2xl border">
+  <DocumentViewer
+    document={currentProject?.originalDocument}
+    title="Baseline Template"
+    parsedDocument={parsedDocuments.original}
+    onScroll={handleScrollSync}
+    scrollTop={scrollPosition.scrollTop}
+    scrollLeft={scrollPosition.scrollLeft}
+    syncScroll={true}
+  />
+</div>
+
+<div id="right-doc" className="bg-gray-50 rounded-2xl border">
+  <DocumentViewer
+    document={currentProject?.compareDocument}
+    title="Supplier Redline Version"
+    parsedDocument={parsedDocuments.comparison}
+    onScroll={handleScrollSync}
+    scrollTop={scrollPosition.scrollTop}
+    scrollLeft={scrollPosition.scrollLeft}
+    syncScroll={true}
+  />
+</div>
+
+
+
+<div className="flex gap-2 mb-2">
+  <Button onClick={handleDiff} className="bg-yellow-500 text-white px-4 py-2 rounded">
+    Show Differences
+  </Button>
+  <Button onClick={handlePrevChange} className="bg-gray-300 px-2 py-1 rounded">↑ Prev</Button>
+  <Button onClick={handleNextChange} className="bg-gray-300 px-2 py-1 rounded">↓ Next</Button>
+</div>
+
+
+.diff-change {
+  padding: 0 2px;
+}
+.diff-active {
+  background-color: orange !important;
+}
+
