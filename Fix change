@@ -1,0 +1,33 @@
+// helper to strip tags
+const stripHtml = (html: string) => {
+  const div = document.createElement("div");
+  div.innerHTML = html;
+  return div.textContent || div.innerText || "";
+};
+
+const text1 = stripHtml(parsedDocuments.original.html);
+const text2 = stripHtml(parsedDocuments.comparison.html);
+
+const diffs = dmp.diff_main(text1, text2);
+dmp.diff_cleanupSemantic(diffs);
+
+const scrollToChange = (index: number) => {
+  const elLeft = document.querySelector(`#left-doc #change-${index}`) as HTMLElement | null;
+  const elRight = document.querySelector(`#right-doc #change-${index}`) as HTMLElement | null;
+
+  if (elLeft && leftContainerRef.current) {
+    leftContainerRef.current.scrollTo({
+      top: elLeft.offsetTop - leftContainerRef.current.offsetTop - 50,
+      behavior: "smooth"
+    });
+  }
+
+  if (elRight && rightContainerRef.current) {
+    rightContainerRef.current.scrollTo({
+      top: elRight.offsetTop - rightContainerRef.current.offsetTop - 50,
+      behavior: "smooth"
+    });
+  }
+
+  setCurrentChangeIndex(index);
+};
