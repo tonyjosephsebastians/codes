@@ -1,0 +1,21 @@
+const containerRef = useRef<HTMLDivElement>(null);
+
+...
+
+<div
+  ref={containerRef}
+  className="flex-1 min-h-0 overflow-y-auto"
+  onMouseUp={handleTextSelection}
+>
+  <WordDocumentPreview
+    content={parsedDocument.html}
+    currentPage={currentPage}
+    totalPages={parsedDocument.metadata?.pages || 0}
+    onPageChange={setCurrentPage}
+    documentTitle={parsedDocument.metadata?.title || "Document"}
+    onScroll={onScroll}
+    scrollTop={scrollTop}
+    scrollLeft={scrollLeft}
+    syncScroll={syncScroll}
+  />
+</div>
