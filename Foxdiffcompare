@@ -1,0 +1,72 @@
+import { diff_match_patch } from "diff-match-patch";
+const dmp = new diff_match_patch();
+
+function diffHtmlPreserveFormatting(html1: string, html2: string) {
+  const parser = new DOMParser();
+  const doc1 = parser.parseFromString(html1, "text/html");
+  const doc2 = parser.parseFromString(html2, "text/html");
+
+  const walker1 = doc1.createTreeWalker(doc1.body, NodeFilter.SHOW_TEXT, null);
+  const walker2 = doc2.createTreeWalker(doc2.body, NodeFilter.SHOW_TEXT, null);
+
+  let textNode1: Node | null;
+  let textNode2: Node | null;
+  let changeIndex = 0;
+  let hasChanges = false;
+
+  while ((textNode1 = walker1.nextNode()) && (textNode2 = walker2.nextNode())) {
+    const text1 = textNode1.textContent || "";
+    const text2 = textNode2.textContent || "";
+
+    if (text1 === text2) continue;
+
+    const diffs = dmp.diff_main(text1, text2);
+    dmp.diff_cleanupSemantic(diffs);
+
+    if (diffs.some(([op]) => op !== diff_match_patch.DIFF_EQUAL)) {
+      hasChanges = true;
+    }
+
+    // Build replacement HTML for each node
+    const new1 = diffs
+      .map(([op, data]) => {
+        if (op === diff_match_patch.DIFF_DELETE) {
+          return `<span id="change-${changeIndex}" class="diff-change bg-red-200">${data}</span>`;
+        }
+        if (op === diff_match_patch.DIFF_EQUAL) {
+          return data;
+        }
+        return "";
+      })
+      .join("");
+
+    const new2 = diffs
+      .map(([op, data]) => {
+        if (op === diff_match_patch.DIFF_INSERT) {
+          return `<span id="change-${changeIndex}" class="diff-change bg-green-200">${data}</span>`;
+        }
+        if (op === diff_match_patch.DIFF_EQUAL) {
+          return data;
+        }
+        return "";
+      })
+      .join("");
+
+    changeIndex++;
+
+    // Replace text nodes with highlighted spans
+    const span1 = document.createElement("span");
+    span1.innerHTML = new1;
+    textNode1.parentNode?.replaceChild(span1, textNode1);
+
+    const span2 = document.createElement("span");
+    span2.innerHTML = new2;
+    textNode2.parentNode?.replaceChild(span2, textNode2);
+  }
+
+  return {
+    left: doc1.body.innerHTML,
+    right: doc2.body.innerHTML,
+    hasChanges,
+  };
+}
