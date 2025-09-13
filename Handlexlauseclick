@@ -1,0 +1,44 @@
+const handleClauseClick = (clauseId: string) => {
+  const clause = documentClauses.find((c) => c.id === clauseId);
+  if (!clause || !parsedDocuments.comparison?.html) {
+    console.warn("Clause or parsed document not found.");
+    return;
+  }
+
+  const clauseRegex = new RegExp(clause.title, "i");
+
+  // Get the scrollable preview container
+  const container = document.querySelector(
+    ".flex-1.min-h-0.overflow-y-auto"
+  ) as HTMLElement | null;
+
+  if (!container) {
+    console.warn("Scroll container not found!");
+    return;
+  }
+
+  // Look for <strong> inside the live preview
+  const strongTag = Array.from(container.querySelectorAll("strong")).find(
+    (el) => clauseRegex.test(el.textContent || "")
+  );
+
+  if (strongTag) {
+    const targetElement = strongTag.closest("li") || strongTag;
+
+    if (targetElement instanceof HTMLElement) {
+      // Relative offset inside the scrollable container
+      const offsetTop =
+        targetElement.offsetTop - container.offsetTop;
+
+      console.log("Scrolling to:", clause.title, "at", offsetTop);
+
+      setScrollPosition((prev) => ({
+        ...prev,
+        targetClause: clause.title,
+        scrollTop: offsetTop,
+      }));
+    }
+  } else {
+    console.warn("No <strong> found for clause:", clause.title);
+  }
+};
