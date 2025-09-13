@@ -1,0 +1,50 @@
+const [originalHtml, setOriginalHtml] = useState<{left: string, right: string}>({
+  left: parsedDocuments.original?.html || "",
+  right: parsedDocuments.comparison?.html || ""
+});
+const [diffMode, setDiffMode] = useState(false);
+
+
+const handleDiff = () => {
+  if (diffMode) {
+    // ✅ Restore original documents
+    setParsedDocuments((prev) => ({
+      ...prev,
+      original: { ...prev.original, html: originalHtml.left },
+      comparison: { ...prev.comparison, html: originalHtml.right },
+    }));
+    setDiffMode(false);
+    return;
+  }
+
+  // ✅ Otherwise compute differences
+  if (!parsedDocuments.original?.html || !parsedDocuments.comparison?.html) return;
+
+  const { left, right, hasChanges } = diffHtmlPreserveAll(
+    parsedDocuments.original.html,
+    parsedDocuments.comparison.html
+  );
+
+  if (!hasChanges) {
+    alert("✅ No differences found — both documents are identical.");
+    return;
+  }
+
+  setParsedDocuments((prev) => ({
+    ...prev,
+    original: { ...prev.original, html: left },
+    comparison: { ...prev.comparison, html: right },
+  }));
+
+  setDiffMode(true);
+  setCurrentChangeIndex(0);
+};
+
+
+<Button 
+  onClick={handleDiff} 
+  className="bg-yellow-500 text-white px-4 py-2 rounded"
+>
+  {diffMode ? "Hide Differences" : "Show Differences"}
+</Button>
+
