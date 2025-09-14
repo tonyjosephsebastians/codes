@@ -1,0 +1,21 @@
+if (el1.tagName === el2.tagName) {
+  // If block-level element → compare text directly
+  if (["P", "LI", "STRONG", "H1", "H2", "H3", "TD", "TH"].includes(el1.tagName)) {
+    const t1 = normalizeText(el1.textContent || "");
+    const t2 = normalizeText(el2.textContent || "");
+    if (t1 !== t2) {
+      const diffed = diffNodes(document.createTextNode(t1), document.createTextNode(t2), changeIndexRef);
+      return {
+        left: `<${el1.tagName.toLowerCase()}>${diffed?.left || ""}</${el1.tagName.toLowerCase()}>`,
+        right: `<${el2.tagName.toLowerCase()}>${diffed?.right || ""}</${el2.tagName.toLowerCase()}>`,
+      };
+    }
+  }
+
+  // Fallback → recurse children as before
+  const { left, right } = diffChildren(el1.childNodes, el2.childNodes, changeIndexRef);
+  return {
+    left: `<${el1.tagName.toLowerCase()}>${left}</${el1.tagName.toLowerCase()}>`,
+    right: `<${el2.tagName.toLowerCase()}>${right}</${el2.tagName.toLowerCase()}>`,
+  };
+}
