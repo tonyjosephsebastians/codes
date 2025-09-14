@@ -1,0 +1,290 @@
+// html-diff-structured.ts
+import { diff_match_patch } from "diff-match-patch";
+
+const dmp = new diff_match_patch();
+
+/* ---------- Utilities ---------- */
+
+const BLOCK_TEXT_TAGS = new Set([
+  "P", "LI", "STRONG", "EM", "SPAN", "B", "I", "H1", "H2", "H3", "H4"
+]);
+
+function normalizeText(t: string): string {
+  return t
+    .replace(/\u00A0/g, " ")      // NBSP -> space
+    .replace(/\s+/g, " ")         // collapse whitespace
+    .replace(/\s+([.,;:!?])/g, "$1")
+    .replace(/([.,;:!?])\s+/g, "$1 ")
+    .trim();
+}
+
+function openTagWithAttrs(el: HTMLElement): string {
+  const parts: string[] = [el.tagName.toLowerCase()];
+  for (let i = 0; i < el.attributes.length; i++) {
+    const a = el.attributes[i];
+    // Basic escaping
+    const v = (a.value || "").replace(/"/g, "&quot;");
+    parts.push(`${a.name}="${v}"`);
+  }
+  return `<${parts.join(" ")}>`;
+}
+function wrapElement(el: HTMLElement, inner: string): string {
+  return `${openTagWithAttrs(el)}${inner}</${el.tagName.toLowerCase()}>`;
+}
+
+function isTextNode(n: Node | null): n is Text {
+  return !!n && n.nodeType === Node.TEXT_NODE;
+}
+function isEl(n: Node | null): n is HTMLElement {
+  return !!n && n.nodeType === Node.ELEMENT_NODE;
+}
+
+/* ---------- Text diff (normalized) ---------- */
+
+function diffText(
+  leftText: string,
+  rightText: string,
+  ref: { value: number }
+): { left: string; right: string } {
+  const a = normalizeText(leftText);
+  const b = normalizeText(rightText);
+  if (a === b) return { left: a, right: b };
+
+  const diffs = dmp.diff_main(a, b);
+  dmp.diff_cleanupSemantic(diffs);
+
+  let left = "", right = "";
+  for (const [op, data] of diffs as [number, string][]) {
+    if (op === diff_match_patch.DIFF_EQUAL) {
+      left += data;  right += data;
+    } else if (op === diff_match_patch.DIFF_DELETE) {
+      left += `<span id="change-${ref.value}" class="diff-change diff-del">${data}</span>`;
+    } else if (op === diff_match_patch.DIFF_INSERT) {
+      right += `<span id="change-${ref.value}" class="diff-change diff-ins">${data}</span>`;
+    }
+  }
+  ref.value++;
+  return { left, right };
+}
+
+/* ---------- Alignment (LCS) for siblings ---------- */
+
+type Pair = { i: number; j: number };
+
+function nodeSignature(n: ChildNode): string {
+  if (isEl(n)) {
+    const tag = n.tagName;
+    if (tag === "TR") {
+      // concatenate first ~40 chars of each cell
+      const cells = Array.from(n.children)
+        .filter((c) => (c as HTMLElement).tagName === "TD" || (c as HTMLElement).tagName === "TH")
+        .map((c) => normalizeText((c as HTMLElement).textContent || "").slice(0, 40))
+        .join("|");
+      return `TR:${cells}`;
+    }
+    if (tag === "TD" || tag === "TH" || tag === "LI" || tag === "P") {
+      return `${tag}:${normalizeText(n.textContent || "").slice(0, 80)}`;
+    }
+    return `${tag}:${(n.childNodes?.length || 0)}`;
+  }
+  // text node
+  return `#text:${normalizeText(n.textContent || "").slice(0, 80)}`;
+}
+
+function lcsAlign(a: ChildNode[], b: ChildNode[]): Pair[] {
+  const A = a.length, B = b.length;
+  const dp: number[][] = Array.from({ length: A + 1 }, () => Array(B + 1).fill(0));
+  const sigA = a.map(nodeSignature);
+  const sigB = b.map(nodeSignature);
+
+  for (let i = A - 1; i >= 0; i--) {
+    for (let j = B - 1; j >= 0; j--) {
+      if (sigA[i] === sigB[j]) dp[i][j] = 1 + dp[i + 1][j + 1];
+      else dp[i][j] = Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const pairs: Pair[] = [];
+  let i = 0, j = 0;
+  while (i < A && j < B) {
+    if (sigA[i] === sigB[j]) { pairs.push({ i, j }); i++; j++; }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) i++;
+    else j++;
+  }
+  return pairs;
+}
+
+/* ---------- Core diff ---------- */
+
+function diffChildrenAligned(
+  parent1: HTMLElement | null,
+  parent2: HTMLElement | null,
+  nodes1: NodeListOf<ChildNode>,
+  nodes2: NodeListOf<ChildNode>,
+  ref: { value: number }
+): { left: string; right: string } {
+  const leftArr = Array.from(nodes1);
+  const rightArr = Array.from(nodes2);
+
+  const tag = (parent1?.tagName || parent2?.tagName || "").toUpperCase();
+  const ALIGN =
+    tag === "UL" || tag === "OL" || tag === "TBODY" || tag === "TABLE" || tag === "TR";
+
+  if (!ALIGN) {
+    // index-by-index fallback
+    let left = "", right = "";
+    const max = Math.max(leftArr.length, rightArr.length);
+    for (let k = 0; k < max; k++) {
+      const n1 = leftArr[k] || null;
+      const n2 = rightArr[k] || null;
+      const r = diffNodes(n1, n2, ref);
+      if (r) { left += r.left; right += r.right; }
+    }
+    return { left, right };
+  }
+
+  // LCS alignment path
+  const pairs = lcsAlign(leftArr, rightArr);
+  let left = "", right = "";
+  let i = 0, j = 0;
+  for (const p of pairs) {
+    // deletions up to p.i
+    while (i < p.i) {
+      const r = diffNodes(leftArr[i], null, ref);
+      if (r) { left += r.left; right += r.right; }
+      i++;
+    }
+    // insertions up to p.j
+    while (j < p.j) {
+      const r = diffNodes(null, rightArr[j], ref);
+      if (r) { left += r.left; right += r.right; }
+      j++;
+    }
+    // matched pair
+    const r = diffNodes(leftArr[p.i], rightArr[p.j], ref);
+    if (r) { left += r.left; right += r.right; }
+    i = p.i + 1;
+    j = p.j + 1;
+  }
+  // tail
+  while (i < leftArr.length) {
+    const r = diffNodes(leftArr[i++], null, ref);
+    if (r) { left += r.left; right += r.right; }
+  }
+  while (j < rightArr.length) {
+    const r = diffNodes(null, rightArr[j++], ref);
+    if (r) { left += r.left; right += r.right; }
+  }
+  return { left, right };
+}
+
+function diffNodes(
+  node1: Node | null,
+  node2: Node | null,
+  ref: { value: number }
+): { left: string; right: string } | null {
+  // both text
+  if (isTextNode(node1) && isTextNode(node2)) {
+    return diffText(node1.data || "", node2.data || "", ref);
+  }
+
+  // both elements
+  if (isEl(node1) && isEl(node2)) {
+    const el1 = node1, el2 = node2;
+
+    if (el1.tagName === el2.tagName) {
+      // 1) cell-level compare
+      if ((el1.tagName === "TD" || el1.tagName === "TH")) {
+        // If both are plain text cells, text-diff; else recurse on children
+        const onlyText1 = el1.childNodes.length === 1 && isTextNode(el1.childNodes[0]);
+        const onlyText2 = el2.childNodes.length === 1 && isTextNode(el2.childNodes[0]);
+        if (onlyText1 && onlyText2) {
+          const inner = diffText(el1.textContent || "", el2.textContent || "", ref);
+          return {
+            left: wrapElement(el1, inner.left),
+            right: wrapElement(el2, inner.right),
+          };
+        }
+      }
+
+      // 2) headings / paragraphs / list items – diff on normalized text
+      if (BLOCK_TEXT_TAGS.has(el1.tagName)) {
+        const t1 = normalizeText(el1.textContent || "");
+        const t2 = normalizeText(el2.textContent || "");
+        if (t1 !== t2) {
+          const inner = diffText(t1, t2, ref);
+          return {
+            left: wrapElement(el1, inner.left),
+            right: wrapElement(el2, inner.right),
+          };
+        }
+      }
+
+      // 3) table row alignment (TR -> TD/TH)
+      if (el1.tagName === "TR" && el2.tagName === "TR") {
+        const { left, right } = diffChildrenAligned(el1, el2, el1.childNodes, el2.childNodes, ref);
+        return { left: wrapElement(el1, left), right: wrapElement(el2, right) };
+      }
+
+      // 4) UL/OL/TABLE/TBODY – aligned recursion
+      if (["UL","OL","TABLE","TBODY"].includes(el1.tagName)) {
+        const { left, right } = diffChildrenAligned(el1, el2, el1.childNodes, el2.childNodes, ref);
+        return { left: wrapElement(el1, left), right: wrapElement(el2, right) };
+      }
+
+      // 5) default recursion (index-aligned)
+      const { left, right } = diffChildrenAligned(el1, el2, el1.childNodes, el2.childNodes, ref);
+      return { left: wrapElement(el1, left), right: wrapElement(el2, right) };
+    }
+
+    // different tags → wrap each as change
+    const left = `<span id="change-${ref.value}" class="diff-change diff-del">${el1.outerHTML}</span>`;
+    const right = `<span id="change-${ref.value}" class="diff-change diff-ins">${el2.outerHTML}</span>`;
+    ref.value++;
+    return { left, right };
+  }
+
+  // only in left
+  if (node1 && !node2) {
+    if (isEl(node1) && node1.tagName === "TR") {
+      const left = `<span id="change-${ref.value}" class="diff-change diff-del">${(node1 as HTMLElement).outerHTML}</span>`;
+      ref.value++;
+      return { left, right: "" };
+    }
+    const html = isEl(node1) ? (node1 as HTMLElement).outerHTML : (node1.textContent || "");
+    const left = `<span id="change-${ref.value}" class="diff-change diff-del">${html}</span>`;
+    ref.value++;
+    return { left, right: "" };
+  }
+
+  // only in right
+  if (!node1 && node2) {
+    if (isEl(node2) && node2.tagName === "TR") {
+      const right = `<span id="change-${ref.value}" class="diff-change diff-ins">${(node2 as HTMLElement).outerHTML}</span>`;
+      ref.value++;
+      return { left: "", right };
+    }
+    const html = isEl(node2) ? (node2 as HTMLElement).outerHTML : (node2.textContent || "");
+    const right = `<span id="change-${ref.value}" class="diff-change diff-ins">${html}</span>`;
+    ref.value++;
+    return { left: "", right };
+  }
+
+  return null;
+}
+
+/* ---------- Public API ---------- */
+
+export function diffHtmlPreserveAll(html1: string, html2: string) {
+  const parser = new DOMParser();
+  const doc1 = parser.parseFromString(html1, "text/html");
+  const doc2 = parser.parseFromString(html2, "text/html");
+
+  const changeIndexRef = { value: 0 };
+  const { left, right } = diffChildrenAligned(doc1.body, doc2.body, doc1.body.childNodes, doc2.body.childNodes, changeIndexRef);
+
+  return {
+    left,
+    right,
+    changes: changeIndexRef.value,
+  };
+}
