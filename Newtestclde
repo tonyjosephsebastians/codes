@@ -1,0 +1,109 @@
+import { diff_match_patch } from "diff-match-patch";
+
+const dmp = new diff_match_patch();
+
+function diffChildren(
+  nodes1: NodeListOf<ChildNode>,
+  nodes2: NodeListOf<ChildNode>,
+  changeIndexRef: { value: number }
+): { left: string; right: string } {
+  let left = "";
+  let right = "";
+
+  const max = Math.max(nodes1.length, nodes2.length);
+
+  for (let i = 0; i < max; i++) {
+    const n1 = nodes1[i] || null;
+    const n2 = nodes2[i] || null;
+    const diffed = diffNodes(n1, n2, changeIndexRef);
+    if (diffed) {
+      left += diffed.left;
+      right += diffed.right;
+    }
+  }
+
+  return { left, right };
+}
+
+function diffNodes(
+  node1: Node | null,
+  node2: Node | null,
+  changeIndexRef: { value: number }
+): { left: string; right: string } | null {
+  // Case 1: both are text nodes
+  if (node1?.nodeType === Node.TEXT_NODE && node2?.nodeType === Node.TEXT_NODE) {
+    const text1 = node1.textContent || "";
+    const text2 = node2.textContent || "";
+
+    if (text1 === text2) {
+      return { left: text1, right: text2 };
+    }
+
+    const diffs = dmp.diff_main(text1, text2);
+    dmp.diff_cleanupSemantic(diffs);
+
+    let left = "",
+      right = "";
+
+    diffs.forEach(([op, data]) => {
+      if (op === diff_match_patch.DIFF_EQUAL) {
+        left += data;
+        right += data;
+      } else if (op === diff_match_patch.DIFF_DELETE) {
+        left += `<span id="change-${changeIndexRef.value}" class="diff-change bg-red-200">${data}</span>`;
+      } else if (op === diff_match_patch.DIFF_INSERT) {
+        right += `<span id="change-${changeIndexRef.value}" class="diff-change bg-green-200">${data}</span>`;
+      }
+    });
+
+    changeIndexRef.value++;
+    return { left, right };
+  }
+
+  // Case 2: both elements, same tag
+  if (node1?.nodeType === Node.ELEMENT_NODE && node2?.nodeType === Node.ELEMENT_NODE) {
+    const el1 = node1 as HTMLElement;
+    const el2 = node2 as HTMLElement;
+
+    if (el1.tagName === el2.tagName) {
+      const { left, right } = diffChildren(el1.childNodes as any, el2.childNodes as any, changeIndexRef);
+      return {
+        left: `<${el1.tagName.toLowerCase()}>${left}</${el1.tagName.toLowerCase()}>`,
+        right: `<${el2.tagName.toLowerCase()}>${right}</${el2.tagName.toLowerCase()}>`,
+      };
+    }
+  }
+
+  // Case 3: exists only in left
+  if (node1 && !node2) {
+    const html = node1.nodeType === Node.ELEMENT_NODE
+      ? (node1 as HTMLElement).outerHTML
+      : node1.textContent || "";
+    const left = `<span id="change-${changeIndexRef.value}" class="diff-change bg-red-200">${html}</span>`;
+    changeIndexRef.value++;
+    return { left, right: "" };
+  }
+
+  // Case 4: exists only in right
+  if (!node1 && node2) {
+    const html = node2.nodeType === Node.ELEMENT_NODE
+      ? (node2 as HTMLElement).outerHTML
+      : node2.textContent || "";
+    const right = `<span id="change-${changeIndexRef.value}" class="diff-change bg-green-200">${html}</span>`;
+    changeIndexRef.value++;
+    return { left: "", right };
+  }
+
+  return null;
+}
+
+export function diffHtmlPreserveAll(html1: string, html2: string) {
+  const parser = new DOMParser();
+  const doc1 = parser.parseFromString(html1, "text/html");
+  const doc2 = parser.parseFromString(html2, "text/html");
+
+  const changeIndexRef = { value: 0 };
+  const { left, right } = diffChildren(doc1.body.childNodes as any, doc2.body.childNodes as any, changeIndexRef);
+
+  return { left, right, hasChanges: changeIndexRef.value > 0 };
+}
