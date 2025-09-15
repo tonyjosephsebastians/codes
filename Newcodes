@@ -1,0 +1,43 @@
+const scrollContainer = document.querySelector(
+  ".flex-1.min-h-0.overflow-y-auto"
+) as HTMLElement | null;
+
+const contentContainer = document.querySelector(
+  ".word-document-content.prose.prose-sm.max-w-none"
+) as HTMLElement | null;
+
+if (!scrollContainer || !contentContainer) {
+  console.warn("Scroll or content container not found!");
+  return;
+}
+
+// Look for matching <strong>
+const strongTag = Array.from(contentContainer.querySelectorAll("strong")).find(
+  (el) =>
+    (el.textContent || "").toLowerCase().includes(
+      clause.title.toLowerCase().trim()
+    )
+);
+
+if (strongTag) {
+  const targetElement = strongTag.closest("li") || strongTag;
+
+  if (targetElement instanceof HTMLElement) {
+    const offsetTop = targetElement.offsetTop - scrollContainer.offsetTop;
+
+    console.log("Scrolling to:", clause.title, "at", offsetTop);
+
+    scrollContainer.scrollTo({
+      top: offsetTop,
+      behavior: "smooth",
+    });
+
+    setScrollPosition((prev) => ({
+      ...prev,
+      targetClause: clause.title,
+      scrollTop: offsetTop,
+    }));
+  }
+} else {
+  console.warn("No <strong> found for clause:", clause.title);
+}
