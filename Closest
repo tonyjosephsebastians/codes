@@ -1,0 +1,31 @@
+// Look for <strong> inside the live preview
+const strongTag = Array.from(container.querySelectorAll("strong")).find(
+  (el) => (el.textContent || "").toLowerCase().includes(clause.title.toLowerCase().trim())
+);
+
+if (strongTag) {
+  const targetElement = strongTag.closest("li") || strongTag;
+
+  if (targetElement instanceof HTMLElement) {
+    const offsetTop = targetElement.offsetTop - container.offsetTop;
+
+    console.log("Scrolling to:", clause.title, "at", offsetTop);
+
+    setScrollPosition((prev) => ({
+      ...prev,
+      targetClause: clause.title,
+      scrollTop: offsetTop,
+    }));
+  }
+} else {
+  // fallback
+  const offsetTop = Math.floor(Math.random() * (1000 - 300 + 1)) + 300;
+  console.log("No <strong> found, scrolling to random offset:", offsetTop);
+
+  setScrollPosition((prev) => ({
+    ...prev,
+    targetClause: clause.title,
+    scrollTop: offsetTop,
+  }));
+  console.warn("No <strong> found for clause:", clause.title);
+}
