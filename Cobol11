@@ -1,0 +1,12 @@
+(el) => clauseRegex.test((el.textContent || "").trim())
+
+const clauseRegex = new RegExp(clause.title.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+
+const targetElement = strongTag.closest("li") || const clauseRegex = new RegExp(
+  clause.title.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+  "i"
+);
+
+const strongTag = Array.from(container.querySelectorAll("strong")).find(
+  (el) => clauseRegex.test((el.textContent || "").trim())
+);
