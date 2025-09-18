@@ -1,0 +1,19 @@
+mime_map = {
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/pdf": "pdf",
+    "text/plain": "txt"
+}
+
+mime_type = file.content_type
+short_type = mime_map.get(mime_type, "other")
+
+db_document = document_models.DocumentFile(
+    project_id=project_id,
+    name=file.filename[:255],
+    size=file_size,
+    type=short_type,
+    document_type=document_type[:50] if document_type else None,
+    content_html=parsed_doc['html'] if parsed_doc.get('html') else None,
+    page_count=parsed_doc['metadata'].get('pages'),
+    word_count=parsed_doc['metadata'].get('wordCount')
+)
