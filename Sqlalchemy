@@ -54,7 +54,14 @@ class Settings(BaseSettings):
         db="daas-kmai-kmai-ent07-devdb"
     )
 
-
+class Settings(BaseSettings):
+    DATABASE_URL: str = (
+        "mssql+pyodbc://@d4003-eastus2-asql-727.database.windows.net/"
+        "daas-kmai-kmai-ent07-devdb"
+        "?driver=ODBC+Driver+18+for+SQL+Server"
+        "&authentication=ActiveDirectoryMsi"
+        "&Encrypt=yes"
+    )
 
 class Settings(BaseSettings):
     DATABASE_URL: str = (
