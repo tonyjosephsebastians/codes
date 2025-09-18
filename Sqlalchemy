@@ -100,3 +100,9 @@ def get_db():
     finally:
         db.close()
 
+
+
+
+# Database
+DATABASE_URL=mssql+pyodbc://@d4003-eastus2-asql-727.database.windows.net/daas-kmai-kmai-ent07-devdb?driver=ODBC+Driver+18+for+SQL+Server&authentication=ActiveDirectoryMsi&Encrypt=yes
+
