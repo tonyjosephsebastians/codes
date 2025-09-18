@@ -1,0 +1,53 @@
+import uuid
+from datetime import datetime
+from sqlalchemy import Column, String, DateTime
+from app.database import Base
+
+class Project(Base):
+    __tablename__ = "projects"
+    __table_args__ = {"schema": "dbo"}   # ensure dbo schema in Azure SQL
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    username = Column(String, nullable=False, index=True)   # <-- NEW column
+    name = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_modified = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from app.config import settings
+
+# Create SQLAlchemy engine for Azure SQL
+engine = create_engine(
+    settings.DATABASE_URL,
+    pool_pre_ping=True,   # helps avoid stale connections
+)
+
+# Session factory
+SessionLocal = sessionmaker(
+    autocommit=False,
+    autoflush=False,
+    bind=engine
+)
+
+# Base class for ORM models
+Base = declarative_base()
+
+# Dependency for FastAPI
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+
+class Settings(BaseSettings):
+    DATABASE_URL: str = (
+        "mssql+pyodbc://@d4003-eastus2-asql-727.database.windows.net/daas-kmai-kmai-ent07-devdb"
+        "?driver=ODBC+Driver+18+for+SQL+Server"
+        "&authentication=ActiveDirectoryMsi"
+    )
