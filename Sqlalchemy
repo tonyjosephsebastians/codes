@@ -44,6 +44,17 @@ def get_db():
         db.close()
 
 
+class Settings(BaseSettings):
+    DATABASE_URL: str = (
+        "mssql+pyodbc://@{server}/{db}"
+        "?driver=ODBC+Driver+18+for+SQL+Server"
+        "&authentication=ActiveDirectoryMsi"
+    ).format(
+        server="d4003-eastus2-asql-727.database.windows.net",
+        db="daas-kmai-kmai-ent07-devdb"
+    )
+
+
 
 class Settings(BaseSettings):
     DATABASE_URL: str = (
