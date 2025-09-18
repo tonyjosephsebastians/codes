@@ -1,0 +1,96 @@
+from sqlalchemy.orm import relationship
+
+class Project(Base):
+    __tablename__ = "projects"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    username = Column(String(100), nullable=False)
+    name = Column(String(255), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_modified = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # 🔗 Relationships (manual join since no ForeignKey)
+    documents = relationship(
+        "DocumentFile",
+        primaryjoin="Project.id == foreign(DocumentFile.project_id)",
+        back_populates="project"
+    )
+
+    risks = relationship(
+        "RiskSummary",
+        primaryjoin="Project.id == foreign(RiskSummary.project_id)",
+        back_populates="project"
+    )
+
+    comparisons = relationship(
+        "ComparisonResult",
+        primaryjoin="Project.id == foreign(ComparisonResult.project_id)",
+        back_populates="project"
+    )
+
+
+
+class DocumentFile(Base):
+    __tablename__ = "document_files"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    project_id = Column(String(36))  # no FK
+    name = Column(String(255), nullable=False)
+    size = Column(Integer, nullable=False)
+    type = Column(String(50), nullable=False)
+    file_path = Column(String(500))
+    content_html = Column(Text)
+    uploaded_at = Column(DateTime(timezone=True), server_default=func.now())
+    document_type = Column(String(50))
+
+    page_count = Column(Integer)
+    word_count = Column(Integer)
+
+    # 🔗 Relationship back to Project
+    project = relationship(
+        "Project",
+        primaryjoin="foreign(DocumentFile.project_id) == Project.id",
+        back_populates="documents"
+    )
+
+class RiskSummary(Base):
+    __tablename__ = "risk_summaries"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    project_id = Column(String(36))  # no FK
+    total_weighted_score = Column(Float)
+    overall_risk_rating = Column(String(50))
+    high_risk_count = Column(Integer)
+    medium_risk_count = Column(Integer)
+    low_risk_count = Column(Integer)
+    clause_risk_scores = Column(JSON)
+    clause_groups = Column(JSON)
+    recommendations = Column(JSON)
+    generated_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    # 🔗 Relationship back to Project
+    project = relationship(
+        "Project",
+        primaryjoin="foreign(RiskSummary.project_id) == Project.id",
+        back_populates="risks"
+    )
+
+
+class ComparisonResult(Base):
+    __tablename__ = "comparison_results"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    project_id = Column(String(36))  # no FK
+    additions = Column(Integer)
+    deletions = Column(Integer)
+    modifications = Column(Integer)
+    changes = Column(JSON)
+    visual_comparison = Column(JSON)
+    generated_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    # 🔗 Relationship back to Project
+    project = relationship(
+        "Project",
+        primaryjoin="foreign(ComparisonResult.project_id) == Project.id",
+        back_populates="comparisons"
+    )
