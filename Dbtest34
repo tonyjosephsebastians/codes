@@ -1,0 +1,7 @@
+projects = (
+        db.query(project_models.Project)
+        .filter(project_models.Project.username == username)  # 🔑 filter by owner
+        .offset(skip)
+        .limit(limit)
+        .all()
+    )
