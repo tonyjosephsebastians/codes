@@ -68,4 +68,35 @@ class Settings(BaseSettings):
         "mssql+pyodbc://@d4003-eastus2-asql-727.database.windows.net/daas-kmai-kmai-ent07-devdb"
         "?driver=ODBC+Driver+18+for+SQL+Server"
         "&authentication=ActiveDirectoryMsi"
+
+
+
     )
+
+
+
+from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from app.config import settings
+
+# Azure SQL engine with Managed Identity
+engine = create_engine(
+    settings.DATABASE_URL,
+    pool_pre_ping=True  # checks connections before using
+)
+
+# Session factory
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# Base class for models
+Base = declarative_base()
+
+# Dependency for FastAPI
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
