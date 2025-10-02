@@ -1,0 +1,76 @@
+import { diff_match_patch } from "diff-match-patch";
+
+const dmp = new diff_match_patch();
+
+function tokenize(text: string): string[] {
+  return text.replace(/\s+/g, " ").trim().split(/\b/).filter(t => t.trim().length > 0);
+}
+
+function similarityScore(a: string, b: string): number {
+  const setA = new Set(tokenize(a.toLowerCase()));
+  const setB = new Set(tokenize(b.toLowerCase()));
+  const intersection = [...setA].filter(x => setB.has(x)).length;
+  const union = new Set([...setA, ...setB]).size;
+  return union === 0 ? 0 : intersection / union;
+}
+
+function diffTokens(left: string, right: string): string {
+  const diffs = dmp.diff_main(left, right);
+  dmp.diff_cleanupSemantic(diffs);
+
+  let html = "";
+  diffs.forEach(([op, data]) => {
+    if (op === diff_match_patch.DIFF_EQUAL) {
+      html += data;
+    } else if (op === diff_match_patch.DIFF_DELETE) {
+      html += `<span style="color:red;text-decoration:line-through">${data}</span>`;
+    } else if (op === diff_match_patch.DIFF_INSERT) {
+      html += `<span style="color:green">${data}</span>`;
+    }
+  });
+  return html;
+}
+
+export function diffHtmlWordStyle(html1: string, html2: string) {
+  const parser = new DOMParser();
+  const doc1 = parser.parseFromString(html1, "text/html");
+  const doc2 = parser.parseFromString(html2, "text/html");
+
+  const paras1 = Array.from(doc1.body.querySelectorAll("p, div, li")).map(el => el.innerText.trim());
+  const paras2 = Array.from(doc2.body.querySelectorAll("p, div, li")).map(el => el.innerText.trim());
+
+  const matched = new Set<number>();
+  let right = "";
+
+  paras1.forEach(p1 => {
+    // find best match in paras2
+    let bestScore = 0;
+    let bestIndex = -1;
+    paras2.forEach((p2, j) => {
+      if (matched.has(j)) return;
+      const score = similarityScore(p1, p2);
+      if (score > bestScore) {
+        bestScore = score;
+        bestIndex = j;
+      }
+    });
+
+    if (bestIndex !== -1 && bestScore > 0.5) {
+      // word-level diff inside this paragraph
+      right += `<p>${diffTokens(p1, paras2[bestIndex])}</p>`;
+      matched.add(bestIndex);
+    } else {
+      // no match found → deleted paragraph
+      right += `<p><span style="color:red;text-decoration:line-through">${p1}</span></p>`;
+    }
+  });
+
+  // Remaining unmatched paras in right → insertions
+  paras2.forEach((p2, j) => {
+    if (!matched.has(j)) {
+      right += `<p><span style="color:green">${p2}</span></p>`;
+    }
+  });
+
+  return { left: html1, right };
+}
