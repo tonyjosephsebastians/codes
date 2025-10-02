@@ -1,0 +1,151 @@
+import { diff_match_patch } from "diff-match-patch";
+
+const dmp = new diff_match_patch();
+
+function normalizeText(text: string): string {
+  return text
+    .replace(/\u00A0/g, " ")   // NBSP → space
+    .replace(/\s+/g, " ")      // collapse whitespace
+    .trim();
+}
+
+// ---- Node similarity based on text ----
+function getNodeSimilarityScore(node1: Node, node2: Node): number {
+  if (!node1 || !node2) return 0;
+
+  if (node1.nodeType === Node.TEXT_NODE && node2.nodeType === Node.TEXT_NODE) {
+    const text1 = normalizeText(node1.textContent || "");
+    const text2 = normalizeText(node2.textContent || "");
+    if (!text1 || !text2) return 0;
+
+    const diffs = dmp.diff_main(text1, text2);
+    dmp.diff_cleanupSemantic(diffs);
+
+    const common = diffs.filter(([op]) => op === 0).reduce((len, [, data]) => len + data.length, 0);
+    return (2 * common) / (text1.length + text2.length); // similarity score
+  }
+
+  if (node1.nodeType === Node.ELEMENT_NODE && node2.nodeType === Node.ELEMENT_NODE) {
+    return (node1 as HTMLElement).tagName === (node2 as HTMLElement).tagName ? 0.8 : 0;
+  }
+
+  return 0;
+}
+
+// ---- Diff nodes ----
+function diffNodes(node1: Node | null, node2: Node | null, changeIndexRef: { value: number }): { right: string } | null {
+  // Case 1: both text nodes
+  if (node1?.nodeType === Node.TEXT_NODE && node2?.nodeType === Node.TEXT_NODE) {
+    const text1 = normalizeText(node1.textContent || "");
+    const text2 = normalizeText(node2.textContent || "");
+
+    if (text1 === text2) return { right: text2 };
+
+    const diffs = dmp.diff_main(text1, text2);
+    dmp.diff_cleanupSemantic(diffs);
+
+    let right = "";
+    diffs.forEach(([op, data]) => {
+      if (op === diff_match_patch.DIFF_EQUAL) {
+        right += data;
+      } else if (op === diff_match_patch.DIFF_DELETE) {
+        right += `<span id="change-${changeIndexRef.value++}" style="color:red;text-decoration:line-through">${data}</span>`;
+      } else if (op === diff_match_patch.DIFF_INSERT) {
+        right += `<span id="change-${changeIndexRef.value++}" style="color:green">${data}</span>`;
+      }
+    });
+
+    return { right };
+  }
+
+  // Case 2: both element nodes
+  if (node1?.nodeType === Node.ELEMENT_NODE && node2?.nodeType === Node.ELEMENT_NODE) {
+    const el1 = node1 as HTMLElement;
+    const el2 = node2 as HTMLElement;
+
+    if (el1.tagName === el2.tagName) {
+      const { right } = diffChildren(el1.childNodes, el2.childNodes, changeIndexRef);
+      return { right: `<${el2.tagName.toLowerCase()}>${right}</${el2.tagName.toLowerCase()}>` };
+    }
+    return { right: el2.outerHTML }; // treat as replace
+  }
+
+  // Case 3: node exists only in left → deletion
+  if (node1 && !node2) {
+    const html = node1.nodeType === Node.ELEMENT_NODE
+      ? (node1 as HTMLElement).outerHTML
+      : node1.textContent || "";
+
+    return {
+      right: `<span id="change-${changeIndexRef.value++}" style="color:red;text-decoration:line-through">${html}</span>`
+    };
+  }
+
+  // Case 4: node exists only in right → insertion
+  if (!node1 && node2) {
+    const html = node2.nodeType === Node.ELEMENT_NODE
+      ? (node2 as HTMLElement).outerHTML
+      : node2.textContent || "";
+
+    return {
+      right: `<span id="change-${changeIndexRef.value++}" style="color:green">${html}</span>`
+    };
+  }
+
+  return null;
+}
+
+// ---- Diff children ----
+function diffChildren(
+  nodes1: NodeListOf<ChildNode>,
+  nodes2: NodeListOf<ChildNode>,
+  changeIndexRef: { value: number }
+): { right: string } {
+  const matchedIndices = new Set<number>();
+  let right = "";
+
+  nodes1.forEach((n1) => {
+    let bestMatchIndex = -1;
+    let bestMatchScore = 0;
+
+    nodes2.forEach((n2, j) => {
+      if (matchedIndices.has(j)) return;
+      const score = getNodeSimilarityScore(n1, n2);
+      if (score > bestMatchScore) {
+        bestMatchScore = score;
+        bestMatchIndex = j;
+      }
+    });
+
+    if (bestMatchIndex !== -1 && bestMatchScore > 0.5) {
+      const diffed = diffNodes(n1, nodes2[bestMatchIndex], changeIndexRef);
+      if (diffed) right += diffed.right;
+      matchedIndices.add(bestMatchIndex);
+    } else {
+      const diffed = diffNodes(n1, null, changeIndexRef);
+      if (diffed) right += diffed.right;
+    }
+  });
+
+  // Handle insertions (remaining unmatched nodes in right)
+  nodes2.forEach((n2, j) => {
+    if (!matchedIndices.has(j)) {
+      const diffed = diffNodes(null, n2, changeIndexRef);
+      if (diffed) right += diffed.right;
+    }
+  });
+
+  return { right };
+}
+
+// ---- Main entry ----
+export function diffHtmlPreserveAll(html1: string, html2: string) {
+  const parser = new DOMParser();
+  const doc1 = parser.parseFromString(html1, "text/html");
+  const doc2 = parser.parseFromString(html2, "text/html");
+
+  const changeIndexRef = { value: 0 };
+  const { right } = diffChildren(doc1.body.childNodes, doc2.body.childNodes, changeIndexRef);
+
+  return { right, hasChanges: changeIndexRef.value > 0 };
+}
