@@ -1,0 +1,81 @@
+const [pageContents, setPageContents] = useState<string[]>([]);
+const contentRef = useRef<HTMLDivElement>(null);
+
+
+useEffect(() => {
+  if (!contentRef.current) return;
+
+  const container = contentRef.current;
+  const children = Array.from(container.childNodes);
+
+  let pages: string[] = [];
+  let currentPageNodes: string[] = [];
+  let accumulatedHeight = 0;
+
+  const pushPage = () => {
+    if (currentPageNodes.length > 0) {
+      pages.push(currentPageNodes.join(""));
+      currentPageNodes = [];
+      accumulatedHeight = 0;
+    }
+  };
+
+  children.forEach((child) => {
+    const el = child as HTMLElement;
+    const childHeight = el.offsetHeight || 0;
+
+    if (accumulatedHeight + childHeight > PAGE_HEIGHT_PX) {
+      // push current page and start new one
+      pushPage();
+      currentPageNodes.push(el.outerHTML);
+      accumulatedHeight = childHeight;
+    } else {
+      currentPageNodes.push(el.outerHTML);
+      accumulatedHeight += childHeight;
+    }
+  });
+
+  if (currentPageNodes.length > 0) {
+    pages.push(currentPageNodes.join(""));
+  }
+
+  setPageContents(pages);
+}, [content, scale]);
+
+
+{/* Hidden container for measuring content */}
+<div
+  ref={contentRef}
+  style={{ display: "none" }}
+  dangerouslySetInnerHTML={{ __html: content }}
+/>
+
+{/* Render visible paginated content */}
+{pageContents.map((html, i) => (
+  <div
+    key={i}
+    className="page-container mx-auto bg-white shadow-lg border border-gray-300 relative"
+    style={{
+      minHeight: `${PAGE_HEIGHT_PX}px`,
+      marginBottom: `${PAGE_PADDING_PX}px`,
+      width: "8.5in",
+      overflow: "hidden",
+    }}
+  >
+    <div
+      className="word-document-content p-8"
+      dangerouslySetInnerHTML={{ __html: html }}
+    />
+    <div className="absolute bottom-2 right-4 text-xs text-gray-500">
+      Page {i + 1} of {pageContents.length}
+    </div>
+  </div>
+))}
+
+
+.page-container {
+  page-break-after: always;
+  background: white;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+  border-radius: 4px;
+}
