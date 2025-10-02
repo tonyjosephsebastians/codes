@@ -1,0 +1,64 @@
+import { diff_match_patch } from "diff-match-patch";
+
+const dmp = new diff_match_patch();
+
+function normalizeHtml(html: string): string[] {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, "text/html");
+
+  // Extract block-level elements (paragraphs, list items, divs, etc.)
+  const blocks: string[] = [];
+  doc.body.querySelectorAll("p, div, li").forEach((el) => {
+    const text = el.innerText.replace(/\s+/g, " ").trim();
+    if (text) blocks.push(text);
+  });
+
+  return blocks;
+}
+
+// Diff two blocks word-by-word
+function diffBlockWords(left: string, right: string): string {
+  const diffs = dmp.diff_main(left, right);
+  dmp.diff_cleanupSemantic(diffs);
+
+  let result = "";
+  diffs.forEach(([op, data]) => {
+    if (op === diff_match_patch.DIFF_EQUAL) {
+      result += data;
+    } else if (op === diff_match_patch.DIFF_DELETE) {
+      result += `<span style="color:red;text-decoration:line-through">${data}</span>`;
+    } else if (op === diff_match_patch.DIFF_INSERT) {
+      result += `<span style="color:green">${data}</span>`;
+    }
+  });
+  return result;
+}
+
+// Compare two full HTML documents
+export function diffHtmlWordStyle(html1: string, html2: string) {
+  const blocks1 = normalizeHtml(html1);
+  const blocks2 = normalizeHtml(html2);
+
+  let right = "";
+
+  // Align by index (improvement: can use similarity score if needed)
+  const maxLen = Math.max(blocks1.length, blocks2.length);
+
+  for (let i = 0; i < maxLen; i++) {
+    const leftBlock = blocks1[i] || "";
+    const rightBlock = blocks2[i] || "";
+
+    if (leftBlock && rightBlock) {
+      // Word-by-word diff inside this block
+      right += `<p>${diffBlockWords(leftBlock, rightBlock)}</p>`;
+    } else if (!leftBlock && rightBlock) {
+      // New paragraph → all green
+      right += `<p><span style="color:green">${rightBlock}</span></p>`;
+    } else if (leftBlock && !rightBlock) {
+      // Deleted paragraph → all red strike
+      right += `<p><span style="color:red;text-decoration:line-through">${leftBlock}</span></p>`;
+    }
+  }
+
+  return { left: html1, right, hasChanges: true };
+}
