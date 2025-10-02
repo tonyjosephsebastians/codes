@@ -1,0 +1,113 @@
+import { diff_match_patch } from "diff-match-patch";
+
+const dmp = new diff_match_patch();
+
+// Split into words/tokens for finer granularity
+function tokenize(text: string): string[] {
+  return text
+    .replace(/\s+/g, " ")
+    .trim()
+    .split(/(\s+|[.,;!?()])/)
+    .filter(t => t.length > 0);
+}
+
+// Simple similarity score: Jaccard overlap of tokens
+function similarityScore(a: string, b: string): number {
+  const setA = new Set(tokenize(a.toLowerCase()));
+  const setB = new Set(tokenize(b.toLowerCase()));
+  const intersection = [...setA].filter(x => setB.has(x)).length;
+  const union = new Set([...setA, ...setB]).size;
+  return union === 0 ? 0 : intersection / union;
+}
+
+function diffTokens(left: string, right: string): { html: string; changed: boolean } {
+  const tokens1 = tokenize(left);
+  const tokens2 = tokenize(right);
+
+  const diffs = dmp.diff_main(tokens1.join(" "), tokens2.join(" "));
+  dmp.diff_cleanupSemantic(diffs);
+
+  let html = "";
+  let changed = false;
+
+  diffs.forEach(([op, data]) => {
+    if (op === diff_match_patch.DIFF_EQUAL) {
+      html += data;
+    } else if (op === diff_match_patch.DIFF_DELETE) {
+      changed = true;
+      html += `<span style="color:red;text-decoration:line-through">${data}</span>`;
+    } else if (op === diff_match_patch.DIFF_INSERT) {
+      changed = true;
+      html += `<span style="color:green">${data}</span>`;
+    }
+  });
+
+  return { html, changed };
+}
+
+export function diffHtmlWordStyle(html1: string, html2: string) {
+  const parser = new DOMParser();
+  const doc1 = parser.parseFromString(html1, "text/html");
+  const doc2 = parser.parseFromString(html2, "text/html");
+
+  const blocks1 = Array.from(doc1.body.querySelectorAll("p, div, li")).map(el =>
+    el.innerText.trim()
+  );
+  const blocks2 = Array.from(doc2.body.querySelectorAll("p, div, li")).map(el =>
+    el.innerText.trim()
+  );
+
+  let right = "";
+  let hasChanges = false;
+  const matchedLeft = new Set<number>();
+
+  let lastMatchedLeftIndex = -1;
+
+  // Walk through right blocks in natural order
+  blocks2.forEach((b2, j) => {
+    // Try to find best matching left block
+    let bestScore = 0;
+    let bestIndex = -1;
+
+    blocks1.forEach((b1, i) => {
+      if (matchedLeft.has(i)) return;
+      const score = similarityScore(b1, b2);
+      if (score > bestScore) {
+        bestScore = score;
+        bestIndex = i;
+      }
+    });
+
+    if (bestIndex !== -1 && bestScore > 0.5) {
+      // Insert any left blocks between last match and this one as deletions
+      for (let k = lastMatchedLeftIndex + 1; k < bestIndex; k++) {
+        if (!matchedLeft.has(k)) {
+          right += `<p><span style="color:red;text-decoration:line-through">${blocks1[k]}</span></p>`;
+          hasChanges = true;
+          matchedLeft.add(k);
+        }
+      }
+
+      // Matched → word-level diff
+      const diffed = diffTokens(blocks1[bestIndex], b2);
+      right += `<p>${diffed.html}</p>`;
+      if (diffed.changed) hasChanges = true;
+      matchedLeft.add(bestIndex);
+      lastMatchedLeftIndex = bestIndex;
+    } else {
+      // No match → treat as pure insertion at correct spot
+      right += `<p><span style="color:green">${b2}</span></p>`;
+      hasChanges = true;
+    }
+  });
+
+  // Remaining unmatched left blocks (after last match) → deletions
+  for (let i = lastMatchedLeftIndex + 1; i < blocks1.length; i++) {
+    if (!matchedLeft.has(i)) {
+      right += `<p><span style="color:red;text-decoration:line-through">${blocks1[i]}</span></p>`;
+      hasChanges = true;
+    }
+  }
+
+  return { left: html1, right, hasChanges };
+}
