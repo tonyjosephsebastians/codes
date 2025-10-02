@@ -1,0 +1,171 @@
+import React, { useRef, useEffect, useState } from "react";
+import { ZoomIn, ZoomOut, RotateCcw } from "lucide-react";
+
+interface WordDocumentPreviewProps {
+  content: string;
+  currentPage: number;
+  totalPages: number;
+  onPageChange: (newPage: number) => void;
+  documentTitle?: string;
+  onScroll?: (scrollTop: number, scrollLeft: number) => void;
+  scrollTop?: number;
+  scrollLeft?: number;
+  syncScroll?: boolean;
+}
+
+const PAGE_HEIGHT_PX = 1056; // approx. Letter/A4 page height
+const PAGE_PADDING_PX = 32;
+
+const WordDocumentPreview: React.FC<WordDocumentPreviewProps> = ({
+  content,
+  currentPage,
+  totalPages,
+  onPageChange,
+  documentTitle,
+  onScroll,
+  scrollTop = 0,
+  scrollLeft = 0,
+  syncScroll = false,
+}) => {
+  const [scale, setScale] = useState(1);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const [visualPages, setVisualPages] = useState<string[]>([]);
+
+  // Split content into pages
+  useEffect(() => {
+    if (!contentRef.current) return;
+
+    const container = contentRef.current;
+    const children = Array.from(container.childNodes);
+
+    let pages: string[] = [];
+    let currentPageNodes: string[] = [];
+    let accumulatedHeight = 0;
+
+    const pushPage = () => {
+      if (currentPageNodes.length > 0) {
+        pages.push(currentPageNodes.join(""));
+        currentPageNodes = [];
+        accumulatedHeight = 0;
+      }
+    };
+
+    children.forEach((child) => {
+      const node = child as HTMLElement;
+      const nodeHeight = node.offsetHeight || 0;
+
+      if (accumulatedHeight + nodeHeight > PAGE_HEIGHT_PX) {
+        pushPage();
+        currentPageNodes.push(node.outerHTML);
+        accumulatedHeight = nodeHeight;
+      } else {
+        currentPageNodes.push(node.outerHTML);
+        accumulatedHeight += nodeHeight;
+      }
+    });
+
+    if (currentPageNodes.length > 0) {
+      pages.push(currentPageNodes.join(""));
+    }
+
+    setVisualPages(pages);
+  }, [content, scale]);
+
+  return (
+    <div className="flex flex-col h-full bg-gray-100 p-4">
+      {/* Hidden container for measuring content */}
+      <div
+        ref={contentRef}
+        style={{ display: "none" }}
+        dangerouslySetInnerHTML={{ __html: content }}
+      />
+
+      {/* Document header */}
+      {documentTitle && (
+        <div className="border-b border-gray-200 pb-2 mb-6">
+          <h4 className="text-2xl font-bold mb-4 text-center">{documentTitle}</h4>
+          <p className="text-sm text-gray-500 text-center">
+            Page {currentPage} of {visualPages.length}
+          </p>
+        </div>
+      )}
+
+      {/* Render visible pages */}
+      {visualPages.map((html, i) => (
+        <div
+          key={i}
+          className="page-container mx-auto bg-white shadow-lg border border-gray-300 relative"
+          style={{
+            minHeight: `${PAGE_HEIGHT_PX}px`,
+            marginBottom: `${PAGE_PADDING_PX}px`,
+            width: "8.5in",
+            overflow: "hidden",
+            transform: `scale(${scale})`,
+            transformOrigin: "top center",
+          }}
+        >
+          <div
+            className="word-document-content p-8"
+            dangerouslySetInnerHTML={{ __html: html }}
+          />
+          <div className="absolute bottom-2 right-4 text-xs text-gray-500">
+            Page {i + 1} of {visualPages.length}
+          </div>
+        </div>
+      ))}
+
+      {/* Page break indicators */}
+      {visualPages.length > 1 &&
+        Array.from({ length: visualPages.length - 1 }, (_, i) => (
+          <div
+            key={i}
+            className="absolute left-0 right-0 z-10"
+            style={{ top: PAGE_PADDING_PX + (i + 1) * PAGE_HEIGHT_PX }}
+          >
+            <div className="mx-[-8px] bg-white/85">
+              <div className="border-t-2 border-dashed border-gray-300" />
+            </div>
+            <span className="absolute -top-3 left-1/2 transform -translate-x-1/2 bg-gray-50 px-2 text-xs text-gray-600">
+              Page {i + 2}
+            </span>
+          </div>
+        ))}
+
+      {/* Navigation / Zoom Controls */}
+      <div className="flex items-center justify-between px-4 py-3 border-t border-gray-200 bg-white">
+        <span className="text-sm text-gray-600">
+          Page {currentPage} of {visualPages.length}
+        </span>
+
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setScale((prev) => Math.max(prev - 0.2, 0.5))}
+            className="p-2 rounded text-gray-600 hover:bg-gray-100 transition-colors"
+            title="Zoom Out"
+          >
+            <ZoomOut className="h-4 w-4" />
+          </button>
+          <span className="text-sm text-gray-600 px-2 min-w-[60px] text-center">
+            {Math.round(scale * 100)}%
+          </span>
+          <button
+            onClick={() => setScale((prev) => Math.min(prev + 0.2, 2))}
+            className="p-2 rounded text-gray-600 hover:bg-gray-100 transition-colors"
+            title="Zoom In"
+          >
+            <ZoomIn className="h-4 w-4" />
+          </button>
+          <button
+            onClick={() => setScale(1)}
+            className="p-2 rounded text-gray-600 hover:bg-gray-100 transition-colors"
+            title="Reset Zoom"
+          >
+            <RotateCcw className="h-4 w-4" />
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default WordDocumentPreview;
