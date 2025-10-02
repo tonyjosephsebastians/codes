@@ -1,0 +1,64 @@
+import { diff_match_patch } from "diff-match-patch";
+
+const dmp = new diff_match_patch();
+
+function normalizeHtml(html: string): string[] {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, "text/html");
+
+  // Extract block-level text (paragraphs, list items, etc.)
+  const blocks: string[] = [];
+  doc.body.querySelectorAll("p, div, li").forEach((el) => {
+    const text = el.innerText.replace(/\s+/g, " ").trim();
+    if (text) blocks.push(text);
+  });
+
+  return blocks;
+}
+
+// Diff words instead of whole sentences
+function diffBlockWords(left: string, right: string): string {
+  const words1 = left.split(/\s+/).join(" ");
+  const words2 = right.split(/\s+/).join(" ");
+
+  const diffs = dmp.diff_main(words1, words2);
+  dmp.diff_cleanupSemantic(diffs);
+
+  let result = "";
+  diffs.forEach(([op, data]) => {
+    if (op === diff_match_patch.DIFF_EQUAL) {
+      result += data;
+    } else if (op === diff_match_patch.DIFF_DELETE) {
+      result += `<span style="color:red;text-decoration:line-through">${data}</span>`;
+    } else if (op === diff_match_patch.DIFF_INSERT) {
+      result += `<span style="color:green">${data}</span>`;
+    }
+  });
+
+  return result;
+}
+
+// Main diff function
+export function diffHtmlWordStyle(html1: string, html2: string) {
+  const blocks1 = normalizeHtml(html1);
+  const blocks2 = normalizeHtml(html2);
+
+  let right = "";
+
+  const maxLen = Math.max(blocks1.length, blocks2.length);
+
+  for (let i = 0; i < maxLen; i++) {
+    const leftBlock = blocks1[i] || "";
+    const rightBlock = blocks2[i] || "";
+
+    if (leftBlock && rightBlock) {
+      right += `<p>${diffBlockWords(leftBlock, rightBlock)}</p>`;
+    } else if (!leftBlock && rightBlock) {
+      right += `<p><span style="color:green">${rightBlock}</span></p>`;
+    } else if (leftBlock && !rightBlock) {
+      right += `<p><span style="color:red;text-decoration:line-through">${leftBlock}</span></p>`;
+    }
+  }
+
+  return { left: html1, right, hasChanges: true };
+}
