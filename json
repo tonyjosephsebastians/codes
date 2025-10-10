@@ -1,0 +1,24 @@
+[
+  {
+    "EffectiveDate": "2025-06-01",
+    "Account": "1001",
+    "Product": "20005",
+    "BE": "BE001",
+    "CustomerGroup": "CG0001",
+    "SubSystem": 100,
+    "GL": 100,
+    "Difference": 0,
+    "MatchingStatus": "Matched"
+  },
+  {
+    "EffectiveDate": "2025-06-10",
+    "Account": "1001",
+    "Product": "20005",
+    "BE": "BE001",
+    "CustomerGroup": "CG0001",
+    "SubSystem": 50,
+    "GL": 40,
+    "Difference": 10,
+    "MatchingStatus": "Unmatched"
+  }
+]
