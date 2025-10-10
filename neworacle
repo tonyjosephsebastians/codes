@@ -1,4 +1,6 @@
-
+You have access to a tool called “Public Workers PB,” which acts as a Finance Reconciliation dataset.
+Treat it as if its name were “ReconciliationData,” containing the following columns:
+EffectiveDate, Account, Product, SubSystem, GL, Difference, MatchingStatus.
 
 
 
