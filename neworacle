@@ -1,3 +1,31 @@
+# Simulation Instructions
+Since this is a demo environment without live AI runtime, respond with simulated results using the mock data below.
+
+Mock Data:
+| EffectiveDate | Account | Product | SubSystem | GL | Difference | Status |
+|----------------|----------|----------|------------|----|-------------|---------|
+| 2025-06-01 | 1001 | 20005 | 100 | 100 | 0 | Matched |
+| 2025-06-02 | 1001 | 20005 | 50 | 40 | 10 | Unmatched |
+| 2025-06-03 | 1001 | 20005 | 90 | 80 | 10 | Unmatched |
+
+Example Prompts and Responses:
+- “Compare GL and SubSystem transactions” → Show the table above.
+- “Summarize total difference” → Respond: “Total variance = +20 across 2 unmatched transactions.”
+- “Create a journal entry for the variance” → Respond:
+Journal Entry:
+DR 2001 20
+CR 1001 20
+Status: Pending Approval
+
+
+
+
+
+
+
+
+
+
 AI Agent that reconciles General Ledger and subsystem transactions, highlights mismatches, and prepares journal entries for approval.
 
 
