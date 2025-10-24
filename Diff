@@ -1,0 +1,69 @@
+import JSZip from "jszip";
+import { diffWordsWithSpace } from "diff";
+
+export const handleWordStyleDiff = async (
+  baselineBuffer: ArrayBuffer,
+  compareBuffer: ArrayBuffer,
+  containerRef: React.RefObject<HTMLDivElement>
+) => {
+  try {
+    console.log("🧩 Starting diff computation...");
+
+    // ✅ Step 1: Extract visible text from both Word files
+    const extractVisibleText = async (buffer: ArrayBuffer) => {
+      const zip = await JSZip.loadAsync(buffer);
+      const xml = await zip.file("word/document.xml")?.async("string");
+      if (!xml) throw new Error("Could not read Word XML.");
+
+      // Clean XML → keep only human-visible content
+      return xml
+        .replace(/<w:.*?>/g, " ") // remove all <w:*> tags
+        .replace(/<\/w:.*?>/g, " ") // remove closing tags
+        .replace(/<[^>]+>/g, " ") // remove other XML
+        .replace(/\s+/g, " ") // normalize spaces
+        .trim();
+    };
+
+    const baselineText = await extractVisibleText(baselineBuffer);
+    const compareText = await extractVisibleText(compareBuffer);
+
+    // ✅ Step 2: Detect identical files
+    if (baselineText === compareText) {
+      console.log("✅ Both documents are identical — skipping diff render");
+      alert("✅ Both documents are identical — no visible changes detected.");
+      if (containerRef.current)
+        containerRef.current.innerHTML =
+          "<p style='color:gray'>No differences found.</p>";
+      return;
+    }
+
+    console.log("⚙️ Generating Word-style redline diff...");
+
+    // ✅ Step 3: Generate word-level diff
+    const diff = diffWordsWithSpace(baselineText, compareText);
+
+    const diffHtml = diff
+      .map((part) => {
+        if (part.added)
+          return `<span class="word-insert">${part.value}</span>`;
+        if (part.removed)
+          return `<span class="word-delete">${part.value}</span>`;
+        return part.value;
+      })
+      .join("");
+
+    // ✅ Step 4: Render clean diff view
+    if (containerRef.current) {
+      containerRef.current.innerHTML = "";
+      const diffWrapper = document.createElement("div");
+      diffWrapper.className = "docx-wrapper word-redline";
+      diffWrapper.innerHTML = `<p>${diffHtml}</p>`;
+      containerRef.current.appendChild(diffWrapper);
+    }
+
+    console.log("✅ Diff rendered successfully");
+  } catch (err) {
+    console.error("❌ Error generating diff:", err);
+    alert("Error generating document diff. Please try again.");
+  }
+};
