@@ -1,0 +1,125 @@
+import JSZip from "jszip";
+import { diffWords } from "diff";
+
+/**
+ * MS Word-style diff:
+ * ✅ Keeps paragraph structure
+ * ✅ Highlights only changed words
+ * ✅ Green = insertions, Red = deletions
+ */
+export const handleWordStyleDiff = async (
+  baselineBuffer: ArrayBuffer,
+  compareBuffer: ArrayBuffer,
+  containerRef: React.RefObject<HTMLDivElement>
+) => {
+  try {
+    console.log("🧩 Starting paragraph-level Word diff...");
+
+    // === 1️⃣ Load DOCX files ===
+    const baseZip = await JSZip.loadAsync(baselineBuffer);
+    const compZip = await JSZip.loadAsync(compareBuffer);
+    const baseXml = await baseZip.file("word/document.xml")?.async("string");
+    const compXml = await compZip.file("word/document.xml")?.async("string");
+
+    if (!baseXml || !compXml) {
+      alert("❌ Unable to extract Word XML content from one or both files.");
+      return;
+    }
+
+    // === 2️⃣ Extract visible paragraphs (plain text only) ===
+    const extractParagraphs = (xml: string): string[] => {
+      return xml
+        .split(/<\/w:p>/) // split by Word paragraph end
+        .map((block) =>
+          block
+            .replace(/<w:tab\/>/g, " ")
+            .replace(/<w:br\/>/g, " ")
+            .replace(/<w:.*?>/g, " ")
+            .replace(/<\/w:.*?>/g, " ")
+            .replace(/<[^>]+>/g, " ")
+            .replace(/\s+/g, " ")
+            .trim()
+        )
+        .filter(Boolean);
+    };
+
+    const baseParas = extractParagraphs(baseXml);
+    const compParas = extractParagraphs(compXml);
+
+    // === 3️⃣ Check for identical documents ===
+    const normalize = (txt: string) =>
+      txt.replace(/\s+/g, " ").trim().toLowerCase();
+
+    const allBase = baseParas.join(" ");
+    const allComp = compParas.join(" ");
+    if (normalize(allBase) === normalize(allComp)) {
+      alert("✅ Both documents are identical — no visible differences.");
+      if (containerRef.current) {
+        containerRef.current.innerHTML = `
+          <div style="padding:20px;color:gray;font-family:Calibri;">
+            No differences found.
+          </div>`;
+      }
+      return;
+    }
+
+    // === 4️⃣ Paragraph-by-paragraph comparison ===
+    const maxLen = Math.max(baseParas.length, compParas.length);
+    let diffHtml = "";
+
+    for (let i = 0; i < maxLen; i++) {
+      const baseP = baseParas[i] || "";
+      const compP = compParas[i] || "";
+
+      // identical paragraph — render as-is
+      if (normalize(baseP) === normalize(compP)) {
+        diffHtml += `<p>${compP}</p>`;
+        continue;
+      }
+
+      // changed paragraph — compute word-level diff
+      const diff = diffWords(baseP, compP);
+      const marked = diff
+        .map((part) => {
+          if (part.added)
+            return `<span class="word-insert">${part.value}</span>`;
+          if (part.removed)
+            return `<span class="word-delete">${part.value}</span>`;
+          return part.value;
+        })
+        .join("");
+
+      diffHtml += `<p>${marked}</p>`;
+    }
+
+    // === 5️⃣ Reset and render clean container ===
+    if (containerRef.current) {
+      const container = containerRef.current;
+      container.replaceChildren();
+      container.removeAttribute("style");
+      container.className = "";
+
+      Object.assign(container.style, {
+        backgroundColor: "#ffffff",
+        color: "#000000",
+        padding: "30px",
+        fontFamily: "Calibri, sans-serif",
+        fontSize: "11pt",
+        lineHeight: "1.5",
+        whiteSpace: "pre-wrap",
+        wordBreak: "break-word",
+        overflowY: "auto",
+      });
+
+      const wrapper = document.createElement("div");
+      wrapper.className = "word-redline-view";
+      wrapper.innerHTML = diffHtml;
+      container.appendChild(wrapper);
+    }
+
+    console.log("✅ Paragraph + word-level diff rendered successfully.");
+  } catch (err) {
+    console.error("❌ Error generating diff:", err);
+    alert("Error generating document difference. Please try again.");
+  }
+};
