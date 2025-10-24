@@ -1,0 +1,38 @@
+styleSheet.textContent += `
+/* ====== MS Word-style diff formatting ====== */
+.word-redline-view {
+  background: white;
+  color: #000;
+  font-family: Calibri, sans-serif;
+  font-size: 11pt;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  padding: 20px;
+}
+
+.word-redline-view p {
+  margin-bottom: 10px;
+}
+
+.word-redline-view .word-insert {
+  color: #006100;
+  background-color: #c6efce;
+  font-weight: bold;
+}
+
+.word-redline-view .word-delete {
+  color: #9c0006;
+  background-color: #ffc7ce;
+  text-decoration: line-through;
+  text-decoration-thickness: 1.3px;
+}
+
+.word-redline-view h1,
+.word-redline-view h2,
+.word-redline-view h3 {
+  color: #1b1b1b;
+  font-weight: bold;
+  margin-top: 12px;
+}
+`;
