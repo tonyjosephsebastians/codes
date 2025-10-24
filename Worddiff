@@ -1,0 +1,296 @@
+import JSZip from "jszip";
+import { diffWords } from "diff";
+
+/**
+ * Extracts only visible text (from <w:t>) and normalizes it.
+ * Ignores XML, tabs, runs, and formatting noise.
+ */
+const extractVisibleText = async (buffer: ArrayBuffer): Promise<string> => {
+  const zip = await JSZip.loadAsync(buffer);
+  const xml = await zip.file("word/document.xml")?.async("string");
+  if (!xml) throw new Error("Could not extract Word XML.");
+
+  // keep only <w:t> text runs (visible text)
+  const textRuns = Array.from(xml.matchAll(/<w:t[^>]*>(.*?)<\/w:t>/g)).map(
+    (m) => m[1]
+  );
+
+  // join and normalize whitespace
+  return textRuns
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .replace(/[\u200B-\u200D\uFEFF]/g, "") // remove zero-width chars
+    .trim();
+};
+
+/**
+ * Generates precise, word-only diff view (like MS Word track-changes)
+ */
+export const handleWordStyleDiff = async (
+  baselineBuffer: ArrayBuffer,
+  compareBuffer: ArrayBuffer,
+  containerRef: React.RefObject<HTMLDivElement>
+) => {
+  try {
+    console.log("🧩 Starting precise Word diff...");
+
+    // 1️⃣ Extract clean visible text
+    const baselineText = await extractVisibleText(baselineBuffer);
+    const compareText = await extractVisibleText(compareBuffer);
+
+    // 2️⃣ Normalize both sides (ignore case/space noise)
+    const baseNorm = baselineText.toLowerCase().replace(/\s+/g, " ");
+    const compNorm = compareText.toLowerCase().replace(/\s+/g, " ");
+
+    if (baseNorm === compNorm) {
+      alert("✅ Both documents are identical — no visible differences found.");
+      if (containerRef.current)
+        containerRef.current.innerHTML =
+          "<p style='color:gray'>No differences found.</p>";
+      return;
+    }
+
+    // 3️⃣ Run word-level diff (true word tokenization)
+    const diff = diffWords(baselineText, compareText);
+
+    // 4️⃣ Build HTML output with MS-Word-like coloring
+    const diffHtml = diff
+      .map((part) => {
+        if (part.added)
+          return `<span class="word-insert">${part.value}</span>`;
+        if (part.removed)
+          return `<span class="word-delete">${part.value}</span>`;
+        return part.value; // unchanged text
+      })
+      .join("");
+
+    // 5️⃣ Render into container
+    if (containerRef.current) {
+      containerRef.current.innerHTML = `
+        <div class="docx-wrapper word-redline">
+          ${diffHtml}
+        </div>`;
+    }
+
+    console.log("✅ Precise diff rendered successfully");
+  } catch (err) {
+    console.error("❌ Error generating diff:", err);
+    alert("Error generating document diff. Please try again.");
+  }
+};
+
+
+.docx-wrapper.word-redline {
+  font-family: Calibri, sans-serif;
+  font-size: 11pt;
+  line-height: 1.5;
+  color: #000;
+  background: #fff;
+  padding: 20px;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
+.word-insert {
+  color: #006100;
+  background-color: #c6efce;
+  font-weight: bold;
+}
+
+.word-delete {
+  color: #9c0006;
+  background-color: #ffc7ce;
+  text-decoration: line-through;
+}
+
+
+
+const WordDocumentPreview = ({
+  file,
+  arrayBuffer,
+  baselineArrayBuffer,
+  fileName,
+  onScroll,
+  showDiff,
+  htmlContent,
+}: {
+  file?: File;
+  arrayBuffer?: ArrayBuffer | null;
+  baselineArrayBuffer?: ArrayBuffer | null;
+  fileName?: string;
+  onScroll?: () => void;
+  showDiff?: boolean;
+  htmlContent?: string | null;
+}) => {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const isRenderingRef = useRef(false);
+
+  useEffect(() => {
+    const renderDocument = async () => {
+      if ((!file && !arrayBuffer) || !containerRef.current) return;
+
+      try {
+        setLoading(true);
+        setError(null);
+
+        const docxPreview = await import("docx-preview");
+        let data: ArrayBuffer | null = null;
+
+        if (arrayBuffer) data = arrayBuffer;
+        else if (file instanceof File) data = await file.arrayBuffer();
+
+        if (!data || data.byteLength === 0) {
+          throw new Error("No data available to render the document.");
+        }
+
+        // 🚨 CLEAR CONTENT before render
+        containerRef.current.innerHTML = "";
+
+        // ✅ DIFF MODE
+        if (showDiff && baselineArrayBuffer && arrayBuffer) {
+          console.log("Rendering diff mode...");
+          await handleWordStyleDiff(baselineArrayBuffer, arrayBuffer, containerRef);
+          setLoading(false);
+          return;
+        }
+
+        // ✅ NORMAL DOCX PREVIEW
+        const wrapper = document.createElement("div");
+        wrapper.className = "docx-wrapper";
+        containerRef.current.appendChild(wrapper);
+
+        const options = {
+          inWrapper: true,
+          breakPages: true,
+          renderEndnotes: true,
+          renderFootnotes: true,
+        };
+
+        await docxPreview.renderAsync(data, wrapper, null, options);
+      } catch (err: any) {
+        console.error("Error rendering document:", err);
+        setError(err.message);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    renderDocument();
+  }, [showDiff, arrayBuffer, baselineArrayBuffer, htmlContent]);
+
+  return (
+    <div className="word-preview-container">
+      {loading && <p className="text-gray-500 text-sm">Loading document...</p>}
+      {error && <p className="text-red-500 text-sm">{error}</p>}
+      <div ref={containerRef}></div>
+    </div>
+  );
+};
+
+await handleWordStyleDiff(baselineArrayBuffer, arrayBuffer, containerRef);
+
+const [searchQuery, setSearchQuery] = useState("");
+const [searchIndex, setSearchIndex] = useState(0);
+
+
+const handleSearch = (query: string) => {
+  setSearchQuery(query);
+
+  const container = document.querySelector(".word-redline") || document.querySelector(".docx-wrapper");
+  if (!container) return;
+
+  // Reset old highlights
+  const marks = container.querySelectorAll("mark");
+  marks.forEach((m) => {
+    const parent = m.parentNode!;
+    parent.replaceChild(document.createTextNode(m.textContent || ""), m);
+    parent.normalize();
+  });
+
+  if (!query) return;
+
+  const regex = new RegExp(query, "gi");
+  const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+
+  let matchCount = 0;
+  while (walker.nextNode()) {
+    const node = walker.currentNode as Text;
+    const matches = node.nodeValue?.match(regex);
+    if (matches) {
+      const span = document.createElement("span");
+      span.innerHTML = node.nodeValue.replace(
+        regex,
+        (m) => `<mark class="search-highlight">${m}</mark>`
+      );
+      node.parentNode?.replaceChild(span, node);
+      matchCount += matches.length;
+    }
+  }
+
+  console.log(`🔍 Found ${matchCount} matches for "${query}"`);
+
+  // Auto-scroll to first match
+  const firstMark = container.querySelector("mark.search-highlight");
+  if (firstMark) {
+    (firstMark as HTMLElement).scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+};
+
+
+<div className="flex items-center gap-2 mb-2">
+  <input
+    type="text"
+    value={searchQuery}
+    onChange={(e) => handleSearch(e.target.value)}
+    placeholder="Search in document..."
+    className="border border-gray-300 rounded px-2 py-1 text-sm w-full"
+  />
+</div>
+
+mark.search-highlight {
+  background-color: #ffeb3b;
+  color: black;
+  padding: 0;
+}
+
+<div className="flex gap-2 mt-1">
+  <button
+    onClick={() => {
+      const allMarks = document.querySelectorAll("mark.search-highlight");
+      if (!allMarks.length) return;
+      setSearchIndex((i) => {
+        const next = (i + 1) % allMarks.length;
+        (allMarks[next] as HTMLElement).scrollIntoView({ behavior: "smooth", block: "center" });
+        return next;
+      });
+    }}
+    className="px-2 py-1 text-xs border rounded"
+  >
+    Next
+  </button>
+
+  <button
+    onClick={() => {
+      const allMarks = document.querySelectorAll("mark.search-highlight");
+      if (!allMarks.length) return;
+      setSearchIndex((i) => {
+        const prev = (i - 1 + allMarks.length) % allMarks.length;
+        (allMarks[prev] as HTMLElement).scrollIntoView({ behavior: "smooth", block: "center" });
+        return prev;
+      });
+    }}
+    className="px-2 py-1 text-xs border rounded"
+  >
+    Prev
+  </button>
+</div>
+
+
+
+
+
+
+
+
