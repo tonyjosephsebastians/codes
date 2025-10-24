@@ -1,0 +1,25 @@
+.word-redline-view {
+  background: #fff;
+  color: #000;
+  font-family: Calibri, sans-serif;
+  font-size: 11pt;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
+.word-insert {
+  color: #006100;
+  background-color: #c6efce;
+  font-weight: bold;
+}
+
+.word-delete {
+  color: #9c0006;
+  background-color: #ffc7ce;
+  text-decoration: line-through;
+}
+
+.word-redline-view p {
+  margin-bottom: 10px;
+}
