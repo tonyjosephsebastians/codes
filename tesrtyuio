@@ -1,0 +1,164 @@
+// src/utils/wordDiffEngine.ts
+import JSZip from "jszip";
+import { diffWordsWithSpace } from "diff";
+
+type Paragraph = { text: string; norm: string };
+
+function normalize(s: string) {
+  return s.replace(/\s+/g, " ").replace(/[“”]/g, '"').replace(/[‘’]/g, "'").trim().toLowerCase();
+}
+
+export async function extractParagraphsFromDocx(buffer: ArrayBuffer): Promise<Paragraph[]> {
+  const zip = await JSZip.loadAsync(buffer);
+  const xml = await zip.file("word/document.xml")?.async("string");
+  if (!xml) throw new Error("Invalid DOCX: document.xml missing");
+
+  const paras: Paragraph[] = [];
+  const pMatches = xml.match(/<w:p[\s\S]*?<\/w:p>/g) || [];
+
+  for (const block of pMatches) {
+    const tMatches = block.match(/<w:t[^>]*>(.*?)<\/w:t>/g);
+    if (!tMatches) continue;
+    const combined = tMatches
+      .map(t => t.replace(/<[^>]+>/g, ""))
+      .join("")
+      .replace(/\u00AD/g, "");
+    const norm = normalize(combined);
+    if (norm) paras.push({ text: combined, norm });
+  }
+  return paras;
+}
+
+/** Align baseline and supplier paragraphs using LCS algorithm */
+function alignParagraphs(base: Paragraph[], comp: Paragraph[]) {
+  const n = base.length, m = comp.length;
+  const dp = Array.from({ length: n + 1 }, () => Array(m + 1).fill(0));
+
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i][j] =
+        base[i].norm === comp[j].norm
+          ? dp[i + 1][j + 1] + 1
+          : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+
+  const pairs: Array<{ bi: number | null; ci: number | null }> = [];
+  let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (base[i].norm === comp[j].norm) {
+      pairs.push({ bi: i, ci: j });
+      i++; j++;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      pairs.push({ bi: i, ci: null }); // baseline only
+      i++;
+    } else {
+      pairs.push({ bi: null, ci: j }); // supplier only
+      j++;
+    }
+  }
+  while (i < n) pairs.push({ bi: i, ci: null }), i++;
+  while (j < m) pairs.push({ bi: null, ci: j }), j++;
+  return pairs;
+}
+
+/** Create HTML markup like MS-Word redline view */
+export async function generateWordDiffHTML(baseBuf: ArrayBuffer, compBuf: ArrayBuffer) {
+  const baseParas = await extractParagraphsFromDocx(baseBuf);
+  const compParas = await extractParagraphsFromDocx(compBuf);
+  const pairs = alignParagraphs(baseParas, compParas);
+
+  const htmlBlocks: string[] = [];
+
+  for (const { bi, ci } of pairs) {
+    if (bi !== null && ci !== null) {
+      // paragraph exists in both, diff word-level
+      const diff = diffWordsWithSpace(baseParas[bi].text, compParas[ci].text);
+      const html = diff
+        .map(p =>
+          p.added
+            ? `<span class="word-insert">${escapeHTML(p.value)}</span>`
+            : p.removed
+            ? `<span class="word-delete">${escapeHTML(p.value)}</span>`
+            : escapeHTML(p.value)
+        )
+        .join("");
+      htmlBlocks.push(`<p>${html}</p>`);
+    } else if (bi !== null) {
+      htmlBlocks.push(
+        `<p><span class="word-delete">${escapeHTML(baseParas[bi].text)}</span></p>`
+      );
+    } else if (ci !== null) {
+      htmlBlocks.push(
+        `<p><span class="word-insert">${escapeHTML(compParas[ci].text)}</span></p>`
+      );
+    }
+  }
+
+  return `<div class="docx-wrapper word-redline-view">${htmlBlocks.join("")}</div>`;
+}
+
+function escapeHTML(s: string) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+
+
+import { generateWordDiffHTML } from "@/utils/wordDiffEngine";
+
+const handleWordStyleDiff = async (
+  baselineBuffer: ArrayBuffer,
+  compareBuffer: ArrayBuffer
+) => {
+  try {
+    if (!baselineBuffer || !compareBuffer || !containerRef.current) return;
+
+    const diffHTML = await generateWordDiffHTML(baselineBuffer, compareBuffer);
+
+    containerRef.current.innerHTML = "";
+    const wrapper = document.createElement("div");
+    wrapper.innerHTML = diffHTML;
+    containerRef.current.appendChild(wrapper);
+
+    injectWordDiffCSS();
+  } catch (err) {
+    console.error("❌ Diff generation failed", err);
+    containerRef.current.innerHTML = `<p style="color:red;">Error comparing documents</p>`;
+  }
+};
+
+
+function injectWordDiffCSS() {
+  if (document.getElementById("word-redline-css")) return;
+  const style = document.createElement("style");
+  style.id = "word-redline-css";
+  style.textContent = `
+    .docx-wrapper {
+      background: #fff;
+      font-family: Calibri, sans-serif;
+      font-size: 11pt;
+      line-height: 1.5;
+      width: 100%;
+      margin: 0 auto;
+      padding: 12px;
+    }
+    .word-insert {
+      color: #006100;       /* green text */
+      text-decoration: none;
+      background: transparent;
+      font-weight: 600;
+    }
+    .word-delete {
+      color: #9c0006;       /* red strike */
+      text-decoration: line-through;
+      background: transparent;
+    }
+  `;
+  document.head.appendChild(style);
+}
+
+
+if (showDiff && arrayBuffer && baselineArrayBuffer) {
+  await handleWordStyleDiff(baselineArrayBuffer, arrayBuffer);
+  return;
+}
