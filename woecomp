@@ -98,3 +98,57 @@ styleSheet.textContent = `
 }
 `;
 
+
+
+styleSheet.textContent = `
+.docx-wrapper {
+  background: #ffffff !important;
+  font-family: Calibri, sans-serif;
+  font-size: 11pt;
+  line-height: 1.5;
+  color: #1b1b1b;
+  margin: 0 auto;
+  padding: 16px;
+  width: 100%;
+  max-width: 100%;
+  box-shadow: none !important;
+}
+
+/* 🔥 Fix dark shadowed "page" backgrounds from docx-preview */
+.docx-wrapper > section.docx {
+  background: #ffffff !important;
+  box-shadow: none !important;
+  margin: 0 auto;
+  padding: 0 !important;
+  width: 100%;
+  max-width: 100%;
+  min-height: auto;
+  border: none !important;
+}
+
+/* Remove inner container gray overlays */
+.docx-container, .docx-wrapper section.docx, .docx-wrapper > div {
+  background: #ffffff !important;
+  box-shadow: none !important;
+  border: none !important;
+}
+
+/* ✅ Clean MS Word-style colors */
+.word-insert {
+  color: #006100 !important;
+  font-weight: 600;
+  background: transparent !important;
+  text-decoration: none !important;
+}
+
+.word-delete {
+  color: #9c0006 !important;
+  background: transparent !important;
+  text-decoration: line-through !important;
+}
+
+/* Ensure transparent scroll container */
+.docx-container {
+  background: #ffffff !important;
+}
+`;
