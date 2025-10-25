@@ -1,0 +1,100 @@
+import JSZip from "jszip";
+import { diffWordsWithSpace } from "diff";
+
+function escapeHTML(s: string) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// Clean XML and extract visible paragraph text
+async function extractVisibleParagraphs(buffer: ArrayBuffer): Promise<string[]> {
+  const zip = await JSZip.loadAsync(buffer);
+  const xml = await zip.file("word/document.xml")?.async("string");
+  if (!xml) throw new Error("Invalid DOCX structure");
+
+  const paragraphs = Array.from(xml.matchAll(/<w:p[\s\S]*?<\/w:p>/g)).map(m => {
+    const t = (m[0].match(/<w:t[^>]*>(.*?)<\/w:t>/g) || [])
+      .map(x => x.replace(/<[^>]+>/g, ""))
+      .join("")
+      .trim();
+    return t;
+  });
+  return paragraphs.filter(Boolean);
+}
+
+export async function generateWordDiffHTML(baselineBuf: ArrayBuffer, compareBuf: ArrayBuffer) {
+  const baseline = await extractVisibleParagraphs(baselineBuf);
+  const compare = await extractVisibleParagraphs(compareBuf);
+
+  // --- Align by content length (avoid full paragraph mismatch)
+  const maxLen = Math.max(baseline.length, compare.length);
+  const resultHTML: string[] = [];
+
+  for (let i = 0; i < maxLen; i++) {
+    const baseText = baseline[i] || "";
+    const compText = compare[i] || "";
+
+    // Ignore identical paragraphs
+    if (baseText.trim() === compText.trim()) {
+      resultHTML.push(`<p>${escapeHTML(compText)}</p>`);
+      continue;
+    }
+
+    // Word-level diff
+    const diff = diffWordsWithSpace(baseText, compText);
+    const html = diff
+      .map(part => {
+        const clean = escapeHTML(part.value);
+        if (part.added)
+          return `<span class="word-insert">${clean}</span>`;
+        if (part.removed)
+          return `<span class="word-delete">${clean}</span>`;
+        return clean;
+      })
+      .join("");
+
+    resultHTML.push(`<p>${html}</p>`);
+  }
+
+  return `<div class="docx-wrapper word-redline-view">${resultHTML.join("")}</div>`;
+}
+
+
+
+styleSheet.textContent = `
+.docx-wrapper {
+  background: #ffffff;
+  font-family: Calibri, sans-serif;
+  font-size: 11pt;
+  line-height: 1.5;
+  color: #1b1b1b;
+  margin: 0 auto;
+  padding: 16px;
+  width: 100%;
+  max-width: 100%;
+  box-shadow: none !important; /* remove gray overlay */
+}
+
+.docx-wrapper > section.docx {
+  background: #ffffff;
+  box-shadow: none !important;
+  margin: 0 auto;
+  padding: 0;
+  width: 100%;
+  position: relative;
+}
+
+/* Word-like redline colors */
+.word-insert {
+  color: #006100;
+  font-weight: 600;
+  background: transparent;
+  text-decoration: none;
+}
+
+.word-delete {
+  color: #9c0006;
+  background: transparent;
+  text-decoration: line-through;
+}
+`;
+
