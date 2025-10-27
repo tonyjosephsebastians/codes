@@ -1,0 +1,173 @@
+import React, { useEffect, useRef, useState } from "react";
+import * as docxPreview from "docx-preview";
+import { Button } from "@/components/ui/button";
+
+const WordDocumentPreview: React.FC<{
+  arrayBuffer: ArrayBuffer;
+  title?: string;
+}> = ({ arrayBuffer, title }) => {
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  // ======= SEARCH STATE =======
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<HTMLElement[]>([]);
+  const [currentIndex, setCurrentIndex] = useState(0);
+
+  // ======= PAGE COUNTER STATE =======
+  const [pageCount, setPageCount] = useState(0);
+  const [currentPage, setCurrentPage] = useState(1);
+
+  // ======= RENDER DOCX =======
+  useEffect(() => {
+    if (!arrayBuffer || !containerRef.current) return;
+
+    const container = containerRef.current;
+    container.innerHTML = "";
+
+    const wrapper = document.createElement("div");
+    wrapper.className = "docx-wrapper";
+    container.appendChild(wrapper);
+
+    const options = {
+      experimental: true,
+      useMathMLPolyfill: false,
+    };
+
+    docxPreview.renderAsync(arrayBuffer, wrapper, null, options).then(() => {
+      // After rendering — override black shadow styles
+      const style = document.createElement("style");
+      style.innerHTML = `
+        section.docx {
+          background: #ffffff !important;
+          box-shadow: none !important;
+          border: none !important;
+          margin: 0 !important;
+          padding: 0 !important;
+        }
+        .docx-wrapper, .docx-container, .docx-wrapper section.docx {
+          background: #ffffff !important;
+          box-shadow: none !important;
+        }
+        body, html {
+          background: #ffffff !important;
+        }
+        .search-highlight {
+          background-color: yellow !important;
+          color: black !important;
+          padding: 0 2px;
+          border-radius: 2px;
+        }
+      `;
+      document.head.appendChild(style);
+
+      // Setup page counting
+      const pages = container.querySelectorAll("section.docx");
+      setPageCount(pages.length);
+
+      const handleScroll = () => {
+        const scrollPos = container.scrollTop || 0;
+        let current = 1;
+        pages.forEach((page, idx) => {
+          if (page.offsetTop - 200 <= scrollPos) {
+            current = idx + 1;
+          }
+        });
+        setCurrentPage(current);
+      };
+
+      container.addEventListener("scroll", handleScroll);
+      return () => container.removeEventListener("scroll", handleScroll);
+    });
+  }, [arrayBuffer]);
+
+  // ======= SEARCH HANDLERS =======
+  const handleSearch = (query: string) => {
+    setSearchQuery(query);
+
+    if (!containerRef.current) return;
+    const container = containerRef.current;
+
+    // Remove old highlights
+    container.querySelectorAll(".search-highlight").forEach((el) => {
+      el.replaceWith(document.createTextNode(el.textContent || ""));
+    });
+
+    if (!query.trim()) {
+      setSearchResults([]);
+      return;
+    }
+
+    const matches: HTMLElement[] = [];
+    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+    const regex = new RegExp(query, "gi");
+
+    while (walker.nextNode()) {
+      const node = walker.currentNode as Text;
+      if (node.nodeValue && regex.test(node.nodeValue)) {
+        const span = document.createElement("span");
+        span.innerHTML = node.nodeValue.replace(
+          regex,
+          (match) => `<mark class="search-highlight">${match}</mark>`
+        );
+        node.parentNode?.replaceChild(span, node);
+        matches.push(span);
+      }
+    }
+
+    setSearchResults(matches);
+    setCurrentIndex(0);
+
+    if (matches.length > 0) {
+      matches[0].scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  };
+
+  const handleNextMatch = () => {
+    if (searchResults.length === 0) return;
+    const next = (currentIndex + 1) % searchResults.length;
+    setCurrentIndex(next);
+    searchResults[next].scrollIntoView({ behavior: "smooth", block: "center" });
+  };
+
+  const handlePrevMatch = () => {
+    if (searchResults.length === 0) return;
+    const prev = (currentIndex - 1 + searchResults.length) % searchResults.length;
+    setCurrentIndex(prev);
+    searchResults[prev].scrollIntoView({ behavior: "smooth", block: "center" });
+  };
+
+  return (
+    <div className="relative w-full h-full flex flex-col">
+      {/* ======= SEARCH BAR ======= */}
+      <div className="flex items-center gap-2 p-2 border-b bg-white z-10">
+        <input
+          type="text"
+          placeholder="Search in document..."
+          value={searchQuery}
+          onChange={(e) => handleSearch(e.target.value)}
+          className="flex-1 border rounded px-2 py-1 text-sm"
+        />
+        <Button onClick={handlePrevMatch} size="sm">
+          Prev
+        </Button>
+        <Button onClick={handleNextMatch} size="sm">
+          Next
+        </Button>
+      </div>
+
+      {/* ======= DOCUMENT VIEWER ======= */}
+      <div
+        ref={containerRef}
+        className="flex-1 overflow-y-auto bg-white relative"
+        style={{ scrollBehavior: "smooth" }}
+      ></div>
+
+      {/* ======= PAGE COUNTER ======= */}
+      <div className="absolute bottom-2 right-4 bg-white/90 border px-3 py-1 text-sm text-gray-600 shadow rounded">
+        Page {currentPage} / {pageCount || 1}
+      </div>
+    </div>
+  );
+};
+
+export default WordDocumentPreview;
