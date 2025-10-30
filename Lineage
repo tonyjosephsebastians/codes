@@ -1,0 +1,50 @@
+// Step 5: Download the generated Excel file
+const downloadurl = getLineageReportDownloadUrl(userId, projectId, excelFile);
+console.log("Download response received:", downloadurl);
+
+// Build a styled HTML button instead of plain text link
+const buttonHTML = `
+  <a 
+    href="${downloadurl}" 
+    target="_blank" 
+    rel="noopener noreferrer"
+    style="
+      display:inline-block;
+      background-color:#007C41;
+      color:#fff;
+      padding:8px 14px;
+      border-radius:6px;
+      text-decoration:none;
+      font-weight:500;
+      margin-top:10px;
+    "
+  >
+    ⬇️ Download Lineage Report
+  </a>
+`;
+
+// Update chat session
+const newEntry = {
+  query: "Download Lineage Report",
+  response: `
+✅ **Lineage Report generated successfully!**  
+Your Excel report is ready for download below.  
+${buttonHTML}
+  `,
+  timestamp: new Date().toLocaleString(),
+};
+
+// Add to chat session
+setSessions((prev) => ({
+  ...prev,
+  [currentSessionIndex]: [...(prev[currentSessionIndex] || []), newEntry],
+}));
+
+// Update live chat display
+setResponse(`
+✅ **Lineage Report generated successfully!**  
+Your Excel report is ready for download below.  
+${buttonHTML}
+`);
+
+setIsLineageReportGenerated(true);
