@@ -1,0 +1,30 @@
+const { headers, data } = await fetchFinalKeyMap(username, projectId);
+const dataRows = data.map((row) => headers.map((h) => row[h]));
+
+
+const tableHTML = `
+  <table id="mappingTable" style="border-collapse: collapse; width: 100%; margin-top: 12px; font-family: system-ui, sans-serif;">
+    <thead style="background-color: #007C41; color: white;">
+      <tr>${headers.map((h) => `<th style="border: 1px solid #ccc; padding: 8px;">${h}</th>`).join("")}</tr>
+    </thead>
+    <tbody>
+      ${data
+        .map(
+          (row) =>
+            `<tr>${headers
+              .map(
+                (h, j) =>
+                  `<td style="border: 1px solid #ccc; padding: 6px;">
+                    ${
+                      j === headers.length - 1
+                        ? `<input type="text" value="${row[h] || ""}" style="width: 100%; border: 1px solid #ccc; border-radius: 4px; padding: 4px;" />`
+                        : row[h]
+                    }
+                  </td>`
+              )
+              .join("")}</tr>`
+        )
+        .join("")}
+    </tbody>
+  </table>
+`;
