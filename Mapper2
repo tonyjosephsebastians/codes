@@ -1,0 +1,216 @@
+const handleMappingReport = async () => {
+  try {
+    if (!selectedFile) {
+      setError("No ZIP file selected for Mapping Report.");
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+
+    const projectId = selectedFile.replace(/\.[^/.]+$/, "");
+
+    // Step 1️⃣ Fetch final_key_map.csv
+    const response = await axios.get("/api/fieldlineage/files/final_key_map", {
+      params: { user_id: userId, project_id: projectId },
+      responseType: "blob",
+    });
+
+    const csvText = await response.data.text();
+    const rows = csvText.split("\n").map((r) => r.split(","));
+    const headers = rows[0];
+    const dataRows = rows.slice(1);
+
+    // Step 2️⃣ Build editable table
+    const tableHTML = `
+      <table id="mappingTable" style="border-collapse: collapse; width: 100%; margin-top: 12px; font-family: system-ui, sans-serif;">
+        <thead style="background-color: #007C41; color: white;">
+          <tr>${headers.map((h) => `<th style="border: 1px solid #ccc; padding: 8px;">${h}</th>`).join("")}</tr>
+        </thead>
+        <tbody>
+          ${dataRows
+            .map(
+              (row) =>
+                `<tr>${row
+                  .map(
+                    (cell, j) =>
+                      `<td style="border: 1px solid #ccc; padding: 6px;">
+                        ${
+                          j === headers.length - 1
+                            ? `<input type="text" value="${cell || ""}" style="width: 100%; border: 1px solid #ccc; border-radius: 4px; padding: 4px;" />`
+                            : cell
+                        }
+                      </td>`
+                  )
+                  .join("")}</tr>`
+            )
+            .join("")}
+        </tbody>
+      </table>
+    `;
+
+    // Step 3️⃣ Buttons
+    const buttonHTML = `
+      <div style="margin-top: 16px; display: flex; gap: 10px;">
+        <button id="uploadCopybooksBtn" style="
+          background-color: #007C41;
+          color: white;
+          border: none;
+          border-radius: 6px;
+          padding: 8px 16px;
+          font-weight: 500;
+          cursor: pointer;
+        ">📁 Upload Copybooks</button>
+
+        <button id="generateMappingBtn" style="
+          background-color: #007C41;
+          color: white;
+          border: none;
+          border-radius: 6px;
+          padding: 8px 16px;
+          font-weight: 500;
+          cursor: pointer;
+        ">⚙️ Generate Mapping Report</button>
+      </div>
+    `;
+
+    // Step 4️⃣ Combine HTML
+    const htmlResponse = `
+      <div style="font-family: system-ui, sans-serif;">
+        <p><strong>✅ Mapping Key File Loaded!</strong></p>
+        <p>Edit the last column below, then upload COBOL copybooks and click Generate Mapping Report.</p>
+        ${tableHTML}
+        ${buttonHTML}
+      </div>
+    `;
+
+    // Step 5️⃣ Update chat
+    const newEntry = {
+      query: "Mapping Report",
+      response: htmlResponse,
+      timestamp: new Date().toLocaleString(),
+    };
+
+    setSessions((prev) => ({
+      ...prev,
+      [currentsessionIndex]: [...(prev[currentsessionIndex] || []), newEntry],
+    }));
+
+    setResponse(htmlResponse);
+
+    // Step 6️⃣ Scoped functions
+    const handleUploadCopybooks = async () => {
+      try {
+        const input = document.createElement("input");
+        input.type = "file";
+        input.multiple = true;
+        input.accept = ".txt,.cpy";
+        input.click();
+
+        input.onchange = async (e) => {
+          const files = e.target.files;
+          if (!files.length) return;
+
+          setResponse(`<p>📤 Uploading ${files.length} copybook(s)...</p>`);
+
+          const formData = new FormData();
+          for (let f of files) formData.append("files", f);
+
+          await axios.post("/api/fieldlineage/files/upload", formData, {
+            params: { user_id: userId, project_id: projectId, input_type: "copybook" },
+            headers: { "Content-Type": "multipart/form-data" },
+          });
+
+          setResponse(`<p>✅ Copybooks uploaded successfully. You can now click "Generate Mapping Report".</p>`);
+        };
+      } catch (error) {
+        console.error(error);
+        setError("Failed to upload copybooks.");
+      }
+    };
+
+    const handleGenerateMappingReport = async () => {
+      try {
+        setResponse(`<p>⚙️ Uploading updated key map and processing mapping...</p>`);
+
+        // Step 6A️⃣ Collect updated table and rebuild CSV
+        const table = document.getElementById("mappingTable");
+        const rows = Array.from(table.querySelectorAll("tr"));
+        const csv = rows
+          .map((tr) =>
+            Array.from(tr.querySelectorAll("td,th"))
+              .map((cell) =>
+                cell.querySelector("input")
+                  ? cell.querySelector("input").value
+                  : cell.textContent.trim()
+              )
+              .join(",")
+          )
+          .join("\n");
+
+        // Step 6B️⃣ Upload updated final_key_map.csv
+        const blob = new Blob([csv], { type: "text/csv" });
+        const file = new File([blob], "updated_final_key_map.csv", { type: "text/csv" });
+
+        const formData = new FormData();
+        formData.append("file", file);
+
+        await axios.post("/api/fieldlineage/files/upload", formData, {
+          params: { user_id: userId, project_id: projectId, input_type: "ksfile" },
+          headers: { "Content-Type": "multipart/form-data" },
+        });
+
+        // Step 6C️⃣ Run mapping generator
+        await axios.post("/api/fieldlineage/variablefinder/run", null, {
+          params: { user_id: userId, project_id: projectId },
+        });
+
+        // Step 6D️⃣ Display download link
+        const excelFile = "mapping_output.xlsx";
+        const downloadurl = `/api/fieldlineage/files/download?user_id=${userId}&project_id=${projectId}&filename=${excelFile}`;
+
+        const successHTML = `
+          <div style="font-family: system-ui, sans-serif;">
+            <p><strong>✅ Mapping Report Generated Successfully!</strong></p>
+            <p>Your Excel mapping report is ready for download below.</p>
+            <a href="${downloadurl}" target="_blank" rel="noopener noreferrer" style="
+              display:inline-block;
+              background-color:#007C41;
+              color:#fff;
+              padding:8px 14px;
+              border-radius:6px;
+              text-decoration:none;
+              font-weight:500;
+              margin-top:10px;
+            ">⬇️ Download Mapping Report</a>
+          </div>
+        `;
+
+        setResponse(successHTML);
+        setSessions((prev) => ({
+          ...prev,
+          [currentsessionIndex]: [
+            ...(prev[currentsessionIndex] || []),
+            { query: "Mapping Report Generated", response: successHTML },
+          ],
+        }));
+      } catch (err) {
+        console.error(err);
+        setError("Failed to generate Mapping Report.");
+      }
+    };
+
+    // Step 7️⃣ Attach button listeners
+    setTimeout(() => {
+      const uploadBtn = document.getElementById("uploadCopybooksBtn");
+      const genBtn = document.getElementById("generateMappingBtn");
+      if (uploadBtn) uploadBtn.onclick = handleUploadCopybooks;
+      if (genBtn) genBtn.onclick = handleGenerateMappingReport;
+    }, 500);
+  } catch (err) {
+    console.error("Mapping report error:", err);
+    setError("Failed to load Mapping Report file.");
+  } finally {
+    setLoading(false);
+  }
+};
