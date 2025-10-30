@@ -1,0 +1,125 @@
+import { fetchFinalKeyMap, uploadUpdatedFinalKeyMap, processMappingReport } from "./api/lineageApi";
+
+export const handleMappingReport = async (
+  userId,
+  projectId,
+  setSessions,
+  setResponse,
+  setError,
+  currentSessionIndex
+) => {
+  try {
+    // Step 1: Fetch key map CSV
+    const { headers, data } = await fetchFinalKeyMap(userId, projectId);
+    console.log("Fetched key map:", headers, data);
+
+    // Step 2: Build editable HTML table (only last column editable)
+    const lastCol = headers[headers.length - 1];
+    const tableHtml = `
+      <div id="mappingTableWrapper" style="max-height:400px; overflow:auto; border:1px solid #e5e7eb; border-radius:6px; margin-top:10px;">
+        <table style="width:100%; border-collapse:collapse;">
+          <thead style="background:#f3f4f6; position:sticky; top:0;">
+            <tr>
+              ${headers.map((h) => `<th style="border:1px solid #ddd; padding:6px; text-align:left;">${h}</th>`).join("")}
+            </tr>
+          </thead>
+          <tbody>
+            ${data
+              .map(
+                (row, i) => `
+              <tr>
+                ${headers
+                  .map((h) =>
+                    h === lastCol
+                      ? `<td style="border:1px solid #ddd; padding:4px;"><input type="text" data-row="${i}" data-col="${h}" value="${
+                          row[h] || ""
+                        }" style="width:100%; border:none; outline:none; background:#fff;"></td>`
+                      : `<td style="border:1px solid #ddd; padding:4px;">${row[h] || ""}</td>`
+                  )
+                  .join("")}
+              </tr>`
+              )
+              .join("")}
+          </tbody>
+        </table>
+      </div>
+
+      <button id="generateMappingBtn" style="margin-top:12px; background:#007C41; color:white; border:none; border-radius:4px; padding:8px 14px; cursor:pointer;">
+        Generate Mapping
+      </button>
+    `;
+
+    const markdownMsg = `
+📋 **Final Key Map Fetched Successfully**
+
+You can now edit the last column below, then click **Generate Mapping**.
+
+${tableHtml}
+    `;
+
+    // Step 3: Update session + response (so chat displays table)
+    const newEntry = {
+      query: "Mapping Report",
+      response: markdownMsg,
+      timestamp: new Date().toLocaleString(),
+    };
+
+    setSessions((prev) => ({
+      ...prev,
+      [currentSessionIndex]: [...(prev[currentSessionIndex] || []), newEntry],
+    }));
+    setResponse(markdownMsg);
+
+    // Step 4: Attach button handler after DOM render
+    setTimeout(() => {
+      const btn = document.getElementById("generateMappingBtn");
+      if (btn) {
+        btn.onclick = async () => {
+          try {
+            // Read table edits
+            const updatedRows = data.map((row, i) => {
+              const newRow = { ...row };
+              const input = document.querySelector(`input[data-row="${i}"][data-col="${lastCol}"]`);
+              newRow[lastCol] = input ? input.value : row[lastCol];
+              return newRow;
+            });
+
+            // Convert to CSV
+            const csv = [
+              headers.join(","),
+              ...updatedRows.map((r) => headers.map((h) => r[h] || "").join(",")),
+            ].join("\n");
+
+            const blob = new Blob([csv], { type: "text/csv" });
+
+            await uploadUpdatedFinalKeyMap(blob, userId, projectId);
+
+            // Update success message
+            const successMsg = `
+✅ **Mapping file uploaded successfully.**
+Please upload your **COBOL source files** next to continue with mapping generation.
+            `;
+            setSessions((prev) => ({
+              ...prev,
+              [currentSessionIndex]: [
+                ...(prev[currentSessionIndex] || []),
+                { query: "Generate Mapping", response: successMsg, timestamp: new Date().toLocaleString() },
+              ],
+            }));
+            setResponse(successMsg);
+          } catch (err) {
+            console.error(err);
+            const failMsg = `❌ Failed to upload updated mapping CSV.`;
+            setResponse(failMsg);
+            setError(failMsg);
+          }
+        };
+      }
+    }, 1000); // wait for render
+
+  } catch (error) {
+    console.error(error);
+    setError("Failed to fetch mapping report.");
+    setResponse("❌ Failed to fetch mapping report.");
+  }
+};
