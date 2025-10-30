@@ -1,0 +1,4 @@
+const htmlResponse = `
+<div><p><strong>✅ Lineage Report generated successfully!</strong></p>
+<p>Your Excel report is ready for download below.</p>${buttonHTML}</div>`;
+setResponse(htmlResponse);
