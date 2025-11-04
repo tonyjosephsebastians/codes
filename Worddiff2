@@ -1,0 +1,168 @@
+import { diffWordsWithSpace } from "diff";
+
+export async function generateDiffHTML(baseEl: HTMLElement, compareEl: HTMLElement): Promise<string> {
+  const baseText = baseEl.innerText.replace(/\s+/g, " ").trim();
+  const compText = compareEl.innerText.replace(/\s+/g, " ").trim();
+
+  if (baseText === compText) {
+    return `<p style="color:gray">No differences found.</p>`;
+  }
+
+  const diff = diffWordsWithSpace(baseText, compText);
+  return diff
+    .map((part) => {
+      if (part.added) return `<span class="word-insert">${part.value}</span>`;
+      if (part.removed) return `<span class="word-delete">${part.value}</span>`;
+      return part.value;
+    })
+    .join("");
+}
+
+
+
+import React, { useEffect, useRef, useState } from "react";
+import * as docxPreview from "docx-preview";
+import { generateDiffHTML } from "./useWordDiff";
+
+export default function WordDocumentPreview({
+  file,
+  arrayBuffer,
+  baselineArrayBuffer,
+  showDiff,
+}: {
+  file?: File;
+  arrayBuffer?: ArrayBuffer | null;
+  baselineArrayBuffer?: ArrayBuffer | null;
+  showDiff?: boolean;
+}) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [loading, setLoading] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchIndex, setSearchIndex] = useState(0);
+
+  useEffect(() => {
+    const renderDoc = async () => {
+      if (!arrayBuffer || !containerRef.current) return;
+      setLoading(true);
+      const wrapper = containerRef.current;
+      wrapper.innerHTML = "";
+
+      if (showDiff && baselineArrayBuffer) {
+        const hiddenBase = document.createElement("div");
+        const hiddenComp = document.createElement("div");
+        hiddenBase.style.display = "none";
+        hiddenComp.style.display = "none";
+        document.body.append(hiddenBase, hiddenComp);
+
+        await docxPreview.renderAsync(baselineArrayBuffer, hiddenBase);
+        await docxPreview.renderAsync(arrayBuffer, hiddenComp);
+
+        const html = await generateDiffHTML(hiddenBase, hiddenComp);
+        wrapper.innerHTML = `<div class="docx-wrapper word-redline">${html}</div>`;
+
+        hiddenBase.remove();
+        hiddenComp.remove();
+      } else {
+        await docxPreview.renderAsync(arrayBuffer, wrapper);
+      }
+
+      setLoading(false);
+    };
+    renderDoc();
+  }, [arrayBuffer, baselineArrayBuffer, showDiff]);
+
+  // 🔍 SEARCH
+  const handleSearch = (query: string) => {
+    setSearchQuery(query);
+    const container = containerRef.current;
+    if (!container) return;
+
+    container.querySelectorAll("mark.search-highlight").forEach((m) => {
+      const parent = m.parentNode!;
+      parent.replaceChild(document.createTextNode(m.textContent || ""), m);
+      parent.normalize();
+    });
+
+    if (!query) return;
+
+    const regex = new RegExp(query, "gi");
+    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+    const matches: HTMLElement[] = [];
+
+    while (walker.nextNode()) {
+      const node = walker.currentNode as Text;
+      if (node.nodeValue?.match(regex)) {
+        const span = document.createElement("span");
+        span.innerHTML = node.nodeValue.replace(regex, (m) => `<mark class='search-highlight'>${m}</mark>`);
+        node.parentNode?.replaceChild(span, node);
+      }
+    }
+
+    const marks = container.querySelectorAll("mark.search-highlight");
+    if (marks.length) {
+      (marks[0] as HTMLElement).scrollIntoView({ behavior: "smooth", block: "center" });
+      setSearchIndex(0);
+    }
+  };
+
+  const jumpTo = (dir: "next" | "prev") => {
+    const container = containerRef.current;
+    if (!container) return;
+    const marks = container.querySelectorAll("mark.search-highlight");
+    if (!marks.length) return;
+    setSearchIndex((i) => {
+      const next = dir === "next" ? (i + 1) % marks.length : (i - 1 + marks.length) % marks.length;
+      (marks[next] as HTMLElement).scrollIntoView({ behavior: "smooth", block: "center" });
+      return next;
+    });
+  };
+
+  return (
+    <div>
+      <div className="flex gap-2 mb-2">
+        <input
+          type="text"
+          value={searchQuery}
+          onChange={(e) => handleSearch(e.target.value)}
+          placeholder="Search in document..."
+          className="border px-2 py-1 text-sm w-full"
+        />
+        <button onClick={() => jumpTo("prev")} className="px-2 py-1 border rounded text-xs">Prev</button>
+        <button onClick={() => jumpTo("next")} className="px-2 py-1 border rounded text-xs">Next</button>
+      </div>
+      {loading && <p className="text-gray-500 text-sm">Loading document...</p>}
+      <div ref={containerRef} className="word-preview-container"></div>
+    </div>
+  );
+}
+
+
+.docx-wrapper.word-redline {
+  font-family: Calibri, sans-serif;
+  font-size: 11pt;
+  line-height: 1.5;
+  color: #000;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  padding: 20px;
+  background: white;
+}
+
+.word-insert {
+  color: #006100;
+  background-color: #c6efce;
+  font-weight: 600;
+  border-bottom: 1px solid #006100;
+}
+
+.word-delete {
+  color: #9c0006;
+  background-color: #ffc7ce;
+  text-decoration: line-through;
+}
+
+mark.search-highlight {
+  background-color: #ffeb3b;
+  color: black;
+}
+
