@@ -1,0 +1,279 @@
+"use client";
+import React, { useEffect, useRef, useState } from "react";
+import * as docxPreview from "docx-preview";
+import { diffWordsWithSpace } from "diff";
+
+type ClauseRow = { id: string; page: number; text: string };
+
+/* ---------------- Utilities ---------------- */
+const assertBuffer = (name: string, buf?: ArrayBuffer | null) => {
+  if (!buf || !(buf instanceof ArrayBuffer) || buf.byteLength === 0) {
+    throw new Error(`${name} is empty or invalid ArrayBuffer`);
+  }
+};
+
+const getPlainTextFromRendered = (el: HTMLElement) =>
+  el.innerText.replace(/[ \t]+\n/g, "\n").replace(/\u00A0/g, " ").replace(/[ \t]+/g, " ").trim();
+
+/* ---------------- Search hook (reads ref at call time) ---------------- */
+function useSearch(ref: React.RefObject<HTMLElement>) {
+  const searchIndexRef = useRef(0);
+
+  const clear = () => {
+    const root = ref.current;
+    if (!root) return;
+    root.querySelectorAll("mark.search-highlight").forEach((m) => {
+      const parent = m.parentNode!;
+      parent.replaceChild(document.createTextNode(m.textContent || ""), m);
+      parent.normalize();
+    });
+    searchIndexRef.current = 0;
+  };
+
+  const search = (q: string) => {
+    const root = ref.current;
+    if (!root) return 0;
+    clear();
+    if (!q) return 0;
+
+    const regex = new RegExp(q, "gi");
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+
+    while (walker.nextNode()) {
+      const node = walker.currentNode as Text;
+      if (!node.nodeValue) continue;
+      if (!regex.test(node.nodeValue)) continue;
+
+      const span = document.createElement("span");
+      span.innerHTML = node.nodeValue.replace(regex, (m) => `<mark class="search-highlight">${m}</mark>`);
+      node.parentNode?.replaceChild(span, node);
+    }
+
+    const marks = root.querySelectorAll("mark.search-highlight");
+    if (marks.length) (marks[0] as HTMLElement).scrollIntoView({ behavior: "smooth", block: "center" });
+    searchIndexRef.current = 0;
+    return marks.length;
+  };
+
+  const jump = (dir: 1 | -1) => {
+    const root = ref.current;
+    if (!root) return;
+    const marks = root.querySelectorAll("mark.search-highlight");
+    if (!marks.length) return;
+    searchIndexRef.current = (searchIndexRef.current + dir + marks.length) % marks.length;
+    (marks[searchIndexRef.current] as HTMLElement).scrollIntoView({ behavior: "smooth", block: "center" });
+  };
+
+  return { search, clear, next: () => jump(1), prev: () => jump(-1) };
+}
+
+/* ---------------- Page + clause map from rendered HTML ---------------- */
+const mapParagraphs = (root: HTMLElement): ClauseRow[] => {
+  const rows: ClauseRow[] = [];
+  const paras = root.querySelectorAll("p");
+  let page = 1;
+
+  paras.forEach((p, i) => {
+    // docx-preview wraps each page in .docx-page; when page container changes, bump page
+    const pageContainer = p.closest(".docx-page");
+    if (pageContainer) {
+      // tag current page number on the container once
+      if (!pageContainer.hasAttribute("data-page-number")) {
+        pageContainer.setAttribute("data-page-number", String(page));
+      }
+      // read existing value to be safe
+      page = Number(pageContainer.getAttribute("data-page-number")) || page;
+    }
+    const id = `para-${i}`;
+    p.setAttribute("data-para-id", id);
+    p.setAttribute("data-page", String(page));
+    rows.push({ id, page, text: p.innerText.trim().slice(0, 120) });
+  });
+
+  return rows;
+};
+
+export const scrollToClause = (root: HTMLElement, clauseId: string) => {
+  const t = root.querySelector(`[data-para-id="${clauseId}"]`) as HTMLElement | null;
+  t?.scrollIntoView({ behavior: "smooth", block: "center" });
+};
+
+/* ---------------- Smart search bar ---------------- */
+const SearchBar = ({
+  onSearch,
+  onNext,
+  onPrev,
+  onClear,
+  count,
+}: {
+  onSearch: (q: string) => void;
+  onNext: () => void;
+  onPrev: () => void;
+  onClear: () => void;
+  count: number;
+}) => {
+  const [q, setQ] = useState("");
+  return (
+    <div className="flex items-center gap-2 mb-2 bg-white border rounded px-2 py-1">
+      <input
+        value={q}
+        onChange={(e) => {
+          const v = e.target.value;
+          setQ(v);
+          onSearch(v);
+        }}
+        placeholder="Search in document…"
+        className="flex-1 text-sm outline-none"
+      />
+      {q && (
+        <button
+          onClick={() => {
+            setQ("");
+            onClear();
+          }}
+          className="text-xs px-2 py-1 border rounded"
+        >
+          Clear
+        </button>
+      )}
+      <button onClick={onPrev} className="text-xs px-2 py-1 border rounded">
+        Prev
+      </button>
+      <button onClick={onNext} className="text-xs px-2 py-1 border rounded">
+        Next
+      </button>
+      {count > 0 && <span className="text-xs text-gray-500 ml-2">{count}</span>}
+    </div>
+  );
+};
+
+/* ---------------- Main: renders + diffs from ArrayBuffers ---------------- */
+export default function WordDiffViewer({
+  arrayBuffer,
+  baselineArrayBuffer,
+  showDiff = false,
+  onClauseMapReady,
+}: {
+  arrayBuffer: ArrayBuffer | null;
+  baselineArrayBuffer?: ArrayBuffer | null;
+  showDiff?: boolean;
+  onClauseMapReady?: (rows: ClauseRow[]) => void;
+}) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [loading, setLoading] = useState(false);
+  const [matchCount, setMatchCount] = useState(0);
+  const { search, clear, next, prev } = useSearch(containerRef);
+
+  useEffect(() => {
+    let mounted = true;
+
+    const render = async () => {
+      if (!containerRef.current) return;
+      try {
+        setLoading(true);
+
+        assertBuffer("Current document", arrayBuffer);
+        const wrapper = containerRef.current;
+        wrapper.innerHTML = "";
+
+        if (showDiff) {
+          assertBuffer("Baseline document", baselineArrayBuffer);
+
+          // hidden staging areas (must be in DOM)
+          const baseDiv = document.createElement("div");
+          const compDiv = document.createElement("div");
+          baseDiv.style.cssText = "position:absolute;left:-99999px;top:-99999px;visibility:hidden;";
+          compDiv.style.cssText = "position:absolute;left:-99999px;top:-99999px;visibility:hidden;";
+          document.body.append(baseDiv, compDiv);
+
+          // render sequentially to avoid race
+          await docxPreview.renderAsync(baselineArrayBuffer!, baseDiv, undefined, { inWrapper: true, breakPages: true });
+          await docxPreview.renderAsync(arrayBuffer!, compDiv, undefined, { inWrapper: true, breakPages: true });
+
+          if (!mounted) return;
+
+          const baseText = getPlainTextFromRendered(baseDiv);
+          const compText = getPlainTextFromRendered(compDiv);
+
+          if (baseText === compText) {
+            wrapper.innerHTML = `<div class="docx-wrapper word-redline"><p style="color:gray">No visible differences found.</p></div>`;
+          } else {
+            const diffParts = diffWordsWithSpace(baseText, compText);
+            const html = diffParts
+              .map((p) =>
+                p.added
+                  ? `<span class="word-insert">${p.value}</span>`
+                  : p.removed
+                  ? `<span class="word-delete">${p.value}</span>`
+                  : p.value
+              )
+              .join("");
+            wrapper.innerHTML = `<div class="docx-wrapper word-redline">${html}</div>`;
+          }
+
+          baseDiv.remove();
+          compDiv.remove();
+        } else {
+          await docxPreview.renderAsync(arrayBuffer!, wrapper, undefined, { inWrapper: true, breakPages: true });
+          if (!mounted) return;
+        }
+
+        // map clauses/pages after final DOM exists
+        const rows = mapParagraphs(wrapper);
+        onClauseMapReady?.(rows);
+      } catch (e: any) {
+        console.error("Render error:", e);
+        if (containerRef.current) {
+          containerRef.current.innerHTML = `<div class="p-3 text-sm text-red-600 bg-red-50 rounded">Failed to render: ${
+            e?.message || e
+          }</div>`;
+        }
+      } finally {
+        if (mounted) setLoading(false);
+      }
+    };
+
+    render();
+    return () => {
+      mounted = false;
+    };
+  }, [arrayBuffer, baselineArrayBuffer, showDiff]);
+
+  return (
+    <div>
+      <SearchBar
+        onSearch={(q) => setMatchCount(search(q))}
+        onNext={next}
+        onPrev={prev}
+        onClear={() => {
+          clear();
+          setMatchCount(0);
+        }}
+        count={matchCount}
+      />
+
+      {loading && <p className="text-gray-500 text-sm">Loading…</p>}
+
+      <div
+        ref={containerRef}
+        className="word-preview-container"
+        style={{
+          maxHeight: "80vh",
+          overflowY: "auto",
+          scrollBehavior: "smooth",
+          background: "white",
+          padding: 12,
+          borderRadius: 8,
+        }}
+      />
+    </div>
+  );
+}
+
+/* ------- Add to your global CSS -------
+
+.word-insert { color:#006100; background:#c6efce; font-weight:600; border-bottom:1px solid #006100; }
+.word-delete { color:#9c0006; background:#ffc7ce; text-decoration:line-through; }
+mark.search-highlight { background:#ffeb3b; color:#000; }
+
+---------------------------------------- *
