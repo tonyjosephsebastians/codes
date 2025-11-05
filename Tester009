@@ -1,0 +1,61 @@
+// Highlight matches safely without breaking docx-preview layout
+const handleSearch = (query: string) => {
+  setSearchTerm(query);
+  if (!containerRef.current) return;
+
+  // Remove previous highlights
+  containerRef.current.querySelectorAll("mark.highlight").forEach((mark) => {
+    const parent = mark.parentNode;
+    if (!parent) return;
+    parent.replaceChild(document.createTextNode(mark.textContent || ""), mark);
+  });
+
+  if (!query.trim()) {
+    setMatches([]);
+    return;
+  }
+
+  const regex = new RegExp(query, "gi");
+  const walker = document.createTreeWalker(containerRef.current, NodeFilter.SHOW_TEXT);
+  const newMatches: HTMLElement[] = [];
+
+  while (walker.nextNode()) {
+    const node = walker.currentNode as Text;
+    const text = node.nodeValue || "";
+
+    // Skip if inside inserted/deleted spans (so diff highlighting isn't broken)
+    if (node.parentElement?.classList.contains("word-insert") ||
+        node.parentElement?.classList.contains("word-delete")) {
+      continue;
+    }
+
+    if (regex.test(text)) {
+      const span = document.createElement("span");
+      span.innerHTML = text.replace(
+        regex,
+        (match) => `<mark class="highlight bg-yellow-200 text-black">${match}</mark>`
+      );
+      node.parentNode?.replaceChild(span, node);
+
+      span.querySelectorAll("mark.highlight").forEach((mark) =>
+        newMatches.push(mark as HTMLElement)
+      );
+    }
+  }
+
+  setMatches(newMatches);
+  setCurrentMatchIndex(0);
+
+  // Auto-scroll to first match
+  if (newMatches.length > 0) {
+    newMatches[0].scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+};
+
+
+mark.highlight {
+  background-color: #fff59d; /* soft yellow */
+  color: #000;
+  border-radius: 2px;
+  padding: 0 1px;
+}
