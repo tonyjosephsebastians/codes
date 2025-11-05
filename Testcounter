@@ -1,0 +1,86 @@
+// ---- Robust page counter + current page tracker ----
+useEffect(() => {
+  const scroller = containerRef.current;
+  if (!scroller) return;
+
+  let io: IntersectionObserver | null = null;
+  let mo: MutationObserver | null = null;
+
+  // 1) Helper that robustly finds docx "pages"
+  const getPages = (): HTMLElement[] => {
+    // common shapes across docx-preview versions
+    const selectors = [
+      "section.docx",
+      ".docx-page",
+      "section[data-page]",     // some forks add data-page
+    ];
+    for (const sel of selectors) {
+      const nodes = Array.from(scroller.querySelectorAll<HTMLElement>(sel));
+      if (nodes.length) return nodes;
+    }
+    // sometimes wrapped in a container; broaden the search
+    const altRoot =
+      scroller.querySelector<HTMLElement>(".docx-container, .docx-wrapper, .docx");
+    if (altRoot) {
+      for (const sel of ["section.docx", ".docx-page", "section[data-page]"]) {
+        const nodes = Array.from(altRoot.querySelectorAll<HTMLElement>(sel));
+        if (nodes.length) return nodes;
+      }
+    }
+    return [];
+  };
+
+  // 2) (Re)wire the intersection observer for the current pages
+  const wireIO = () => {
+    const pages = getPages();
+    setPageCount(pages.length || 1);
+
+    if (!pages.length) return; // wait for MutationObserver
+
+    // Clean old IO
+    if (io) io.disconnect();
+
+    io = new IntersectionObserver(
+      (entries) => {
+        // pick the page with the largest visible area inside scroller
+        const visible = entries
+          .filter((e) => e.isIntersecting)
+          .sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
+        if (visible) {
+          const idx = pages.indexOf(visible.target as HTMLElement);
+          if (idx >= 0) setCurrentPage(idx + 1);
+        }
+      },
+      {
+        root: scroller, // <-- IMPORTANT: use the scrollable div as root
+        threshold: [0.15, 0.33, 0.5, 0.66, 0.85],
+      }
+    );
+
+    pages.forEach((p) => io!.observe(p));
+  };
+
+  // 3) Mutation observer: wait until docx-preview finishes rendering pages
+  mo = new MutationObserver(() => {
+    const pages = getPages();
+    if (pages.length) {
+      wireIO();
+      // once we have pages and IO is wired, we can stop watching DOM churn
+      if (mo) {
+        mo.disconnect();
+        mo = null;
+      }
+    }
+  });
+
+  // Start observing the scroller’s subtree for added/changed nodes
+  mo.observe(scroller, { childList: true, subtree: true });
+
+  // Try once in case pages are already there (e.g. fast render)
+  wireIO();
+
+  return () => {
+    if (io) io.disconnect();
+    if (mo) mo.disconnect();
+  };
+}, [parsedDocument, showDiff]);
