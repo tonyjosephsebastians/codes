@@ -1,0 +1,198 @@
+// src/utils/wordDiffEngine.ts
+// Word-level diff engine preserving DOCX HTML structure from docx-preview
+
+import { diffWordsWithSpace } from "diff";
+import JSZip from "jszip";
+
+/* ========== Utilities ========== */
+
+function escapeHTML(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/** Merge adjacent diff fragments for smoother MS Word–style output */
+function mergeNearby(parts: ReturnType<typeof diffWordsWithSpace>) {
+  const out: typeof parts = [];
+  for (const p of parts) {
+    const last = out[out.length - 1];
+    if (
+      last &&
+      last.added === p.added &&
+      last.removed === p.removed &&
+      (p.value.length <= 10 || /\s$/.test(last.value))
+    ) {
+      last.value += p.value;
+    } else {
+      out.push({ ...p });
+    }
+  }
+  return out;
+}
+
+/** Compute similarity for paragraph alignment */
+function similarity(a: string, b: string): number {
+  if (!a || !b) return 0;
+  const aWords = a.toLowerCase().split(/\s+/);
+  const bWords = b.toLowerCase().split(/\s+/);
+  const match = aWords.filter((w) => bWords.includes(w)).length;
+  return (2 * match) / (aWords.length + bWords.length);
+}
+
+/* ========== Text Extraction (Fallback Only) ========== */
+
+async function extractParagraphsFromDOCX(buffer: ArrayBuffer): Promise<string[]> {
+  const zip = await JSZip.loadAsync(buffer);
+  const xml = await zip.file("word/document.xml")?.async("string");
+  if (!xml) throw new Error("Invalid DOCX structure");
+
+  return Array.from(xml.matchAll(/<w:p[\s\S]*?<\/w:p>/g))
+    .map((m) => {
+      const runs = Array.from(m[0].matchAll(/<w:t[^>]*>(.*?)<\/w:t>/g)).map(
+        (t) => t[1]
+      );
+      return runs.join(" ").replace(/\s+/g, " ").trim();
+    })
+    .filter(Boolean);
+}
+
+/* ========== Public 1: Inject diff into rendered docx-preview HTML ========== */
+
+export function injectDiffIntoRenderedHTML(
+  baselineHTML: string,
+  compareHTML: string,
+  options: { minSimilarity?: number } = {}
+): string {
+  const minSimilarity = options.minSimilarity ?? 0.35;
+
+  const parser = new DOMParser();
+  const baseDoc = parser.parseFromString(baselineHTML, "text/html");
+  const cmpDoc = parser.parseFromString(compareHTML, "text/html");
+
+  const baseParas = Array.from(baseDoc.querySelectorAll("p, li, td, th"));
+  const cmpParas = Array.from(cmpDoc.querySelectorAll("p, li, td, th"));
+
+  const usedCmp = new Set<number>();
+  const norm = (t: string) => t.replace(/\s+/g, " ").trim();
+
+  for (let i = 0; i < baseParas.length; i++) {
+    const baseText = norm(baseParas[i].textContent ?? "");
+    let bestIdx = -1;
+    let bestSim = minSimilarity;
+    for (let j = 0; j < cmpParas.length; j++) {
+      if (usedCmp.has(j)) continue;
+      const sim = similarity(baseText, norm(cmpParas[j].textContent ?? ""));
+      if (sim > bestSim) {
+        bestSim = sim;
+        bestIdx = j;
+      }
+    }
+    if (bestIdx < 0) continue;
+    usedCmp.add(bestIdx);
+
+    const cmpEl = cmpParas[bestIdx];
+    const baseEl = baseParas[i];
+
+    // Get plain texts for diff
+    const baseTxt = baseEl.textContent ?? "";
+    const cmpTxt = cmpEl.textContent ?? "";
+    if (baseTxt === cmpTxt) continue;
+
+    const diffParts = mergeNearby(diffWordsWithSpace(baseTxt, cmpTxt));
+
+    // Walk text nodes recursively and inject only where changed
+    const walker = cmpDoc.createTreeWalker(cmpEl, NodeFilter.SHOW_TEXT);
+    const textNodes: Text[] = [];
+    let node: Node | null;
+    while ((node = walker.nextNode())) textNodes.push(node as Text);
+
+    // Flatten diff parts to a single HTML string
+    let htmlBuffer = "";
+    for (const part of diffParts) {
+      const escaped = escapeHTML(part.value);
+      if (part.added)
+        htmlBuffer += `<span class="word-insert">${escaped}</span>`;
+      else if (part.removed)
+        htmlBuffer += `<span class="word-delete">${escaped}</span>`;
+      else htmlBuffer += escaped;
+    }
+
+    // Replace text-only section (preserving inline styles)
+    const frag = cmpDoc.createElement("span");
+    frag.innerHTML = htmlBuffer;
+
+    // Clear only text nodes
+    textNodes.forEach((t) => t.remove());
+    cmpEl.appendChild(frag);
+  }
+
+  return cmpDoc.body.innerHTML;
+}
+
+/* ========== Public 2: Fallback basic diff from ArrayBuffers ========== */
+
+export async function generateWordDiffHTMLFromBuffers(
+  baselineBuf: ArrayBuffer,
+  compareBuf: ArrayBuffer,
+  minSim = 0.35
+): Promise<string> {
+  const base = await extractParagraphsFromDOCX(baselineBuf);
+  const cmp = await extractParagraphsFromDOCX(compareBuf);
+
+  const html: string[] = [];
+  const usedCmp = new Set<number>();
+
+  for (let i = 0; i < base.length; i++) {
+    let bestIdx = -1;
+    let bestSim = minSim;
+    for (let j = 0; j < cmp.length; j++) {
+      if (usedCmp.has(j)) continue;
+      const sim = similarity(base[i], cmp[j]);
+      if (sim > bestSim) {
+        bestSim = sim;
+        bestIdx = j;
+      }
+    }
+
+    if (bestIdx >= 0) {
+      usedCmp.add(bestIdx);
+      const diff = mergeNearby(diffWordsWithSpace(base[i], cmp[bestIdx]));
+      const htmlLine = diff
+        .map((p) => {
+          const clean = escapeHTML(p.value);
+          if (p.added) return `<span class="word-insert">${clean}</span>`;
+          if (p.removed) return `<span class="word-delete">${clean}</span>`;
+          return clean;
+        })
+        .join("");
+      html.push(`<p>${htmlLine}</p>`);
+    } else {
+      html.push(
+        `<p><span class="word-delete">${escapeHTML(base[i])}</span></p>`
+      );
+    }
+  }
+
+  for (let j = 0; j < cmp.length; j++) {
+    if (!usedCmp.has(j)) {
+      html.push(
+        `<p><span class="word-insert">${escapeHTML(cmp[j])}</span></p>`
+      );
+    }
+  }
+
+  return `<div class="docx-wrapper word-redline-view">${html.join("")}</div>`;
+}
+
+/* ========== Public 3: CSS Helper ========== */
+
+export function getWordDiffStyleTag(): HTMLStyleElement {
+  const style = document.createElement("style");
+  style.id = "word-redline-css";
+  style.textContent = `
+    .docx-wrapper { background:#fff; font-family: Calibri, sans-serif; font-size:11pt; line-height:1.5; }
+    .docx-wrapper section.docx { background:#fff; box-shadow:none !important; }
+    .word-insert { color: rgb(67,181,67); font-weight:600; text-decoration:none; background:transparent; }
+    .word-delete { color: rgb(234,41,41); text-decoration: line-through; background:transparent; }
+  `;
+  return style;
+}
