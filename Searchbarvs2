@@ -1,0 +1,192 @@
+import React, { useEffect, useRef, useState } from "react";
+import { ChevronUp, ChevronDown, X } from "lucide-react";
+
+interface SearchBarProps {
+  containerSelector?: string; // e.g., ".docx-container" or ".viewer-content"
+  onClose: () => void;
+}
+
+const SearchBar: React.FC<SearchBarProps> = ({
+  containerSelector = "body",
+  onClose,
+}) => {
+  const [query, setQuery] = useState<string>("");
+  const [matches, setMatches] = useState<HTMLElement[]>([]);
+  const [currentIndex, setCurrentIndex] = useState<number>(0);
+  const containerRef = useRef<HTMLElement | null>(null);
+
+  // Inject self-contained styles
+  useEffect(() => {
+    if (document.getElementById("searchbar-inline-style")) return;
+    const style = document.createElement("style");
+    style.id = "searchbar-inline-style";
+    style.textContent = `
+      mark.__search_highlight {
+        background-color: #fff176;
+        color: #000;
+        border-radius: 2px;
+        padding: 0 2px;
+      }
+      mark.__search_active {
+        background-color: #ffca28;
+        outline: 1px solid #f9a825;
+      }
+      .searchbar-container {
+        position: fixed;
+        top: 12px;
+        right: 20px;
+        z-index: 9999;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        background: #ffffff;
+        border: 1px solid #ccc;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+        border-radius: 6px;
+        padding: 6px 8px;
+        font-family: sans-serif;
+      }
+      .searchbar-input {
+        border: 1px solid #ddd;
+        border-radius: 4px;
+        padding: 4px 6px;
+        font-size: 13px;
+        outline: none;
+        width: 180px;
+      }
+      .searchbar-input:focus {
+        border-color: #0078d7;
+      }
+      .searchbar-button {
+        cursor: pointer;
+        border: none;
+        background: none;
+        padding: 3px;
+        color: #555;
+        transition: 0.2s;
+      }
+      .searchbar-button:hover {
+        color: #000;
+      }
+      .searchbar-count {
+        font-size: 12px;
+        color: #555;
+        width: 40px;
+        text-align: center;
+      }
+    `;
+    document.head.appendChild(style);
+  }, []);
+
+  useEffect(() => {
+    containerRef.current = document.querySelector(containerSelector) as HTMLElement;
+  }, [containerSelector]);
+
+  const highlightMatches = (term: string) => {
+    if (!containerRef.current) return;
+
+    const container = containerRef.current;
+
+    // remove previous highlights
+    container.querySelectorAll("mark.__search_highlight").forEach((el) => {
+      const parent = el.parentNode;
+      if (parent) parent.replaceChild(document.createTextNode(el.textContent || ""), el);
+    });
+
+    if (!term.trim()) {
+      setMatches([]);
+      return;
+    }
+
+    const regex = new RegExp(term, "gi");
+    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+    const found: HTMLElement[] = [];
+
+    while (walker.nextNode()) {
+      const node = walker.currentNode as Text;
+      const text = node.nodeValue || "";
+      if (regex.test(text)) {
+        const span = document.createElement("span");
+        span.innerHTML = text.replace(
+          regex,
+          (m) => `<mark class="__search_highlight">${m}</mark>`
+        );
+        node.parentNode?.replaceChild(span, node);
+      }
+    }
+
+    const highlights = Array.from(
+      container.querySelectorAll<HTMLElement>("mark.__search_highlight")
+    );
+    setMatches(highlights);
+    setCurrentIndex(0);
+    if (highlights.length > 0) scrollTo(0);
+  };
+
+  const scrollTo = (index: number) => {
+    matches.forEach((m) => m.classList.remove("__search_active"));
+    const el = matches[index];
+    if (el) {
+      el.classList.add("__search_active");
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  };
+
+  const goNext = () => {
+    if (!matches.length) return;
+    const next = (currentIndex + 1) % matches.length;
+    setCurrentIndex(next);
+    scrollTo(next);
+  };
+
+  const goPrev = () => {
+    if (!matches.length) return;
+    const prev = (currentIndex - 1 + matches.length) % matches.length;
+    setCurrentIndex(prev);
+    scrollTo(prev);
+  };
+
+  // Keyboard shortcut: Enter = next, Shift+Enter = previous
+  useEffect(() => {
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === "Enter" && matches.length > 0) {
+        e.preventDefault();
+        if (e.shiftKey) goPrev();
+        else goNext();
+      }
+    };
+    document.addEventListener("keydown", handleKey);
+    return () => document.removeEventListener("keydown", handleKey);
+  }, [matches, currentIndex]);
+
+  return (
+    <div className="searchbar-container">
+      <input
+        type="text"
+        className="searchbar-input"
+        placeholder="Find in document..."
+        autoFocus
+        value={query}
+        onChange={(e) => {
+          const value = e.target.value;
+          setQuery(value);
+          highlightMatches(value);
+        }}
+      />
+      <button onClick={goPrev} className="searchbar-button" disabled={!matches.length}>
+        <ChevronUp size={16} />
+      </button>
+      <button onClick={goNext} className="searchbar-button" disabled={!matches.length}>
+        <ChevronDown size={16} />
+      </button>
+      <span className="searchbar-count">
+        {matches.length ? `${currentIndex + 1}/${matches.length}` : "0/0"}
+      </span>
+      <button onClick={onClose} className="searchbar-button">
+        <X size={16} />
+      </button>
+    </div>
+  );
+};
+
+export default SearchBar;
