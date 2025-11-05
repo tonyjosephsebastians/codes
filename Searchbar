@@ -1,0 +1,165 @@
+import React, { useEffect, useRef, useState } from "react";
+import { X, ChevronUp, ChevronDown } from "lucide-react";
+
+interface ChromeLikeSearchBarProps {
+  containerSelector?: string; // optional: where to search, defaults to document.body
+  onClose: () => void;
+}
+
+const ChromeLikeSearchBar: React.FC<ChromeLikeSearchBarProps> = ({
+  containerSelector,
+  onClose,
+}) => {
+  const [query, setQuery] = useState("");
+  const [matches, setMatches] = useState<HTMLElement[]>([]);
+  const [currentIndex, setCurrentIndex] = useState(0);
+  const containerRef = useRef<HTMLElement | null>(null);
+
+  // Initialize search container
+  useEffect(() => {
+    containerRef.current = containerSelector
+      ? (document.querySelector(containerSelector) as HTMLElement)
+      : document.body;
+  }, [containerSelector]);
+
+  // Perform case-insensitive search
+  const performSearch = (term: string) => {
+    if (!containerRef.current) return;
+    const container = containerRef.current;
+    container
+      .querySelectorAll("mark.__chrome_search_highlight")
+      .forEach((el) => el.replaceWith(document.createTextNode(el.textContent || "")));
+
+    if (!term.trim()) {
+      setMatches([]);
+      setCurrentIndex(0);
+      return;
+    }
+
+    const regex = new RegExp(term, "gi");
+    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+    const newMatches: HTMLElement[] = [];
+
+    while (walker.nextNode()) {
+      const node = walker.currentNode as Text;
+      const text = node.nodeValue || "";
+      if (regex.test(text)) {
+        const span = document.createElement("span");
+        span.innerHTML = text.replace(
+          regex,
+          (match) =>
+            `<mark class="__chrome_search_highlight">${match}</mark>`
+        );
+        node.parentNode?.replaceChild(span, node);
+      }
+    }
+
+    const highlights = Array.from(
+      container.querySelectorAll<HTMLElement>("mark.__chrome_search_highlight")
+    );
+    setMatches(highlights);
+    setCurrentIndex(0);
+    if (highlights.length > 0) scrollToIndex(0);
+  };
+
+  const scrollToIndex = (index: number) => {
+    matches.forEach((m) => m.classList.remove("__chrome_search_active"));
+    if (matches[index]) {
+      matches[index].classList.add("__chrome_search_active");
+      matches[index].scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  };
+
+  const next = () => {
+    if (!matches.length) return;
+    const nextIndex = (currentIndex + 1) % matches.length;
+    setCurrentIndex(nextIndex);
+    scrollToIndex(nextIndex);
+  };
+
+  const prev = () => {
+    if (!matches.length) return;
+    const prevIndex = (currentIndex - 1 + matches.length) % matches.length;
+    setCurrentIndex(prevIndex);
+    scrollToIndex(prevIndex);
+  };
+
+  return (
+    <div className="fixed top-3 right-4 bg-white border shadow-md rounded-md flex items-center gap-2 px-3 py-2 z-[9999]">
+      <input
+        autoFocus
+        type="text"
+        value={query}
+        onChange={(e) => {
+          setQuery(e.target.value);
+          performSearch(e.target.value);
+        }}
+        placeholder="Find in page..."
+        className="border rounded px-2 py-1 text-sm outline-none w-56"
+      />
+      <button
+        onClick={prev}
+        disabled={!matches.length}
+        className="text-gray-600 hover:text-black disabled:text-gray-300"
+      >
+        <ChevronUp size={16} />
+      </button>
+      <button
+        onClick={next}
+        disabled={!matches.length}
+        className="text-gray-600 hover:text-black disabled:text-gray-300"
+      >
+        <ChevronDown size={16} />
+      </button>
+      <span className="text-xs text-gray-500 w-10 text-center">
+        {matches.length ? `${currentIndex + 1}/${matches.length}` : "0/0"}
+      </span>
+      <button onClick={onClose} className="text-gray-400 hover:text-gray-600">
+        <X size={16} />
+      </button>
+    </div>
+  );
+};
+
+export default ChromeLikeSearchBar;
+
+
+mark.__chrome_search_highlight {
+  background-color: #fff59d;
+  color: #000;
+  border-radius: 2px;
+  padding: 0 2px;
+}
+
+mark.__chrome_search_active {
+  background-color: #ffd54f;
+  outline: 1px solid #f9a825;
+}
+
+import React, { useState } from "react";
+import ChromeLikeSearchBar from "./ChromeLikeSearchBar";
+
+function HeaderBar() {
+  const [showSearch, setShowSearch] = useState(false);
+
+  return (
+    <>
+      <div className="flex justify-end p-2 bg-gray-100 border-b">
+        <button
+          onClick={() => setShowSearch(true)}
+          className="bg-gray-200 hover:bg-gray-300 px-3 py-1 rounded text-sm font-medium"
+        >
+          🔍 Search
+        </button>
+      </div>
+
+      {showSearch && (
+        <ChromeLikeSearchBar onClose={() => setShowSearch(false)} />
+      )}
+    </>
+  );
+}
+
+export default HeaderBar;
+
+
