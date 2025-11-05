@@ -1,0 +1,151 @@
+import React, { useEffect, useRef, useState } from "react";
+import Mark from "mark.js";
+import { ChevronUp, ChevronDown, X } from "lucide-react";
+
+interface SearchBarProps {
+  containerSelector?: string; // e.g. ".docx-container"
+  onClose: () => void;        // called when user clicks X
+}
+
+const SearchBar: React.FC<SearchBarProps> = ({
+  containerSelector = ".docx-container",
+  onClose,
+}) => {
+  const containerRef = useRef<HTMLElement | null>(null);
+  const [query, setQuery] = useState("");
+  const [marks, setMarks] = useState<NodeListOf<HTMLElement> | []>([]);
+  const [index, setIndex] = useState(0);
+  const markInstance = useRef<Mark | null>(null);
+
+  // Prepare container and mark.js
+  useEffect(() => {
+    containerRef.current = document.querySelector(containerSelector);
+    if (containerRef.current) markInstance.current = new Mark(containerRef.current);
+  }, [containerSelector]);
+
+  // Highlight logic
+  const highlight = (term: string) => {
+    if (!markInstance.current || !containerRef.current) return;
+    const ctx = containerRef.current;
+    const instance = markInstance.current;
+
+    instance.unmark({
+      done: () => {
+        if (term.trim()) {
+          instance.mark(term, {
+            separateWordSearch: false,
+            done: () => {
+              const newMarks = ctx.querySelectorAll("mark");
+              setMarks(newMarks);
+              setIndex(0);
+              if (newMarks.length > 0) {
+                newMarks[0].scrollIntoView({ behavior: "smooth", block: "center" });
+                newMarks[0].classList.add("active-highlight");
+              }
+            },
+          });
+        } else {
+          setMarks([]);
+        }
+      },
+    });
+  };
+
+  const navigate = (dir: "next" | "prev") => {
+    if (!marks.length) return;
+    marks[index].classList.remove("active-highlight");
+    const newIndex =
+      dir === "next"
+        ? (index + 1) % marks.length
+        : (index - 1 + marks.length) % marks.length;
+    setIndex(newIndex);
+    marks[newIndex].classList.add("active-highlight");
+    marks[newIndex].scrollIntoView({ behavior: "smooth", block: "center" });
+  };
+
+  return (
+    <div
+      style={{
+        position: "fixed",
+        top: "10px",
+        right: "10px",
+        zIndex: 9999,
+        display: "flex",
+        alignItems: "center",
+        gap: "6px",
+        background: "#fff",
+        border: "1px solid #ccc",
+        boxShadow: "0 2px 6px rgba(0,0,0,0.15)",
+        borderRadius: "6px",
+        padding: "6px 8px",
+        fontFamily: "sans-serif",
+      }}
+    >
+      <input
+        autoFocus
+        value={query}
+        onChange={(e) => {
+          setQuery(e.target.value);
+          highlight(e.target.value);
+        }}
+        placeholder="Find in document..."
+        style={{
+          border: "1px solid #ddd",
+          borderRadius: "4px",
+          padding: "4px 6px",
+          fontSize: "13px",
+          outline: "none",
+          width: "180px",
+        }}
+      />
+      <button
+        onClick={() => navigate("prev")}
+        style={{ border: "none", background: "none", cursor: "pointer" }}
+      >
+        <ChevronUp size={16} />
+      </button>
+      <button
+        onClick={() => navigate("next")}
+        style={{ border: "none", background: "none", cursor: "pointer" }}
+      >
+        <ChevronDown size={16} />
+      </button>
+      <span
+        style={{
+          fontSize: "12px",
+          color: "#555",
+          width: "40px",
+          textAlign: "center",
+        }}
+      >
+        {marks.length ? `${index + 1}/${marks.length}` : "0/0"}
+      </span>
+      <button
+        onClick={() => {
+          setQuery("");
+          highlight("");
+          onClose();
+        }}
+        style={{ border: "none", background: "none", cursor: "pointer" }}
+      >
+        <X size={16} />
+      </button>
+
+      {/* Inline highlight styles */}
+      <style>{`
+        mark {
+          background-color: #ffeb3b;
+          color: #000;
+          border-radius: 2px;
+          padding: 0 2px;
+        }
+        mark.active-highlight {
+          background-color: #ffc107;
+          outline: 1px solid #f9a825;
+        }
+      `}</style>
+    </div>
+  );
+};
+
+export default SearchBar;
