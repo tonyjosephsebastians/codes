@@ -1,0 +1,117 @@
+import JSZip from "jszip";
+import { diffWordsWithSpace } from "diff";
+
+/** HTML escaping */
+function escapeHTML(s: string) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/** Extract paragraphs from DOCX */
+async function extractParagraphs(buffer: ArrayBuffer): Promise<string[]> {
+  const zip = await JSZip.loadAsync(buffer);
+  const xml = await zip.file("word/document.xml")?.async("string");
+  if (!xml) throw new Error("Invalid DOCX structure");
+
+  return Array.from(xml.matchAll(/<w:p[\s\S]*?<\/w:p>/g))
+    .map((m) => {
+      const runs = Array.from(m[0].matchAll(/<w:t[^>]*>(.*?)<\/w:t>/g)).map(
+        (t) => t[1]
+      );
+      return runs.join(" ").replace(/\s+/g, " ").trim();
+    })
+    .filter(Boolean);
+}
+
+/** Paragraph similarity for alignment */
+function paragraphSimilarity(a: string, b: string): number {
+  if (!a || !b) return 0;
+  const aWords = a.split(/\s+/);
+  const bWords = b.split(/\s+/);
+  const common = aWords.filter((w) => bWords.includes(w)).length;
+  return (2 * common) / (aWords.length + bWords.length);
+}
+
+/** Align paragraphs using LCS-like similarity matrix */
+function alignParagraphs(a: string[], b: string[]): [number, number][] {
+  const simMatrix: number[][] = Array.from({ length: a.length }, () =>
+    Array(b.length).fill(0)
+  );
+  for (let i = 0; i < a.length; i++) {
+    for (let j = 0; j < b.length; j++) {
+      simMatrix[i][j] = paragraphSimilarity(a[i], b[j]);
+    }
+  }
+
+  const pairs: [number, number][] = [];
+  const usedB = new Set<number>();
+  for (let i = 0; i < a.length; i++) {
+    let best = -1;
+    let maxSim = 0.35; // threshold
+    for (let j = 0; j < b.length; j++) {
+      if (usedB.has(j)) continue;
+      if (simMatrix[i][j] > maxSim) {
+        maxSim = simMatrix[i][j];
+        best = j;
+      }
+    }
+    if (best >= 0) {
+      pairs.push([i, best]);
+      usedB.add(best);
+    }
+  }
+
+  // sort pairs in sequence order (for stable alignment)
+  return pairs.sort((x, y) => x[0] - y[0]);
+}
+
+/** Generate word-level diff HTML */
+export async function generateWordDiffHTML(
+  baselineBuf: ArrayBuffer,
+  compareBuf: ArrayBuffer
+): Promise<string> {
+  const base = await extractParagraphs(baselineBuf);
+  const comp = await extractParagraphs(compareBuf);
+
+  const alignedPairs = alignParagraphs(base, comp);
+  const resultHTML: string[] = [];
+
+  let usedBase = new Set<number>();
+  let usedComp = new Set<number>();
+
+  for (const [i, j] of alignedPairs) {
+    usedBase.add(i);
+    usedComp.add(j);
+
+    const diff = diffWordsWithSpace(base[i], comp[j]);
+    const html = diff
+      .map((part) => {
+        const clean = escapeHTML(part.value);
+        if (part.added) return `<span class="word-insert">${clean}</span>`;
+        if (part.removed)
+          return `<span class="word-delete">${clean}</span>`;
+        return clean;
+      })
+      .join("");
+    resultHTML.push(`<p>${html}</p>`);
+  }
+
+  // Handle inserted paragraphs (not matched in baseline)
+  for (let j = 0; j < comp.length; j++) {
+    if (!usedComp.has(j)) {
+      resultHTML.push(
+        `<p><span class="word-insert">${escapeHTML(comp[j])}</span></p>`
+      );
+    }
+  }
+
+  // Handle deleted paragraphs (not matched in compare)
+  for (let i = 0; i < base.length; i++) {
+    if (!usedBase.has(i)) {
+      resultHTML.push(
+        `<p><span class="word-delete">${escapeHTML(base[i])}</span></p>`
+      );
+    }
+  }
+
+  return `<div class="docx-wrapper word-redline-view">${resultHTML.join("")}</div>`;
+}
