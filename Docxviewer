@@ -1,0 +1,83 @@
+// ------------------------- SEARCH / HIGHLIGHT LOGIC -------------------------
+
+const handleSearch = (query: string) => {
+  setSearchTerm(query);
+  if (!containerRef.current) return;
+
+  // 1️⃣ Clear previous highlights
+  containerRef.current.querySelectorAll("mark.highlight").forEach((mark) => {
+    const parent = mark.parentNode;
+    if (!parent) return;
+    parent.replaceChild(document.createTextNode(mark.textContent || ""), mark);
+  });
+
+  // 2️⃣ Stop if no query
+  if (!query.trim()) {
+    setMatches([]);
+    return;
+  }
+
+  // 3️⃣ Case-insensitive regex
+  const regex = new RegExp(query, "gi");
+  const walker = document.createTreeWalker(containerRef.current, NodeFilter.SHOW_TEXT);
+  const newMatches: HTMLElement[] = [];
+
+  // 4️⃣ Walk through all text nodes (excluding redline spans)
+  while (walker.nextNode()) {
+    const node = walker.currentNode as Text;
+    const text = node.nodeValue || "";
+
+    if (
+      node.parentElement?.classList.contains("word-insert") ||
+      node.parentElement?.classList.contains("word-delete")
+    ) {
+      continue; // skip diff markup
+    }
+
+    if (regex.test(text)) {
+      const span = document.createElement("span");
+      span.innerHTML = text.replace(
+        regex,
+        (match) =>
+          `<mark class="highlight bg-yellow-200 text-black">${match}</mark>`
+      );
+      node.parentNode?.replaceChild(span, node);
+
+      span.querySelectorAll("mark.highlight").forEach((mark) =>
+        newMatches.push(mark as HTMLElement)
+      );
+    }
+  }
+
+  // 5️⃣ Store matches
+  setMatches(newMatches);
+  setCurrentMatchIndex(0);
+
+  // 6️⃣ Scroll to first match
+  if (newMatches.length > 0) {
+    newMatches[0].scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+};
+
+// Navigate to next highlighted match
+const goNext = () => {
+  if (!matches.length) return;
+  const next = (currentMatchIndex + 1) % matches.length;
+  setCurrentMatchIndex(next);
+  matches[next].scrollIntoView({ behavior: "smooth", block: "center" });
+};
+
+// Navigate to previous highlighted match
+const goPrev = () => {
+  if (!matches.length) return;
+  const prev = (currentMatchIndex - 1 + matches.length) % matches.length;
+  setCurrentMatchIndex(prev);
+  matches[prev].scrollIntoView({ behavior: "smooth", block: "center" });
+};
+
+// Re-center when currentMatchIndex changes (optional smoother UX)
+useEffect(() => {
+  if (matches.length && matches[currentMatchIndex]) {
+    matches[currentMatchIndex].scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+}, [currentMatchIndex]);
