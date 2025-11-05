@@ -1,0 +1,120 @@
+// WordDocumentPreview.tsx (replace your current handleWordStyleDiff with this)
+const handleWordStyleDiff = async (
+  baselineBuffer: ArrayBuffer,
+  compareBuffer: ArrayBuffer
+) => {
+  if (!containerRef.current) return;
+
+  // Load docx-preview lazily
+  const docxPreview = await import("docx-preview");
+
+  // 1) Prepare the live (visible) wrapper for the COMPARE doc
+  containerRef.current.innerHTML = "";
+  const visibleWrapper = document.createElement("div");
+  visibleWrapper.className = "docx-wrapper";
+  containerRef.current.appendChild(visibleWrapper);
+
+  // 2) Prepare hidden wrappers for baseline & compare (for safe text extraction)
+  const hidden = document.createElement("div");
+  hidden.style.position = "absolute";
+  hidden.style.left = "-99999px";
+  hidden.style.top = "0";
+  hidden.style.width = "1px";
+  hidden.style.height = "1px";
+  hidden.style.overflow = "hidden";
+  document.body.appendChild(hidden);
+
+  const baseTmp = document.createElement("div");
+  const cmpTmp  = document.createElement("div");
+  hidden.appendChild(baseTmp);
+  hidden.appendChild(cmpTmp);
+
+  // 3) Render baseline and compare with the same options to keep structure identical
+  const options = {
+    inWrapper: true,
+    ignoreWidth: false,
+    ignoreHeight: false,
+    ignoreFonts: false,
+    useBase64URL: false,
+    renderFootnotes: true,
+    renderEndnotes: true,
+    renderHeaders: true,
+    renderFooters: true,
+    breakPages: true,
+    experimental: true,
+    debug: false
+  } as const;
+
+  // Render the visible document as the COMPARE version (this is what user will see)
+  await docxPreview.renderAsync(compareBuffer, visibleWrapper, null, options);
+
+  // Render hidden baseline & hidden compare for safe, clean text extraction
+  await docxPreview.renderAsync(baselineBuffer, baseTmp, null, options);
+  await docxPreview.renderAsync(compareBuffer, cmpTmp, null, options);
+
+  // 4) Collect blocks (paragraphs & list items) in all three trees
+  const q = "section.docx p, section.docx li";
+  const baseBlocks = Array.from(baseTmp.querySelectorAll<HTMLElement>(q));
+  const cmpBlocks  = Array.from(cmpTmp.querySelectorAll<HTMLElement>(q));
+  const visBlocks  = Array.from(visibleWrapper.querySelectorAll<HTMLElement>(q));
+
+  // Helper: get plain text for a node (preserving spaces reasonably)
+  const getText = (el: HTMLElement) => (el.textContent ?? "").replace(/\s+/g, " ").trim();
+
+  // 5) Iterate through the *visual* compare blocks and inject diffs word-by-word
+  const maxLen = Math.max(baseBlocks.length, cmpBlocks.length, visBlocks.length);
+
+  for (let i = 0; i < maxLen; i++) {
+    const baseEl = baseBlocks[i];
+    const cmpEl  = cmpBlocks[i];
+    const visEl  = visBlocks[i];
+
+    if (!visEl) continue; // nothing to paint into
+
+    const baseText = baseEl ? getText(baseEl) : "";
+    const cmpText  = cmpEl  ? getText(cmpEl)  : "";
+
+    // Run word-level diff (you already import { diffWords } from "diff")
+    const parts = diffWords(baseText, cmpText);
+
+    // Build redline HTML (only wrapping words; never touch the container element/tag)
+    // NOTE: use textContent escape for safety when building strings
+    const frag = document.createDocumentFragment();
+
+    for (const p of parts) {
+      const span = document.createElement("span");
+      if (p.added) {
+        span.className = "word-insert";
+        span.textContent = p.value;
+      } else if (p.removed) {
+        span.className = "word-delete";
+        span.textContent = p.value;
+      } else {
+        // unchanged
+        span.textContent = p.value;
+      }
+      frag.appendChild(span);
+    }
+
+    // Clean only the textual content of the visible block
+    // Keep numbering/list/container attributes intact
+    while (visEl.firstChild) visEl.removeChild(visEl.firstChild);
+    visEl.appendChild(frag);
+  }
+
+  // 6) Inject minimal CSS once (no gray page shadow, Word-like colors)
+  if (!document.getElementById("word-redline-css")) {
+    const style = document.createElement("style");
+    style.id = "word-redline-css";
+    style.textContent = `
+      .docx-wrapper { background:#fff; font-family:Calibri, sans-serif; font-size:11pt; line-height:1.5; }
+      .docx-wrapper section.docx { background:#fff; box-shadow:none !important; }
+      .word-insert { color: rgb(67,181,67); font-weight:600; text-decoration:none; background:transparent; }
+      .word-delete { color: rgb(234,41,41); text-decoration: line-through; background:transparent; }
+    `;
+    document.head.appendChild(style);
+  }
+
+  // 7) Cleanup hidden rendering DOM
+  hidden.remove();
+};
