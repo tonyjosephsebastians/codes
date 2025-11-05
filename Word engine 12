@@ -1,0 +1,112 @@
+import JSZip from "jszip";
+import { diffWordsWithSpace } from "diff";
+
+/** HTML escape */
+function escapeHTML(s: string) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/** Extract visible text paragraphs */
+async function extractParagraphs(buffer: ArrayBuffer): Promise<string[]> {
+  const zip = await JSZip.loadAsync(buffer);
+  const xml = await zip.file("word/document.xml")?.async("string");
+  if (!xml) throw new Error("Invalid DOCX structure");
+  return Array.from(xml.matchAll(/<w:p[\s\S]*?<\/w:p>/g))
+    .map((m) => {
+      const runs = Array.from(m[0].matchAll(/<w:t[^>]*>(.*?)<\/w:t>/g)).map(
+        (t) => t[1]
+      );
+      return runs.join(" ").replace(/\s+/g, " ").trim();
+    })
+    .filter(Boolean);
+}
+
+/** Similarity between paragraphs (cosine-like) */
+function similarity(a: string, b: string): number {
+  if (!a || !b) return 0;
+  const aWords = a.split(/\s+/);
+  const bWords = b.split(/\s+/);
+  const match = aWords.filter((w) => bWords.includes(w)).length;
+  return (2 * match) / (aWords.length + bWords.length);
+}
+
+/** Merge consecutive small diffs for cleaner output */
+function mergeNearby(parts: ReturnType<typeof diffWordsWithSpace>): typeof parts {
+  const merged: typeof parts = [];
+  for (const p of parts) {
+    const last = merged[merged.length - 1];
+    if (
+      last &&
+      last.added === p.added &&
+      last.removed === p.removed &&
+      (p.value.length < 10 || /\s$/.test(last.value))
+    ) {
+      last.value += p.value;
+    } else {
+      merged.push({ ...p });
+    }
+  }
+  return merged;
+}
+
+/** Main generator */
+export async function generateWordDiffHTML(
+  baseBuf: ArrayBuffer,
+  cmpBuf: ArrayBuffer,
+  opts: { minSim?: number } = {}
+): Promise<string> {
+  const minSim = opts.minSim ?? 0.3;
+
+  const base = await extractParagraphs(baseBuf);
+  const cmp = await extractParagraphs(cmpBuf);
+  const usedCmp = new Set<number>();
+  const resultHTML: string[] = [];
+
+  for (let i = 0; i < base.length; i++) {
+    let bestJ = -1;
+    let bestSim = minSim;
+
+    for (let j = 0; j < cmp.length; j++) {
+      if (usedCmp.has(j)) continue;
+      const sim = similarity(base[i], cmp[j]);
+      if (sim > bestSim) {
+        bestSim = sim;
+        bestJ = j;
+      }
+    }
+
+    // Aligned paragraph
+    if (bestJ >= 0) {
+      usedCmp.add(bestJ);
+      const diff = mergeNearby(diffWordsWithSpace(base[i], cmp[bestJ]));
+      const html = diff
+        .map((p) => {
+          const clean = escapeHTML(p.value);
+          if (p.added) return `<span class="word-insert">${clean}</span>`;
+          if (p.removed) return `<span class="word-delete">${clean}</span>`;
+          return clean;
+        })
+        .join("");
+      resultHTML.push(`<p>${html}</p>`);
+    }
+    // Deleted paragraph
+    else {
+      resultHTML.push(
+        `<p><span class="word-delete">${escapeHTML(base[i])}</span></p>`
+      );
+    }
+  }
+
+  // Added paragraphs (not matched at all)
+  for (let j = 0; j < cmp.length; j++) {
+    if (!usedCmp.has(j)) {
+      resultHTML.push(
+        `<p><span class="word-insert">${escapeHTML(cmp[j])}</span></p>`
+      );
+    }
+  }
+
+  return `<div class="docx-wrapper word-redline-view">${resultHTML.join(
+    ""
+  )}</div>`;
+}
