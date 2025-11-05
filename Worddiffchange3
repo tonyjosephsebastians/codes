@@ -1,0 +1,174 @@
+import JSZip from "jszip";
+import { diffWordsWithSpace } from "diff";
+
+/** Escape text safely for HTML output */
+function escapeHTML(s: string) {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+/** Extracts visible text from DOCX into paragraph array */
+async function extractVisibleParagraphs(buffer: ArrayBuffer): Promise<string[]> {
+  const zip = await JSZip.loadAsync(buffer);
+  const xml = await zip.file("word/document.xml")?.async("string");
+  if (!xml) throw new Error("Invalid DOCX structure");
+
+  // Pull out paragraphs (<w:p>) and collect runs (<w:t>)
+  const paragraphs = Array.from(xml.matchAll(/<w:p[\s\S]*?<\/w:p>/g)).map((m) => {
+    const runs = Array.from(m[0].matchAll(/<w:t[^>]*>(.*?)<\/w:t>/g)).map((t) =>
+      t[1]
+    );
+    return runs.join(" ").trim();
+  });
+
+  return paragraphs.filter(Boolean);
+}
+
+/** Compute similarity ratio between two texts (0–1) */
+function similarity(a: string, b: string): number {
+  if (!a || !b) return 0;
+  const aWords = a.split(/\s+/);
+  const bWords = b.split(/\s+/);
+  const matches = aWords.filter((w) => bWords.includes(w)).length;
+  return (2 * matches) / (aWords.length + bWords.length);
+}
+
+/** Main diff generator with Word-like logic */
+export async function generateWordDiffHTML(
+  baselineBuf: ArrayBuffer,
+  compareBuf: ArrayBuffer,
+  opts: { minSimilarity?: number; ignorePunctuation?: boolean } = {}
+): Promise<string> {
+  const { minSimilarity = 0.35, ignorePunctuation = true } = opts;
+
+  const baseline = await extractVisibleParagraphs(baselineBuf);
+  const compare = await extractVisibleParagraphs(compareBuf);
+
+  const resultHTML: string[] = [];
+  let i = 0,
+    j = 0;
+
+  const stripPunct = (txt: string) =>
+    ignorePunctuation ? txt.replace(/[.,;:!?'"”“‘’\[\]\(\)]/g, "") : txt;
+
+  while (i < baseline.length || j < compare.length) {
+    const baseText = stripPunct(baseline[i] || "");
+    const compText = stripPunct(compare[j] || "");
+
+    // Both empty? skip
+    if (!baseText && !compText) {
+      i++;
+      j++;
+      continue;
+    }
+
+    // If identical → just copy
+    if (baseText === compText) {
+      resultHTML.push(`<p>${escapeHTML(compare[j])}</p>`);
+      i++;
+      j++;
+      continue;
+    }
+
+    // Check similarity to align merges/splits
+    const nextSim =
+      j + 1 < compare.length ? similarity(baseText, compare[j + 1]) : 0;
+    const prevSim =
+      i + 1 < baseline.length ? similarity(baseline[i + 1], compText) : 0;
+    const sameSim = similarity(baseText, compText);
+
+    // Case 1: current match is similar enough
+    if (sameSim >= minSimilarity) {
+      const diff = diffWordsWithSpace(baseline[i], compare[j]);
+      const html = diff
+        .map((part) => {
+          const clean = escapeHTML(part.value);
+          if (part.added)
+            return `<span class="word-insert">${clean}</span>`;
+          if (part.removed)
+            return `<span class="word-delete">${clean}</span>`;
+          return clean;
+        })
+        .join("");
+      resultHTML.push(`<p>${html}</p>`);
+      i++;
+      j++;
+    }
+
+    // Case 2: likely a merged paragraph in compare
+    else if (nextSim > sameSim && nextSim >= minSimilarity) {
+      const merged = compare[j] + " " + compare[j + 1];
+      const diff = diffWordsWithSpace(baseline[i], merged);
+      const html = diff
+        .map((p) => {
+          const clean = escapeHTML(p.value);
+          if (p.added)
+            return `<span class="word-insert">${clean}</span>`;
+          if (p.removed)
+            return `<span class="word-delete">${clean}</span>`;
+          return clean;
+        })
+        .join("");
+      resultHTML.push(`<p>${html}</p>`);
+      i++;
+      j += 2;
+    }
+
+    // Case 3: likely a split paragraph in compare
+    else if (prevSim > sameSim && prevSim >= minSimilarity) {
+      const combined = baseline[i] + " " + baseline[i + 1];
+      const diff = diffWordsWithSpace(combined, compare[j]);
+      const html = diff
+        .map((p) => {
+          const clean = escapeHTML(p.value);
+          if (p.added)
+            return `<span class="word-insert">${clean}</span>`;
+          if (p.removed)
+            return `<span class="word-delete">${clean}</span>`;
+          return clean;
+        })
+        .join("");
+      resultHTML.push(`<p>${html}</p>`);
+      i += 2;
+      j++;
+    }
+
+    // Case 4: totally new paragraph in compare
+    else if (sameSim < minSimilarity && !baseText && compText) {
+      resultHTML.push(
+        `<p><span class="word-insert">${escapeHTML(compare[j])}</span></p>`
+      );
+      j++;
+    }
+
+    // Case 5: removed paragraph
+    else if (sameSim < minSimilarity && baseText && !compText) {
+      resultHTML.push(
+        `<p><span class="word-delete">${escapeHTML(baseline[i])}</span></p>`
+      );
+      i++;
+    }
+
+    // Case 6: fallback diff
+    else {
+      const diff = diffWordsWithSpace(baseline[i], compare[j]);
+      const html = diff
+        .map((p) => {
+          const clean = escapeHTML(p.value);
+          if (p.added)
+            return `<span class="word-insert">${clean}</span>`;
+          if (p.removed)
+            return `<span class="word-delete">${clean}</span>`;
+          return clean;
+        })
+        .join("");
+      resultHTML.push(`<p>${html}</p>`);
+      i++;
+      j++;
+    }
+  }
+
+  return `<div class="docx-wrapper word-redline-view">${resultHTML.join("")}</div>`;
+}
