@@ -1,0 +1,33 @@
+useEffect(() => {
+  if (!containerRef.current) return;
+
+  const container = containerRef.current;
+  // Find pages produced by docx-preview
+  const pages = Array.from(
+    container.querySelectorAll<HTMLElement>("section.docx, .docx-page")
+  );
+  setPageCount(pages.length || 1);
+
+  if (!pages.length) return;
+
+  // Observe which page is mostly visible inside the scroll container
+  const io = new IntersectionObserver(
+    (entries) => {
+      // pick the entry with the largest intersection ratio
+      const best = entries
+        .filter(e => e.isIntersecting)
+        .sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
+      if (best) {
+        const idx = pages.indexOf(best.target as HTMLElement);
+        if (idx >= 0) setCurrentPage(idx + 1);
+      }
+    },
+    {
+      root: container,          // <-- IMPORTANT: scroll container as root
+      threshold: [0.1, 0.25, 0.5, 0.75, 0.9],
+    }
+  );
+
+  pages.forEach(p => io.observe(p));
+  return () => io.disconnect();
+}, [parsedDocument, showDiff]);
