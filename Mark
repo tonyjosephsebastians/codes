@@ -1,0 +1,29 @@
+declare module "mark.js" {
+  export default class Mark {
+    constructor(context: HTMLElement | HTMLElement[] | NodeListOf<HTMLElement>);
+    mark(
+      keyword: string | string[],
+      options?: {
+        element?: string;
+        className?: string;
+        separateWordSearch?: boolean;
+        accuracy?: "partially" | "complementary" | "exactly";
+        diacritics?: boolean;
+        synonyms?: Record<string, string>;
+        iframes?: boolean;
+        acrossElements?: boolean;
+        caseSensitive?: boolean;
+        ignoreJoiners?: boolean;
+        ignorePunctuation?: string[];
+        wildcards?: "disabled" | "enabled" | "withSpaces";
+        each?: (element: HTMLElement) => void;
+        done?: () => void;
+      }
+    ): void;
+    unmark(options?: { done?: () => void }): void;
+  }
+}
+
+
+"skipLibCheck": true,
+"typeRoots": ["./src/types", "./node_modules/@types"]
