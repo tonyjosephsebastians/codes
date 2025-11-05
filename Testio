@@ -1,0 +1,24 @@
+import { injectDiffIntoRenderedHTML, getWordDiffStyleTag } from "@/utils/wordDiffEngine";
+
+if (showDiff && arrayBuffer && baselineArrayBuffer) {
+  const docxPreview = await import("docx-preview");
+
+  const baselineContainer = document.createElement("div");
+  const compareContainer = document.createElement("div");
+
+  await docxPreview.renderAsync(baselineArrayBuffer, baselineContainer, null, {});
+  await docxPreview.renderAsync(arrayBuffer, compareContainer, null, {});
+
+  const mergedHTML = injectDiffIntoRenderedHTML(
+    baselineContainer.innerHTML,
+    compareContainer.innerHTML
+  );
+
+  containerRef.current.innerHTML = mergedHTML;
+
+  if (!document.getElementById("word-redline-css")) {
+    document.head.appendChild(getWordDiffStyleTag());
+  }
+
+  return;
+}
