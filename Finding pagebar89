@@ -1,0 +1,130 @@
+import React, { useEffect, useRef, useState } from "react";
+import { X, ChevronUp, ChevronDown, Search } from "lucide-react";
+
+interface FindInPageBarProps {
+  visible: boolean;
+  onClose: () => void;
+}
+
+declare global {
+  interface Window {
+    find: (
+      string: string,
+      caseSensitive?: boolean,
+      backwards?: boolean,
+      wrapAround?: boolean,
+      wholeWord?: boolean,
+      searchInFrames?: boolean,
+      showDialog?: boolean
+    ) => boolean;
+  }
+}
+
+const FindInPageBar: React.FC<FindInPageBarProps> = ({ visible, onClose }) => {
+  const [query, setQuery] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (visible) {
+      setTimeout(() => inputRef.current?.focus(), 80);
+    } else {
+      setQuery("");
+    }
+  }, [visible]);
+
+  const findNext = () => {
+    if (!query.trim()) return;
+    window.find(query, false, false, true, false, true, false);
+  };
+
+  const findPrev = () => {
+    if (!query.trim()) return;
+    window.find(query, false, true, true, false, true, false);
+  };
+
+  if (!visible) return null;
+
+  return (
+    <div
+      style={{
+        position: "fixed",
+        top: "96px", // appears just below the toolbar
+        left: "50%",
+        transform: "translateX(-50%)",
+        zIndex: 2000,
+        display: "flex",
+        alignItems: "center",
+        gap: "8px",
+        background: "#ffffff",
+        border: "1px solid #ddd",
+        borderRadius: "8px",
+        padding: "6px 10px",
+        boxShadow: "0 3px 8px rgba(0,0,0,0.15)",
+        fontFamily: "system-ui, sans-serif",
+        transition: "transform 0.25s ease, opacity 0.25s ease",
+        opacity: visible ? 1 : 0,
+      }}
+    >
+      <Search size={16} color="#444" />
+      <input
+        ref={inputRef}
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") findNext();
+          if (e.key === "Escape") onClose();
+        }}
+        placeholder="Find in document..."
+        style={{
+          border: "1px solid #ccc",
+          borderRadius: "4px",
+          padding: "4px 6px",
+          fontSize: "13px",
+          width: "180px",
+          outline: "none",
+        }}
+      />
+      <button
+        onClick={findPrev}
+        title="Previous"
+        style={{
+          border: "none",
+          background: "none",
+          cursor: "pointer",
+          color: "#333",
+          padding: "4px",
+        }}
+      >
+        <ChevronUp size={16} />
+      </button>
+      <button
+        onClick={findNext}
+        title="Next"
+        style={{
+          border: "none",
+          background: "none",
+          cursor: "pointer",
+          color: "#333",
+          padding: "4px",
+        }}
+      >
+        <ChevronDown size={16} />
+      </button>
+      <button
+        onClick={onClose}
+        title="Close"
+        style={{
+          border: "none",
+          background: "none",
+          cursor: "pointer",
+          color: "#666",
+          padding: "4px",
+        }}
+      >
+        <X size={16} />
+      </button>
+    </div>
+  );
+};
+
+export default FindInPageBar;
