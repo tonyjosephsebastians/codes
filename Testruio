@@ -1,0 +1,109 @@
+import React, { useEffect, useRef, useState } from "react";
+import { X, ChevronUp, ChevronDown, Search } from "lucide-react";
+
+interface FindInPageBarProps {
+  visible: boolean;
+  onClose: () => void;
+}
+
+const FindInPageBar: React.FC<FindInPageBarProps> = ({ visible, onClose }) => {
+  const [query, setQuery] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (visible) {
+      setTimeout(() => inputRef.current?.focus(), 80);
+    } else {
+      setQuery("");
+    }
+  }, [visible]);
+
+  const findNext = () => {
+    if (!query.trim()) return;
+    window.find(query, false, false, true, false, true, false);
+  };
+
+  const findPrev = () => {
+    if (!query.trim()) return;
+    window.find(query, false, true, true, false, true, false);
+  };
+
+  if (!visible) return null;
+
+  return (
+    <div
+      style={{
+        width: "100%",
+        display: "flex",
+        alignItems: "center",
+        gap: "8px",
+        background: "#f9fafb",
+        borderBottom: "1px solid #ddd",
+        padding: "6px 10px",
+        fontFamily: "system-ui, sans-serif",
+      }}
+    >
+      <Search size={16} color="#444" />
+      <input
+        ref={inputRef}
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") findNext();
+          if (e.key === "Escape") onClose();
+        }}
+        placeholder="Find in document..."
+        style={{
+          flex: 1,
+          border: "1px solid #ccc",
+          borderRadius: "4px",
+          padding: "4px 6px",
+          fontSize: "13px",
+          outline: "none",
+          background: "#fff",
+        }}
+      />
+      <button
+        onClick={findPrev}
+        title="Previous"
+        style={{
+          border: "none",
+          background: "none",
+          cursor: "pointer",
+          color: "#333",
+          padding: "4px",
+        }}
+      >
+        <ChevronUp size={16} />
+      </button>
+      <button
+        onClick={findNext}
+        title="Next"
+        style={{
+          border: "none",
+          background: "none",
+          cursor: "pointer",
+          color: "#333",
+          padding: "4px",
+        }}
+      >
+        <ChevronDown size={16} />
+      </button>
+      <button
+        onClick={onClose}
+        title="Close"
+        style={{
+          border: "none",
+          background: "none",
+          cursor: "pointer",
+          color: "#666",
+          padding: "4px",
+        }}
+      >
+        <X size={16} />
+      </button>
+    </div>
+  );
+};
+
+export default FindInPageBar;
