@@ -1,0 +1,68 @@
+const containerRef = useRef<HTMLDivElement>(null);
+const [scale, setScale] = useState(1);
+
+useEffect(() => {
+  const handleResize = () => {
+    if (!containerRef.current) return;
+    const containerWidth = containerRef.current.clientWidth;
+    const baseWidth = 1000; // approximate document width in px
+    const newScale = Math.min(1, containerWidth / baseWidth);
+    setScale(newScale);
+  };
+
+  handleResize();
+  window.addEventListener("resize", handleResize);
+  return () => window.removeEventListener("resize", handleResize);
+}, []);
+
+...
+
+<div ref={containerRef} className="document-wrapper">
+  <div className="document-container" style={{ transform: `scale(${scale})` }}>
+    ...
+  </div>
+</div>
+
+
+
+.document-wrapper {
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding: 1rem;
+  overflow-x: auto;
+  height: 100%;
+}
+
+.document-container {
+  transform-origin: top center;
+  width: auto;
+  max-width: 100%;
+  overflow: visible;
+  transition: transform 0.3s ease;
+}
+
+/* Responsive scaling */
+@media (max-width: 1200px) {
+  .document-container {
+    transform: scale(0.9);
+  }
+}
+
+@media (max-width: 992px) {
+  .document-container {
+    transform: scale(0.8);
+  }
+}
+
+@media (max-width: 768px) {
+  .document-container {
+    transform: scale(0.7);
+  }
+}
+
+@media (max-width: 480px) {
+  .document-container {
+    transform: scale(0.6);
+  }
+}
