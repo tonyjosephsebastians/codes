@@ -1,0 +1,53 @@
+/* Base container */
+.document-container {
+  transform-origin: top left;
+  overflow: visible; /* allow natural flow after scaling */
+  display: inline-block;
+  width: 100%;
+  max-width: 100%;
+}
+
+/* Adjust scaling progressively */
+@media (max-width: 1024px) {
+  .document-container {
+    transform: scale(0.9);
+  }
+}
+
+@media (max-width: 768px) {
+  .document-container {
+    transform: scale(0.75);
+  }
+}
+
+@media (max-width: 480px) {
+  .document-container {
+    transform: scale(0.6);
+  }
+}
+
+/* Optional: keep centered horizontally */
+.document-wrapper {
+  display: flex;
+  justify-content: center;
+  overflow-x: auto; /* allow horizontal scroll if needed */
+}
+
+<div ref={containerRef} className="flex-1 min-h-0 overflow-y-auto">
+  <div className="document-wrapper">
+    <div className="document-container">
+      <WordDocumentPreview
+        file={file || undefined}
+        arrayBuffer={parsedDocument?.originalContent}
+        fileName={parsedDocument?.metadata.title}
+        onScroll={onScroll}
+        scrollTop={scrollTop}
+        scrollLeft={scrollLeft}
+        syncScroll={syncScroll}
+        showDiff={showDiff}
+        baselineArrayBuffer={baselineArrayBuffer}
+        htmlContent={parsedDocument?.html || ""}
+      />
+    </div>
+  </div>
+</div>
