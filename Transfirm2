@@ -1,0 +1,62 @@
+.document-wrapper {
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding: 1rem;
+  overflow-x: auto;
+  height: 100%;
+}
+
+.document-container {
+  width: 100%;
+  max-width: 800px; /* typical A4 content width in px */
+  overflow: visible;
+  transition: all 0.3s ease;
+}
+
+/* adjust at breakpoints */
+@media (max-width: 1200px) {
+  .document-container {
+    max-width: 700px;
+  }
+}
+
+@media (max-width: 992px) {
+  .document-container {
+    max-width: 600px;
+  }
+}
+
+@media (max-width: 768px) {
+  .document-container {
+    max-width: 100%;
+    padding: 0 10px;
+  }
+}
+
+@media (max-width: 480px) {
+  .document-container {
+    max-width: 100%;
+    padding: 0 5px;
+  }
+}
+
+
+const [containerWidth, setContainerWidth] = useState("800px");
+const containerRef = useRef<HTMLDivElement>(null);
+
+useEffect(() => {
+  const handleResize = () => {
+    if (!containerRef.current) return;
+    const screenW = window.innerWidth;
+    if (screenW < 480) setContainerWidth("95%");
+    else if (screenW < 768) setContainerWidth("90%");
+    else if (screenW < 1024) setContainerWidth("700px");
+    else setContainerWidth("800px");
+  };
+  handleResize();
+  window.addEventListener("resize", handleResize);
+  return () => window.removeEventListener("resize", handleResize);
+}, []);
+
+<div className="document-container" style={{ maxWidth: containerWidth }}>
