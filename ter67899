@@ -1,0 +1,392 @@
+import base64
+import io
+import os
+import zipfile
+import difflib
+from typing import List, Tuple
+
+import numpy as np
+from fastapi import FastAPI
+from pydantic import BaseModel
+from lxml import etree
+from azure.ai.openai import OpenAIClient
+
+# ---------------- Azure OpenAI setup ----------------
+
+AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+AZURE_KEY = os.getenv("AZURE_OPENAI_KEY", "")
+EMBED_MODEL = os.getenv("AZURE_OPENAI_EMBEDDING_MODEL", "text-embedding-3-large")
+
+if not AZURE_ENDPOINT or not AZURE_KEY:
+    raise RuntimeError("AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_KEY must be set")
+
+openai_client = OpenAIClient(
+    azure_endpoint=AZURE_ENDPOINT,
+    api_key=AZURE_KEY,
+)
+
+WNS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+NS = {"w": WNS}
+
+
+def embed_text(text: str) -> np.ndarray:
+    """Get normalized embedding from Azure OpenAI (no prompts, no generation)."""
+    text = text or ""
+    resp = openai_client.embeddings.create(
+        model=EMBED_MODEL,
+        input=text,
+    )
+    vec = np.array(resp.data[0].embedding, dtype=np.float32)
+    norm = np.linalg.norm(vec) or 1.0
+    return vec / norm
+
+
+def cosine_sim(a: str, b: str) -> float:
+    """Cosine similarity between two text chunks."""
+    v1 = embed_text(a)
+    v2 = embed_text(b)
+    return float(np.dot(v1, v2))
+
+
+# ---------------- DOCX XML helpers ----------------
+
+
+def load_document_xml(docx_bytes: bytes) -> etree._Element:
+    with io.BytesIO(docx_bytes) as f:
+        with zipfile.ZipFile(f) as z:
+            xml_bytes = z.read("word/document.xml")
+    return etree.fromstring(xml_bytes)
+
+
+def save_document_xml(original_docx: bytes, new_root: etree._Element) -> bytes:
+    """Replace word/document.xml in the original docx with new_root."""
+    out_buf = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(original_docx)) as zin:
+        with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+                if item.filename == "word/document.xml":
+                    data = etree.tostring(
+                        new_root, xml_declaration=True, encoding="UTF-8", standalone="yes"
+                    )
+                zout.writestr(item, data)
+    return out_buf.getvalue()
+
+
+def extract_blocks(root: etree._Element) -> List[Tuple[str, etree._Element]]:
+    """
+    Extract top-level blocks from a Word document body:
+    - 'p'  : paragraphs
+    - 'tbl': tables
+    Returns list of (type, element).
+    """
+    body = root.find("w:body", NS)
+    blocks: List[Tuple[str, etree._Element]] = []
+    if body is None:
+        return blocks
+
+    for child in body:
+        tag = etree.QName(child.tag).localname
+        if tag == "p":
+            blocks.append(("p", child))
+        elif tag == "tbl":
+            blocks.append(("tbl", child))
+        # ignore other block-level elements for now
+    return blocks
+
+
+def get_text_from_runs(el: etree._Element) -> str:
+    """Extract visible text from a paragraph or cell by concatenating all w:t text nodes."""
+    texts: List[str] = []
+    for t in el.findall(".//w:t", NS):
+        if t.text:
+            texts.append(t.text)
+    return " ".join(texts).strip()
+
+
+# ---------------- Word-level diff helpers ----------------
+
+
+def diff_words(a: str, b: str):
+    """
+    Return list of tokens like:
+    { "type": "eq" | "ins" | "del", "text": "word" }
+    """
+    seq = difflib.ndiff(a.split(), b.split())
+    out = []
+    for token in seq:
+        if token.startswith("  "):
+            out.append({"type": "eq", "text": token[2:]})
+        elif token.startswith("+ "):
+            out.append({"type": "ins", "text": token[2:]})
+        elif token.startswith("- "):
+            out.append({"type": "del", "text": token[2:]})
+    return out
+
+
+def build_track_change_run(text: str, is_insert: bool) -> etree._Element:
+    """
+    Create a WordprocessingML track-change wrapper:
+    - <w:ins><w:r><w:rPr><w:color .../><w:b/></w:rPr><w:t>text</w:t></w:r></w:ins>
+    - <w:del><w:r><w:rPr><w:color .../><w:strike/></w:rPr><w:t>text</w:t></w:r></w:del>
+    """
+    w_ns = f"{{{WNS}}}"
+
+    wrapper_tag = w_ns + ("ins" if is_insert else "del")
+    wrapper = etree.Element(wrapper_tag)
+
+    r = etree.SubElement(wrapper, w_ns + "r")
+    rPr = etree.SubElement(r, w_ns + "rPr")
+
+    # Color: green for insert, red for delete
+    color = etree.SubElement(rPr, w_ns + "color")
+    if is_insert:
+        color.set(f"{{{WNS}}}val", "00AA00")  # green
+        etree.SubElement(rPr, w_ns + "b")  # bold (optional)
+    else:
+        color.set(f"{{{WNS}}}val", "FF0000")  # red
+        etree.SubElement(rPr, w_ns + "strike")  # strikethrough
+
+    t = etree.SubElement(r, w_ns + "t")
+    t.text = text
+
+    return wrapper
+
+
+def build_plain_run(text: str) -> etree._Element:
+    """Create a normal <w:r><w:t>text</w:t></w:r> run (unchanged text)."""
+    w_ns = f"{{{WNS}}}"
+    r = etree.Element(w_ns + "r")
+    t = etree.SubElement(r, w_ns + "t")
+    t.text = text
+    return r
+
+
+# ---------------- Paragraph diff ----------------
+
+
+def apply_paragraph_diff(p_el: etree._Element, old_text: str, new_text: str):
+    """
+    Replace the content of paragraph element with mixed runs:
+    - unchanged words as plain runs
+    - deleted words in red strike-through
+    - inserted words in green bold
+    """
+    # remove existing runs
+    for child in list(p_el):
+        p_el.remove(child)
+
+    tokens = diff_words(old_text, new_text)
+
+    # rebuild
+    for tok in tokens:
+        word = tok["text"]
+        if not word:
+            continue
+        word_with_space = word + " "
+        if tok["type"] == "eq":
+            p_el.append(build_plain_run(word_with_space))
+        elif tok["type"] == "ins":
+            p_el.append(build_track_change_run(word_with_space, is_insert=True))
+        elif tok["type"] == "del":
+            p_el.append(build_track_change_run(word_with_space, is_insert=False))
+
+
+# ---------------- Table diff ----------------
+
+
+def apply_table_diff(tbl_el: etree._Element, old_tbl_text: str, new_tbl_text: str):
+    """
+    Very simple table diff:
+    - walks rows & cells in parallel
+    - for each cell, do word-level diff like paragraphs
+    NOTE: This is a starting point; row add/delete detection can be expanded later.
+    """
+    old_rows = tbl_el.findall("w:tr", NS)
+    # For simplicity, we just assume structure follows revised table text;
+    # We use new_tbl_text only for similarity / alignment, here we mutate existing table.
+
+    # Iterate all cells and diff their text against themselves is not helpful;
+    # Instead, we just mark the entire table as "changed" by comparing old_tbl_text vs new_tbl_text.
+    # For a richer implementation, you'd match rows & cells between base and revised tables
+    # using embeddings or index-based mapping.
+
+    # If texts are equal, leave table as is
+    if old_tbl_text == new_tbl_text:
+        return
+
+    # If not equal, we simply wrap entire table text as insert/delete summary
+    # This is the simplest safe approach to show "table changed"
+    # But to show word-level inside cells, uncomment below and implement cell-level mapping.
+
+    # Example: mark whole table as deleted then inserted
+    for row in old_rows:
+        for cell in row.findall("w:tc", NS):
+            for p in cell.findall("w:p", NS):
+                text_old = get_text_from_runs(p)
+                # Clear
+                for child in list(p):
+                    p.remove(child)
+                # mark as deleted block
+                if text_old:
+                    p.append(build_track_change_run(text_old, is_insert=False))
+
+    # Then add one new paragraph explaining new text (very rough)
+    # In a real version, you'd build a second table or modify in-place from the revised doc.
+    w_ns = f"{{{WNS}}}"
+    last_row = old_rows[-1] if old_rows else None
+    if last_row is not None:
+        new_cell = etree.SubElement(last_row, w_ns + "tc")
+        new_p = etree.SubElement(new_cell, w_ns + "p")
+        new_p.append(build_track_change_run(new_tbl_text, is_insert=True))
+
+
+# ---------------- AI alignment at block level ----------------
+
+
+def build_ai_diff_doc(base_docx: bytes, rev_docx: bytes) -> bytes:
+    """
+    1. Parse both docs
+    2. Extract blocks (paragraphs & tables)
+    3. Align each baseline block to best semantic match in revised
+    4. Apply word-level diff for paragraphs
+    5. Mark tables as changed if content differs
+    6. Save updated baseline document as "diff" docx
+    """
+    base_root = load_document_xml(base_docx)
+    rev_root = load_document_xml(rev_docx)
+
+    base_blocks = extract_blocks(base_root)
+    rev_blocks = extract_blocks(rev_root)
+
+    # Precompute revised block texts
+    rev_texts = [get_text_from_runs(b[1]) for b in rev_blocks]
+
+    used_rev = set()
+
+    for idx, (kind, el) in enumerate(base_blocks):
+        base_text = get_text_from_runs(el)
+        if not base_text:
+            continue
+
+        # find best revised match
+        best_score = -1.0
+        best_j = None
+        for j, (rk, rel) in enumerate(rev_blocks):
+            if j in used_rev:
+                continue
+            other_text = rev_texts[j]
+            if not other_text:
+                continue
+            score = cosine_sim(base_text, other_text)
+            if score > best_score:
+                best_score = score
+                best_j = j
+
+        # threshold: if no good match, mark as deletion
+        if best_j is None or best_score < 0.60:
+            if kind == "p":
+                # whole paragraph deleted
+                apply_paragraph_diff(el, base_text, "")
+            elif kind == "tbl":
+                apply_table_diff(el, base_text, "")
+            continue
+
+        used_rev.add(best_j)
+        revised_kind, revised_el = rev_blocks[best_j]
+        revised_text = rev_texts[best_j]
+
+        if kind == "p" and revised_kind == "p":
+            apply_paragraph_diff(el, base_text, revised_text)
+        elif kind == "tbl" and revised_kind == "tbl":
+            apply_table_diff(el, base_text, revised_text)
+        else:
+            # type changed (paragraph ↔ table) – treat as deletion
+            if kind == "p":
+                apply_paragraph_diff(el, base_text, "")
+            else:
+                apply_table_diff(el, base_text, "")
+
+    # Any revised blocks not used are insertions – append them at the end as "added"
+    body = base_root.find("w:body", NS)
+    if body is not None:
+        for j, (rk, rel) in enumerate(rev_blocks):
+            if j in used_rev:
+                continue
+            text = rev_texts[j]
+            if not text:
+                continue
+
+            if rk == "p":
+                # new paragraph added
+                p = etree.SubElement(body, f"{{{WNS}}}p")
+                apply_paragraph_diff(p, "", text)
+            elif rk == "tbl":
+                # simplified: append a new paragraph noting table added
+                p = etree.SubElement(body, f"{{{WNS}}}p")
+                apply_paragraph_diff(p, "", f"[TABLE ADDED] {text}")
+
+    # Save modified baseline as new diff docx
+    return save_document_xml(base_docx, base_root)
+
+
+# ---------------- FastAPI app ----------------
+
+
+class CompareRequest(BaseModel):
+    baseline_docx_b64: str
+    revised_docx_b64: str
+
+
+class CompareResponse(BaseModel):
+    diff_docx_b64: str
+
+
+app = FastAPI()
+
+
+@app.post("/word-ai-compare", response_model=CompareResponse)
+async def word_ai_compare(body: CompareRequest):
+    base_bytes = base64.b64decode(body.baseline_docx_b64)
+    rev_bytes = base64.b64decode(body.revised_docx_b64)
+
+    diff_bytes = build_ai_diff_doc(base_bytes, rev_bytes)
+
+    return CompareResponse(
+        diff_docx_b64=base64.b64encode(diff_bytes).decode("utf-8")
+    )
+
+
+
+
+
+
+
+const toBase64 = (buf: ArrayBuffer) =>
+  btoa(String.fromCharCode(...new Uint8Array(buf)));
+
+async function fetchWordAIDiff(
+  baselineBuffer: ArrayBuffer,
+  revisedBuffer: ArrayBuffer
+) {
+  const res = await fetch("http://localhost:8001/word-ai-compare", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      baseline_docx_b64: toBase64(baselineBuffer),
+      revised_docx_b64: toBase64(revisedBuffer),
+    }),
+  });
+
+  const data = await res.json();
+  const diffBytes = Uint8Array.from(
+    atob(data.diff_docx_b64),
+    (c) => c.charCodeAt(0)
+  ).buffer;
+
+  return diffBytes;
+}
+
+
+const diffBuffer = await fetchWordAIDiff(baselineArrayBuffer, revisedArrayBuffer);
+docxPreview.renderAsync(diffBuffer, containerElement);
