@@ -1,0 +1,175 @@
+import io
+import zipfile
+from lxml import etree
+from difflib import SequenceMatcher
+
+WNS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+NS = {"w": WNS}
+
+
+class AIComparator:
+    """
+    FAST backend comparator producing DOCX fully compatible with docx-preview.
+    Uses only <w:r> + <w:rPr> with color/bold/strike (no <w:ins> or <w:del>).
+    """
+
+    # ----------------- DOCX Load/Save -----------------
+    def load_doc(self, doc_bytes):
+        with io.BytesIO(doc_bytes) as f:
+            with zipfile.ZipFile(f) as z:
+                xml = z.read("word/document.xml")
+        return etree.fromstring(xml)
+
+    def save_doc(self, original, new_root):
+        out = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(original)) as zin:
+            with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    data = zin.read(item.filename)
+                    if item.filename == "word/document.xml":
+                        data = etree.tostring(
+                            new_root,
+                            xml_declaration=True,
+                            encoding="UTF-8",
+                            standalone="yes"
+                        )
+                    zout.writestr(item, data)
+        return out.getvalue()
+
+    # ----------------- Block Extraction -----------------
+    def extract_blocks(self, root):
+        body = root.find("w:body", NS)
+        blocks = []
+        for child in body:
+            tag = etree.QName(child).localname
+            if tag == "p":
+                blocks.append(("p", child))
+            elif tag == "tbl":
+                blocks.append(("tbl", child))
+        return blocks
+
+    def get_text(self, el):
+        return " ".join(
+            t.text for t in el.findall(".//w:t", NS) if t.text
+        ).strip()
+
+    # ---------------- Word-level diff ----------------
+    def diff_words(self, txt_a, txt_b):
+        a = txt_a.split()
+        b = txt_b.split()
+
+        sm = SequenceMatcher(None, a, b)
+        ops = sm.get_opcodes()
+
+        diff = []
+        for op, i1, i2, j1, j2 in ops:
+            if op == "equal":
+                for w in a[i1:i2]:
+                    diff.append(("eq", w))
+            elif op == "delete":
+                for w in a[i1:i2]:
+                    diff.append(("del", w))
+            elif op == "insert":
+                for w in b[j1:j2]:
+                    diff.append(("ins", w))
+            elif op == "replace":
+                for w in a[i1:i2]:
+                    diff.append(("del", w))
+                for w in b[j1:j2]:
+                    diff.append(("ins", w))
+        return diff
+
+    # -------------- Run constructors ----------------
+    def run_plain(self, word):
+        r = etree.Element(f"{{{WNS}}}r")
+        t = etree.SubElement(r, f"{{{WNS}}}t")
+        t.text = word + " "
+        return r
+
+    def run_add(self, word):
+        r = etree.Element(f"{{{WNS}}}r")
+        rPr = etree.SubElement(r, f"{{{WNS}}}rPr")
+        color = etree.SubElement(rPr, f"{{{WNS}}}color")
+        color.set(f"{{{WNS}}}val", "00AA00")
+        etree.SubElement(rPr, f"{{{WNS}}}b")
+        t = etree.SubElement(r, f"{{{WNS}}}t")
+        t.text = word + " "
+        return r
+
+    def run_del(self, word):
+        r = etree.Element(f"{{{WNS}}}r")
+        rPr = etree.SubElement(r, f"{{{WNS}}}rPr")
+        color = etree.SubElement(rPr, f"{{{WNS}}}color")
+        color.set(f"{{{WNS}}}val", "FF0000")
+        etree.SubElement(rPr, f"{{{WNS}}}strike")
+        t = etree.SubElement(r, f"{{{WNS}}}t")
+        t.text = word + " "
+        return r
+
+    # -------------- Apply diff to paragraph --------------
+    def apply_para_diff(self, p_el, old_text, new_text):
+        for c in list(p_el):
+            p_el.remove(c)
+
+        for typ, w in self.diff_words(old_text, new_text):
+            if typ == "eq":
+                p_el.append(self.run_plain(w))
+            elif typ == "ins":
+                p_el.append(self.run_add(w))
+            elif typ == "del":
+                p_el.append(self.run_del(w))
+
+    # -------------- Main compare ----------------
+    def compare(self, base_docx, rev_docx):
+        root_a = self.load_doc(base_docx)
+        root_b = self.load_doc(rev_docx)
+
+        blocks_a = self.extract_blocks(root_a)
+        blocks_b = self.extract_blocks(root_b)
+
+        # Simple paragraph alignment (fast + stable)
+        mapping = {}
+        used = set()
+
+        for i, (kind_a, el_a) in enumerate(blocks_a):
+            if kind_a != "p":
+                continue
+
+            txt_a = self.get_text(el_a)
+            best = (-1, None)
+
+            for j, (kind_b, el_b) in enumerate(blocks_b):
+                if kind_b != "p" or j in used:
+                    continue
+
+                txt_b = self.get_text(el_b)
+                score = SequenceMatcher(None, txt_a, txt_b).ratio()
+
+                if score > best[0]:
+                    best = (score, j)
+
+            if best[0] > 0.40:
+                mapping[i] = best[1]
+                used.add(best[1])
+
+        # Apply diffs
+        for i, (kind, el) in enumerate(blocks_a):
+            if kind != "p":
+                continue
+
+            old = self.get_text(el)
+            if i in mapping:
+                new = self.get_text(blocks_b[mapping[i]][1])
+                self.apply_para_diff(el, old, new)
+            else:
+                self.apply_para_diff(el, old, "")
+
+        # Add new paragraphs
+        body = root_a.find("w:body", NS)
+        for j, (kind, el) in enumerate(blocks_b):
+            if kind == "p" and j not in used:
+                txt = self.get_text(el)
+                p = etree.SubElement(body, f"{{{WNS}}}p")
+                self.apply_para_diff(p, "", txt)
+
+        return self.save_doc(base_docx, root_a)
