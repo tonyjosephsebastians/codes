@@ -1,0 +1,72 @@
+def is_formatting_paragraph(self, p_el):
+    """
+    Returns True if the paragraph contains formatting elements but no visible text.
+    These paragraphs should not be deleted or diffed.
+    """
+    # Has page break?
+    if p_el.find(".//w:br", NS) is not None:
+        return True
+
+    # Section break (page break between sections)
+    if p_el.find("w:pPr/w:sectPr", NS) is not None:
+        return True
+
+    # Numbering / bullets (w:numPr)
+    if p_el.find("w:pPr/w:numPr", NS) is not None:
+        return True
+
+    # Field codes (used for page numbers, references)
+    if p_el.find(".//w:fldSimple", NS) is not None:
+        return True
+    if p_el.find(".//w:instrText", NS) is not None:
+        return True
+
+    # If no text, but internal nodes exist → formatting container paragraph
+    text = self.get_text(p_el)
+    if not text and len(p_el.findall(".//*")) > 0:
+        return True
+
+    return False
+
+def apply_para_diff(self, p_el, old_text, new_text):
+    """
+    Apply diff to a paragraph.
+    If paragraph is formatting-only → do NOT alter it.
+    """
+
+    # Do NOT diff formatting paragraphs
+    if self.is_formatting_paragraph(p_el):
+        return
+
+    # Clear existing runs
+    for c in list(p_el):
+        p_el.remove(c)
+
+    # If new_text is empty → deletion case
+    if not new_text:
+        # but skip formatting paragraphs
+        if self.is_formatting_paragraph(p_el):
+            return
+        # turn entire old paragraph red
+        for w in old_text.split():
+            p_el.append(self.run_del(w))
+        return
+
+    # Apply real text diff
+    for typ, w in self.diff_words(old_text, new_text):
+        if typ == "eq":
+            p_el.append(self.run_plain(w))
+        elif typ == "ins":
+            p_el.append(self.run_add(w))
+        elif typ == "del":
+            p_el.append(self.run_del(w))
+
+
+else:
+    # skip deleting formatting-only paragraphs
+    if not self.is_formatting_paragraph(el):
+        self.apply_para_diff(el, old, "")
+
+
+
+
