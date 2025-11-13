@@ -1,0 +1,252 @@
+# ------------------------------------------------------------
+# ai_comparator.py
+# FULL AI-POWERED DOCX COMPARATOR (Singleton, Fast, Word-level)
+# ------------------------------------------------------------
+
+import io
+import zipfile
+import numpy as np
+from typing import List, Tuple
+from lxml import etree
+
+from .embedder_singleton import get_embedder   # <-- your existing embedder
+
+WNS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+NS = {"w": WNS}
+
+
+# ------------------------------------------------------------
+# MAIN CLASS — EVERYTHING YOU REQUESTED INSIDE HERE
+# ------------------------------------------------------------
+
+class AIComparator:
+    """
+    AI-powered DOCX comparator:
+    - Uses Azure OpenAI embeddings (through your embedder)
+    - Singleton instance
+    - Extremely fast block alignment
+    - MS Word-style (<w:ins> green, <w:del> red) markup
+    """
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(AIComparator, cls).__new__(cls)
+        return cls._instance
+
+    def __init__(self):
+        if hasattr(self, "_initialized"):
+            return
+
+        self.embedder = get_embedder()  # Your singleton embedder
+        self._initialized = True
+
+    # ------------------------------------------------------------
+    # Embedding utility (batch + normalized)
+    # ------------------------------------------------------------
+    def embed_batch(self, texts: List[str]) -> np.ndarray:
+        vectors = []
+        for t in texts:
+            v = self.embedder.embed_query(t or "")
+            vec = np.array(v, dtype=np.float32)
+            norm = np.linalg.norm(vec) or 1.0
+            vectors.append(vec / norm)
+        return np.vstack(vectors)
+
+    def cosine_matrix(self, base_emb: np.ndarray, rev_emb: np.ndarray) -> np.ndarray:
+        return np.dot(base_emb, rev_emb.T)
+
+    def align_blocks(self, base_texts: List[str], rev_texts: List[str]):
+        base_emb = self.embed_batch(base_texts)
+        rev_emb = self.embed_batch(rev_texts)
+        sim = self.cosine_matrix(base_emb, rev_emb)
+        best_match = np.argmax(sim, axis=1)
+        best_score = np.max(sim, axis=1)
+        return best_match, best_score
+
+    # ------------------------------------------------------------
+    # DOCX low-level helpers
+    # ------------------------------------------------------------
+
+    def load_root(self, docx_bytes: bytes) -> etree._Element:
+        with zipfile.ZipFile(io.BytesIO(docx_bytes)) as z:
+            xml_bytes = z.read("word/document.xml")
+        return etree.fromstring(xml_bytes)
+
+    def save_root(self, original_docx: bytes, new_root: etree._Element) -> bytes:
+        out = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(original_docx)) as zin:
+            with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    data = zin.read(item.filename)
+                    if item.filename == "word/document.xml":
+                        data = etree.tostring(
+                            new_root, encoding="UTF-8", xml_declaration=True
+                        )
+                    zout.writestr(item, data)
+        return out.getvalue()
+
+    def extract_blocks(self, root: etree._Element):
+        body = root.find("w:body", NS)
+        blocks = []
+        for child in body:
+            tag = etree.QName(child.tag).localname
+            if tag == "p":
+                blocks.append(("p", child))
+            elif tag == "tbl":
+                blocks.append(("tbl", child))
+        return blocks
+
+    def get_text(self, el: etree._Element) -> str:
+        parts = []
+        for t in el.findall(".//w:t", NS):
+            if t.text:
+                parts.append(t.text)
+        return " ".join(parts).strip()
+
+    # ------------------------------------------------------------
+    # Word-level diff
+    # ------------------------------------------------------------
+    def diff_words(self, a: str, b: str):
+        import difflib
+        seq = difflib.ndiff(a.split(), b.split())
+        out = []
+        for s in seq:
+            if s.startswith("  "):
+                out.append(("eq", s[2:]))
+            elif s.startswith("+ "):
+                out.append(("ins", s[2:]))
+            elif s.startswith("- "):
+                out.append(("del", s[2:]))
+        return out
+
+    # ------------------------------------------------------------
+    # Create Word run elements
+    # ------------------------------------------------------------
+    def run_plain(self, word: str) -> etree._Element:
+        w = f"{{{WNS}}}"
+        r = etree.Element(w + "r")
+        t = etree.SubElement(r, w + "t")
+        t.text = word
+        return r
+
+    def run_change(self, word: str, is_insert: bool) -> etree._Element:
+        w = f"{{{WNS}}}"
+        tag = w + ("ins" if is_insert else "del")
+        wrapper = etree.Element(tag)
+        r = etree.SubElement(wrapper, w + "r")
+        rPr = etree.SubElement(r, w + "rPr")
+
+        color = etree.SubElement(rPr, w + "color")
+        if is_insert:
+            color.set(w + "val", "00AA00")   # green
+        else:
+            color.set(w + "val", "FF0000")   # red
+            etree.SubElement(rPr, w + "strike")
+
+        t = etree.SubElement(r, w + "t")
+        t.text = word
+        return wrapper
+
+    # ------------------------------------------------------------
+    # Apply paragraph diff
+    # ------------------------------------------------------------
+    def apply_para_diff(self, el, old_text, new_text):
+        # Clear runs
+        for child in list(el):
+            el.remove(child)
+
+        tokens = self.diff_words(old_text, new_text)
+        for typ, txt in tokens:
+            w = txt + " "
+            if typ == "eq":
+                el.append(self.run_plain(w))
+            elif typ == "ins":
+                el.append(self.run_change(w, True))
+            else:
+                el.append(self.run_change(w, False))
+
+    # ------------------------------------------------------------
+    # Apply table diff (simple but accurate change marking)
+    # ------------------------------------------------------------
+    def apply_tbl_diff(self, el, old_text, new_text):
+        if old_text == new_text:
+            return
+
+        rows = el.findall("w:tr", NS)
+
+        # Mark old table as deleted
+        for row in rows:
+            for cell in row.findall("w:tc", NS):
+                for p in cell.findall("w:p", NS):
+                    txt = self.get_text(p)
+                    for c in list(p):
+                        p.remove(c)
+                    if txt:
+                        p.append(self.run_change(txt, False))
+
+        # Append "table added" marker
+        w = f"{{{WNS}}}"
+        last_row = rows[-1]
+        new_cell = etree.SubElement(last_row, w + "tc")
+        p = etree.SubElement(new_cell, w + "p")
+        p.append(self.run_change(new_text, True))
+
+    # ------------------------------------------------------------
+    # MAIN ENTRY — BUILD AI TRACK-CHANGE DOCX
+    # ------------------------------------------------------------
+    def build_diff(self, base_docx: bytes, rev_docx: bytes) -> bytes:
+        base_root = self.load_root(base_docx)
+        rev_root = self.load_root(rev_docx)
+
+        base_blocks = self.extract_blocks(base_root)
+        rev_blocks = self.extract_blocks(rev_root)
+
+        base_texts = [self.get_text(el) for kind, el in base_blocks]
+        rev_texts  = [self.get_text(el) for kind, el in rev_blocks]
+
+        best_match, best_score = self.align_blocks(base_texts, rev_texts)
+        used = set()
+
+        # Apply diffs
+        for i, (kind, el) in enumerate(base_blocks):
+            j = best_match[i]
+            score = best_score[i]
+
+            old = base_texts[i]
+            new = rev_texts[j] if j < len(rev_texts) else ""
+
+            if score < 0.60:
+                # treat as deleted
+                if kind == "p":
+                    self.apply_para_diff(el, old, "")
+                else:
+                    self.apply_tbl_diff(el, old, "")
+                continue
+
+            used.add(j)
+
+            rev_kind, _ = rev_blocks[j]
+
+            if kind == "p" and rev_kind == "p":
+                self.apply_para_diff(el, old, new)
+            elif kind == "tbl" and rev_kind == "tbl":
+                self.apply_tbl_diff(el, old, new)
+            else:
+                # type mismatch = delete
+                if kind == "p":
+                    self.apply_para_diff(el, old, "")
+                else:
+                    self.apply_tbl_diff(el, old, "")
+
+        # Append new (unmatched) blocks
+        body = base_root.find("w:body", NS)
+        for j, (kind, el) in enumerate(rev_blocks):
+            if j not in used:
+                txt = rev_texts[j]
+                w = f"{{{WNS}}}"
+                p = etree.SubElement(body, w + "p")
+                self.apply_para_diff(p, "", txt)
+
+        return self.save_root(base_docx, base_root)
