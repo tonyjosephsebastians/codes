@@ -1,0 +1,194 @@
+import io, zipfile, base64
+import numpy as np
+from lxml import etree
+from rapidfuzz import distance
+from utils.embedding import get_embedder
+
+WNS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+NS = {"w": WNS}
+
+
+class AIComparator:
+    """AI-powered DOCX comparator preserving formatting using <w:ins> & <w:del>."""
+
+    def __init__(self):
+        self.embedder = get_embedder()  # singleton
+
+    # ------------------------
+    # Embeddings
+    # ------------------------
+    def embed(self, text: str):
+        vec = np.array(self.embedder.embed_query(text or ""), dtype=np.float32)
+        return vec / (np.linalg.norm(vec) or 1.0)
+
+    def similarity(self, a: str, b: str):
+        return float(np.dot(self.embed(a), self.embed(b)))
+
+    # ------------------------
+    # DOCX load/save
+    # ------------------------
+    def load_xml(self, data: bytes):
+        with io.BytesIO(data) as f:
+            with zipfile.ZipFile(f) as z:
+                xml = z.read("word/document.xml")
+        return etree.fromstring(xml)
+
+    def save_xml(self, original_docx: bytes, root):
+        out = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(original_docx)) as zin:
+            with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    data = zin.read(item.filename)
+                    if item.filename == "word/document.xml":
+                        data = etree.tostring(
+                            root,
+                            xml_declaration=True,
+                            encoding="UTF-8",
+                            standalone="yes"
+                        )
+                    zout.writestr(item, data)
+        return out.getvalue()
+
+    # ------------------------
+    # Run helpers
+    # ------------------------
+    def get_runs(self, p):
+        runs = []
+        for r in p.findall("w:r", NS):
+            t = r.find("w:t", NS)
+            if t is not None and t.text:
+                runs.append((t.text, r))
+        return runs
+
+    def wrap_ins(self, run):
+        w = f"{{{WNS}}}"
+        ins = etree.Element(w + "ins")
+        ins.append(run)
+        return ins
+
+    def wrap_del(self, run):
+        w = f"{{{WNS}}}"
+        d = etree.Element(w + "del")
+        d.append(run)
+        return d
+
+    # ------------------------
+    # Paragraph diff (formatting preserved!)
+    # ------------------------
+    def apply_para_diff(self, p, new_text):
+        old_runs = self.get_runs(p)
+        old_words = [t for (t, r) in old_runs]
+        new_words = new_text.split()
+
+        ops = distance.Levenshtein.editops(old_words, new_words)
+
+        new_children = []
+        i = j = 0
+
+        for op in ops:
+            if op.tag == "delete":
+                new_children.append(self.wrap_del(old_runs[i][1]))
+                i += 1
+
+            elif op.tag == "insert":
+                w = f"{{{WNS}}}"
+                r = etree.Element(w + "r")
+                t = etree.SubElement(r, w + "t")
+                t.text = new_words[j]
+                new_children.append(self.wrap_ins(r))
+                j += 1
+
+            elif op.tag == "replace":
+                new_children.append(self.wrap_del(old_runs[i][1]))
+                w = f"{{{WNS}}}"
+                r = etree.Element(w + "r")
+                t = etree.SubElement(r, w + "t")
+                t.text = new_words[j]
+                new_children.append(self.wrap_ins(r))
+                i += 1
+                j += 1
+
+        # Append unchanged trailing words
+        while i < len(old_words) and j < len(new_words):
+            if old_words[i] == new_words[j]:
+                new_children.append(old_runs[i][1])
+            else:
+                new_children.append(self.wrap_del(old_runs[i][1]))
+
+                w = f"{{{WNS}}}"
+                r = etree.Element(w + "r")
+                t = etree.SubElement(r, w + "t")
+                t.text = new_words[j]
+                new_children.append(self.wrap_ins(r))
+
+            i += 1
+            j += 1
+
+        # clear old
+        for child in list(p):
+            p.remove(child)
+        for child in new_children:
+            p.append(child)
+
+    # ------------------------
+    # MAIN compare
+    # ------------------------
+    def compare_docx(self, base_bytes, rev_bytes):
+        base_root = self.load_xml(base_bytes)
+        rev_root = self.load_xml(rev_bytes)
+
+        base_ps = base_root.findall(".//w:p", NS)
+        rev_ps = rev_root.findall(".//w:p", NS)
+
+        rev_texts = [
+            " ".join(t.text for t in p.findall(".//w:t", NS) if t.text)
+            for p in rev_ps
+        ]
+
+        used = set()
+
+        for p_idx, p_el in enumerate(base_ps):
+            base_text = " ".join(
+                t.text for t in p_el.findall(".//w:t", NS) if t.text
+            )
+
+            if not base_text.strip():
+                continue
+
+            # Find best match
+            best = -1
+            best_j = None
+
+            for j, txt in enumerate(rev_texts):
+                if j in used:
+                    continue
+                score = self.similarity(base_text, txt)
+                if score > best:
+                    best = score
+                    best_j = j
+
+            if best_j is None or best < 0.55:
+                self.apply_para_diff(p_el, "")
+            else:
+                used.add(best_j)
+                self.apply_para_diff(p_el, rev_texts[best_j])
+
+        return self.save_xml(base_bytes, base_root)
+
+
+
+
+  // Add track-change CSS for insertions/deletions
+const style = document.createElement("style");
+style.innerHTML = `
+  w\\:del, del, .del {
+    color: red !important;
+    text-decoration: line-through !important;
+  }
+  w\\:ins, ins, .ins {
+    color: green !important;
+    font-weight: bold !important;
+  }
+`;
+document.head.appendChild(style);
+
