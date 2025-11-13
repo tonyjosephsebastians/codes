@@ -1,0 +1,123 @@
+import io, zipfile, base64
+import numpy as np
+from lxml import etree
+from app.utils.azure_utils import get_embedder
+
+WNS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+NS = {"w": WNS}
+
+
+class AIComparator:
+    """AI-powered comparator WITHOUT rapidfuzz."""
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(self):
+        self.embedder = get_embedder()  # Azure embedding client
+
+    # ---------------- Embeddings ----------------
+
+    def embed_text(self, text: str) -> np.ndarray:
+        text = text or ""
+        vec = np.array(self.embedder.embed_query(text), dtype=np.float32)
+        norm = np.linalg.norm(vec) or 1.0
+        return vec / norm
+
+    def cosine_sim(self, a: str, b: str) -> float:
+        return float(np.dot(self.embed_text(a), self.embed_text(b)))
+
+    # ---------------- DOCX Helpers ----------------
+
+    def load_xml(self, doc_bytes: bytes):
+        with io.BytesIO(doc_bytes) as f:
+            with zipfile.ZipFile(f) as z:
+                xml = z.read("word/document.xml")
+        return etree.fromstring(xml)
+
+    def save_xml(self, original: bytes, new_root):
+        out = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(original)) as zin:
+            with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    data = zin.read(item.filename)
+                    if item.filename == "word/document.xml":
+                        data = etree.tostring(new_root, encoding="UTF-8", xml_declaration=True)
+                    zout.writestr(item, data)
+        return out.getvalue()
+
+    # ---------------- Word Diff Engine ----------------
+
+    def diff_tokens(self, old: str, new: str):
+        import difflib
+        seq = difflib.ndiff(old.split(), new.split())
+        for x in seq:
+            if x.startswith("  "):
+                yield ("eq", x[2:])
+            elif x.startswith("- "):
+                yield ("del", x[2:])
+            elif x.startswith("+ "):
+                yield ("ins", x[2:])
+
+    def run_plain(self, t: str):
+        r = etree.Element(f"{{{WNS}}}r")
+        el = etree.SubElement(r, f"{{{WNS}}}t")
+        el.text = t
+        return r
+
+    def run_add(self, t: str):
+        ins = etree.Element(f"{{{WNS}}}ins")
+        r = etree.SubElement(ins, f"{{{WNS}}}r")
+        rp = etree.SubElement(r, f"{{{WNS}}}rPr")
+        color = etree.SubElement(rp, f"{{{WNS}}}color", **{f"{{{WNS}}}val": "00AA00"})
+        etree.SubElement(rp, f"{{{WNS}}}b")
+        el = etree.SubElement(r, f"{{{WNS}}}t")
+        el.text = t
+        return ins
+
+    def run_del(self, t: str):
+        ins = etree.Element(f"{{{WNS}}}del")
+        r = etree.SubElement(ins, f"{{{WNS}}}r")
+        rp = etree.SubElement(r, f"{{{WNS}}}rPr")
+        color = etree.SubElement(rp, f"{{{WNS}}}color", **{f"{{{WNS}}}val": "FF0000"})
+        etree.SubElement(rp, f"{{{WNS}}}strike")
+        el = etree.SubElement(r, f"{{{WNS}}}t")
+        el.text = t
+        return ins
+
+    # ---------------- Main Diff Function ----------------
+
+    def compare_docx(self, base: bytes, rev: bytes) -> bytes:
+        root_a = self.load_xml(base)
+        root_b = self.load_xml(rev)
+
+        pa = root_a.findall(".//w:p", NS)
+        pb = root_b.findall(".//w:p", NS)
+
+        for i, paraA in enumerate(pa):
+            old = " ".join([t.text for t in paraA.findall(".//w:t", NS) if t.text])
+
+            if i >= len(pb):
+                continue
+
+            new = " ".join([t.text for t in pb[i].findall(".//w:t", NS) if t.text])
+
+            # clear paragraph
+            for c in list(paraA):
+                paraA.remove(c)
+
+            # rebuild
+            for typ, tok in self.diff_tokens(old, new):
+                tok += " "
+                if typ == "eq":
+                    paraA.append(self.run_plain(tok))
+                elif typ == "ins":
+                    paraA.append(self.run_add(tok))
+                elif typ == "del":
+                    paraA.append(self.run_del(tok))
+
+        return self.save_xml(base, root_a)
