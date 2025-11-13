@@ -1,0 +1,100 @@
+def _apply_table_diff(self, base_tbl: etree._Element, rev_tbl: etree._Element):
+    """
+    Accurate table diff:
+    - Iterate rows and cells in parallel
+    - Diff cell paragraphs individually
+    - Preserve table formatting
+    """
+
+    base_rows = base_tbl.findall("w:tr", NS)
+    rev_rows  = rev_tbl.findall("w:tr", NS)
+
+    max_rows = max(len(base_rows), len(rev_rows))
+
+    for i in range(max_rows):
+        base_row = base_rows[i] if i < len(base_rows) else None
+        rev_row  = rev_rows[i] if i < len(rev_rows) else None
+
+        # Case 1: Row deleted
+        if base_row is not None and rev_row is None:
+            self._mark_row_deleted(base_row)
+            continue
+
+        # Case 2: Row inserted
+        if base_row is None and rev_row is not None:
+            self._append_table_row_insert(base_tbl, rev_row)
+            continue
+
+        # Case 3: Both rows exist → compare cells
+        base_cells = base_row.findall("w:tc", NS)
+        rev_cells  = rev_row.findall("w:tc", NS)
+
+        max_cols = max(len(base_cells), len(rev_cells))
+
+        for c in range(max_cols):
+            base_cell = base_cells[c] if c < len(base_cells) else None
+            rev_cell  = rev_cells[c] if c < len(rev_cells) else None
+
+            # Cell deleted
+            if base_cell is not None and rev_cell is None:
+                self._mark_cell_deleted(base_cell)
+                continue
+
+            # Cell inserted
+            if base_cell is None and rev_cell is not None:
+                self._append_table_cell_insert(base_row, rev_cell)
+                continue
+
+            # Diff cell content
+            self._diff_table_cell(base_cell, rev_cell)
+
+
+
+
+def _mark_row_deleted(self, row):
+    for cell in row.findall("w:tc", NS):
+        self._mark_cell_deleted(cell)
+
+def _append_table_row_insert(self, base_tbl, rev_row):
+    new_row = etree.SubElement(base_tbl, f"{{{WNS}}}tr")
+    for rev_cell in rev_row.findall("w:tc", NS):
+        self._append_table_cell_insert(new_row, rev_cell)
+
+def _mark_cell_deleted(self, cell):
+    for p in cell.findall("w:p", NS):
+        txt = self._get_text(p)
+        for child in list(p):
+            p.remove(child)
+        if txt:
+            p.append(self._run_delete(txt))
+
+def _append_table_cell_insert(self, base_row, rev_cell):
+    new_cell = etree.SubElement(base_row, f"{{{WNS}}}tc")
+    p = etree.SubElement(new_cell, f"{{{WNS}}}p")
+    txt = self._get_text(rev_cell)
+    if txt:
+        p.append(self._run_insert(txt))
+
+def _diff_table_cell(self, base_cell, rev_cell):
+    base_paras = base_cell.findall("w:p", NS)
+    rev_paras  = rev_cell.findall("w:p", NS)
+
+    max_p = max(len(base_paras), len(rev_paras))
+
+    for i in range(max_p):
+        if i < len(base_paras) and i < len(rev_paras):
+            # Diff paragraph
+            old = self._get_text(base_paras[i])
+            new = self._get_text(rev_paras[i])
+            self._apply_paragraph_diff(base_paras[i], old, new)
+
+        elif i < len(base_paras):
+            # Paragraph deleted
+            old = self._get_text(base_paras[i])
+            self._apply_paragraph_diff(base_paras[i], old, "")
+
+        else:
+            # Paragraph inserted
+            new_p = etree.SubElement(base_cell, f"{{{WNS}}}p")
+            txt = self._get_text(rev_paras[i])
+            self._apply_paragraph_diff(new_p, "", txt)
