@@ -1,0 +1,54 @@
+def _apply_paragraph_diff(self, p_el: etree._Element, old_text: str, new_text: str):
+    """
+    Improved diff:
+    - If diff is small → do normal word-level diff
+    - If diff is large → replace whole paragraph (prevents docx-preview crashes)
+    """
+
+    # Calculate diff ratio FIRST
+    sm = SequenceMatcher(None, old_text, new_text)
+    ratio = sm.ratio()
+
+    # 🔥 Threshold: if <50% similarity → treat entire paragraph as replaced
+    if ratio < 0.50:
+        # CLEAR runs
+        for child in list(p_el):
+            p_el.remove(child)
+
+        # OLD paragraph deleted
+        if old_text.strip():
+            del_run = etree.SubElement(p_el, f"{{{WNS}}}r")
+            rPr = etree.SubElement(del_run, f"{{{WNS}}}rPr")
+            color = etree.SubElement(rPr, f"{{{WNS}}}color")
+            color.set(f"{{{WNS}}}val", "FF0000")
+            etree.SubElement(rPr, f"{{{WNS}}}strike")
+            t = etree.SubElement(del_run, f"{{{WNS}}}t")
+            t.text = old_text
+
+        # Add line break between deleted + inserted
+        etree.SubElement(p_el, f"{{{WNS}}}r")
+        br = etree.SubElement(p_el[-1], f"{{{WNS}}}br")
+
+        # NEW paragraph inserted
+        if new_text.strip():
+            ins_run = etree.SubElement(p_el, f"{{{WNS}}}r")
+            rPr = etree.SubElement(ins_run, f"{{{WNS}}}rPr")
+            color = etree.SubElement(rPr, f"{{{WNS}}}color")
+            color.set(f"{{{WNS}}}val", "00AA00")
+            etree.SubElement(rPr, f"{{{WNS}}}b")
+            t = etree.SubElement(ins_run, f"{{{WNS}}}t")
+            t.text = new_text
+
+        return  # Done
+
+    # ⭐ Normal diff path (small differences)
+    for child in list(p_el):
+        p_el.remove(child)
+
+    for kind, w in self._diff_words(old_text, new_text):
+        if kind == "eq":
+            p_el.append(self._run_plain(w))
+        elif kind == "ins":
+            p_el.append(self._run_insert(w))
+        elif kind == "del":
+            p_el.append(self._run_delete(w))
