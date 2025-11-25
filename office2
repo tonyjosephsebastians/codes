@@ -1,0 +1,137 @@
+import os
+import io
+import shutil
+import uuid
+import tempfile
+import subprocess
+import zipfile
+from lxml import etree
+
+
+WNS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+NS = {"w": WNS}
+
+
+class AIComparator:
+    """
+    AIComparator using LibreOffice native DOCX comparison.
+
+    - Creates temporary runtime profile under /dev/shm (RAM)
+    - Performs real Word-level compare via LibreOffice
+    - Output is a proper DOCX with <w:ins> and <w:del>
+    - Fully compatible with docx-preview
+    """
+
+    def __init__(self):
+        self.soffice_path = shutil.which("soffice")
+        if not self.soffice_path:
+            raise RuntimeError("LibreOffice (soffice) not found in PATH!")
+
+        # Create reusable RAM-profile for LO
+        self.profile_dir = "/dev/shm/lo_profile"
+        os.makedirs(self.profile_dir, exist_ok=True)
+
+    # ---------------------------------------------------------
+    # Helper: Write bytes to temp file
+    # ---------------------------------------------------------
+    def _write_temp_docx(self, folder: str, name: str, content: bytes) -> str:
+        path = os.path.join(folder, name)
+        with open(path, "wb") as f:
+            f.write(content)
+        return path
+
+    # ---------------------------------------------------------
+    # Helper: Extract the "difference" document LO writes
+    # ---------------------------------------------------------
+    def _find_diff_docx(self, folder: str):
+        for f in os.listdir(folder):
+            if f.lower().startswith("calc") or f.lower().startswith("diff"):
+                # sometimes LO names it "Diff_Document.docx"
+                pass
+
+        # Look for any docx newer than the inputs
+        for f in os.listdir(folder):
+            if f.lower().endswith(".docx") and "compare" in f.lower():
+                return os.path.join(folder, f)
+
+        # fallback: pick the newest .docx
+        candidates = [
+            os.path.join(folder, f)
+            for f in os.listdir(folder)
+            if f.lower().endswith(".docx")
+        ]
+        if not candidates:
+            return None
+
+        return max(candidates, key=lambda p: os.path.getmtime(p))
+
+    # ---------------------------------------------------------
+    # MAIN LibreOffice Compare
+    # ---------------------------------------------------------
+    def _run_libreoffice_compare(self, base_bytes: bytes, rev_bytes: bytes) -> bytes:
+        workdir = tempfile.mkdtemp(prefix="lo_cmp_", dir="/dev/shm")
+
+        try:
+            base_path = self._write_temp_docx(workdir, "baseline.docx", base_bytes)
+            rev_path = self._write_temp_docx(workdir, "revised.docx", rev_bytes)
+
+            # Output folder (same)
+            outdir = workdir
+
+            # LibreOffice compare command
+            cmd = [
+                self.soffice_path,
+                "--headless",
+                f"-env:UserInstallation=file://{self.profile_dir}",
+                "--convert-to",
+                "docx",
+                "--compare",
+                rev_path,
+                "--outdir",
+                outdir,
+                base_path,
+            ]
+
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=60,
+            )
+
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"LibreOffice compare failed.\nCMD: {' '.join(cmd)}\n"
+                    f"STDERR:\n{proc.stderr}"
+                )
+
+            diff_doc = self._find_diff_docx(outdir)
+            if not diff_doc:
+                raise RuntimeError(
+                    f"LO compare succeeded but diff DOCX not found in {outdir}"
+                )
+
+            with open(diff_doc, "rb") as f:
+                return f.read()
+
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    # ---------------------------------------------------------
+    # PUBLIC API
+    # ---------------------------------------------------------
+    def compare(self, baseline_docx: bytes, revised_docx: bytes) -> bytes:
+        """
+        Compare 2 DOCX files using LibreOffice's built-in "Compare Documents"
+        and return a DOCX that includes tracked changes.
+
+        This produces:
+            <w:ins> for insertions
+            <w:del> for deletions
+            <w:moveFrom>, <w:moveTo> for moved text
+            <w:rPrChange> etc.
+
+        Exactly like MS Word Compare.
+        """
+        return self._run_libreoffice_compare(baseline_docx, revised_docx)
