@@ -1,0 +1,833 @@
+import os
+import threading
+import traceback
+import re
+import time
+import datetime
+import zipfile
+import tempfile
+import shutil
+import json
+import asyncio
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, simpledialog
+from tkinter.scrolledtext import ScrolledText
+
+import pandas as pd
+from docx import Document as DocxDocument
+from pptx import Presentation
+from PyPDF2 import PdfReader
+import mammoth
+import pyexcel as p  # for .xls reading (NO Excel/COM popups)
+
+from dotenv import load_dotenv
+load_dotenv()
+
+from langchain_openai import AzureChatOpenAI
+
+# ===================== CONFIG =====================
+
+CHROME_USER_DATA_DIR = r"C:\Users\TAE7758\AppData\Local\Google\Chrome\User Data"
+CHROME_PROFILE_NAME = "Default"  # change if your corporate profile is different
+
+# ---------- Azure OpenAI LLM ----------
+
+def init_azure_llm():
+    try:
+        api_key = os.environ["AZURE_OPENAI_API_KEY"]
+        endpoint = os.environ["AZURE_OPENAI_ENDPOINT"]
+        api_version = os.environ["AZURE_OPENAI_API_VERSION"]
+        deployment = os.environ["AZURE_OPENAI_CHAT_DEPLOYMENT_NAME"]
+
+        llm = AzureChatOpenAI(
+            azure_endpoint=endpoint,
+            openai_api_key=api_key,
+            openai_api_version=api_version,
+            azure_deployment=deployment,
+            temperature=0.2,
+        )
+        return llm
+    except Exception as e:
+        print("Failed to initialize Azure OpenAI LLM:", e)
+        return None
+
+LLM_AZURE = init_azure_llm()
+
+# ===================== TEXT EXTRACTION HELPERS (LOCAL FILES) =====================
+
+def get_text_from_docx(path):
+    doc = DocxDocument(path)
+    return "\n".join(p.text for p in doc.paragraphs)
+
+
+def convert_doc_to_docx(doc_path, temp_root):
+    """
+    Convert .doc → .docx using mammoth.
+    """
+    try:
+        base = os.path.splitext(os.path.basename(doc_path))[0]
+        out_path = os.path.join(temp_root, f"doc_{base}.docx")
+
+        with open(doc_path, "rb") as f:
+            result = mammoth.convert_to_html(f)
+        html_text = result.value or ""
+
+        clean_text = re.sub(r"<[^>]+>", "", html_text).replace("\r", "")
+
+        doc = DocxDocument()
+        for line in clean_text.split("\n"):
+            line = line.strip()
+            if line:
+                doc.add_paragraph(line)
+        doc.save(out_path)
+
+        return out_path
+    except Exception:
+        return None
+
+
+def get_text_from_pdf(path):
+    text = []
+    try:
+        with open(path, "rb") as f:
+            reader = PdfReader(f)
+            for page in reader.pages:
+                try:
+                    t = page.extract_text()
+                    if t:
+                        text.append(t)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return "\n".join(text)
+
+
+def get_text_from_txt(path):
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
+
+
+def get_text_from_xlsx(path):
+    xls = pd.ExcelFile(path)
+    texts = []
+    for sheet_name in xls.sheet_names:
+        df = xls.parse(sheet_name, dtype=str)
+        texts.append(df.to_string())
+    return "\n".join(texts)
+
+
+def get_text_from_xls(path):
+    """
+    Safely read .xls using pyexcel (no Excel, no COM, no popups).
+    """
+    try:
+        book = p.get_book(file_name=path)
+        texts = []
+        for sheet in book:
+            try:
+                array = sheet.to_array()
+                for row in array:
+                    texts.append(" | ".join([str(x) for x in row]))
+            except Exception:
+                continue
+        return "\n".join(texts)
+    except Exception:
+        return ""
+
+
+def get_text_from_pptx(path):
+    prs = Presentation(path)
+    texts = []
+    for slide in prs.slides:
+        for shape in slide.shapes:
+            if hasattr(shape, "text"):
+                texts.append(shape.text)
+    return "\n".join(texts)
+
+
+def extract_text(path, temp_root):
+    """
+    Main extractor for local files.
+    """
+    ext = os.path.splitext(path)[1].lower()
+
+    if ext == ".txt":
+        return get_text_from_txt(path)
+    elif ext == ".docx":
+        return get_text_from_docx(path)
+    elif ext == ".pdf":
+        return get_text_from_pdf(path)
+    elif ext == ".xlsx":
+        return get_text_from_xlsx(path)
+    elif ext == ".xls":
+        return get_text_from_xls(path)
+    elif ext == ".pptx":
+        return get_text_from_pptx(path)
+    elif ext == ".doc":
+        new_path = convert_doc_to_docx(path, temp_root)
+        if new_path and os.path.exists(new_path):
+            return get_text_from_docx(new_path)
+        return ""
+    else:
+        raise ValueError(f"Unsupported extension: {ext}")
+
+
+# ===================== KEYWORD MAPPING =====================
+
+def load_keyword_mapping(excel_path):
+    df = pd.read_excel(excel_path)
+    if "Heading" not in df.columns or "Keywords" not in df.columns:
+        raise ValueError("Mapping file must have 'Heading' and 'Keywords' columns")
+
+    mapping = {}
+    for _, row in df.iterrows():
+        heading = str(row["Heading"]).strip()
+        kw_cell = str(row["Keywords"]).strip()
+        if not heading or not kw_cell:
+            continue
+        if heading.lower() == "nan" or kw_cell.lower() == "nan":
+            continue
+        keywords = [k.strip().lower() for k in re.split(r"[;,]", kw_cell) if k.strip()]
+        if keywords:
+            mapping[heading] = keywords
+
+    if not mapping:
+        raise ValueError("No valid headings/keywords found in mapping file.")
+    return mapping
+
+
+# ===================== ZIP HELPERS =====================
+
+def extract_zip_recursive(zip_path, temp_root):
+    try:
+        name = os.path.splitext(os.path.basename(zip_path))[0]
+        extract_dir = os.path.join(temp_root, "zip_" + name)
+        os.makedirs(extract_dir, exist_ok=True)
+        with zipfile.ZipFile(zip_path, "r") as z:
+            z.extractall(extract_dir)
+        return extract_dir
+    except Exception:
+        return None
+
+
+def count_files_in_zip(zip_path, exts):
+    count = 0
+    try:
+        with zipfile.ZipFile(zip_path, "r") as z:
+            for name in z.namelist():
+                if name.endswith("/"):
+                    continue
+                ext = os.path.splitext(name)[1].lower()
+                if ext in exts:
+                    count += 1
+    except Exception:
+        pass
+    return count
+
+
+# ===================== SHAREPOINT via browser-use =====================
+
+async def _sharepoint_list_files_for_link(link, log_func):
+    """
+    Use browser-use + Azure LLM to recursively list all files under a SharePoint link.
+    Returns a list of dicts: {file_name, file_url}
+    """
+    if LLM_AZURE is None:
+        raise RuntimeError("Azure OpenAI LLM is not configured.")
+
+    from browser_use import Agent, Browser
+
+    log_func(f"[SP] Starting SharePoint scan for: {link}")
+
+    browser = Browser(
+        chrome_user_data_dir=CHROME_USER_DATA_DIR,
+        chrome_profile=CHROME_PROFILE_NAME,
+    )
+
+    task_text = f"""
+You are an agent controlling a browser inside a corporate SharePoint Online page.
+
+URL:
+{link}
+
+Goal:
+- Navigate this document library and its folders/subfolders.
+- Collect every document or file (ignore folders).
+- For each file, capture:
+  - file_name: the document name as seen in the 'Name' column.
+  - file_url: a full clickable link (absolute URL) that opens the file.
+
+Output:
+- Return ONLY a valid JSON array and nothing else (no commentary, no markdown).
+  Example:
+  [
+    {{"file_name": "doc1.docx", "file_url": "https://..."}},
+    {{"file_name": "doc2.pdf", "file_url": "https://..."}}
+  ]
+"""
+
+    agent = Agent(
+        task=task_text.strip(),
+        llm=LLM_AZURE,
+        browser=browser,
+    )
+
+    history = await agent.run()
+    text = str(history)
+
+    start = text.find("[")
+    end = text.rfind("]")
+    if start == -1 or end == -1:
+        raise ValueError("Could not find JSON array in agent output")
+
+    json_str = text[start:end + 1]
+    data = json.loads(json_str)
+
+    if not isinstance(data, list):
+        raise ValueError("Agent JSON output is not a list")
+
+    log_func(f"[SP] Found {len(data)} file(s) in SharePoint link: {link}")
+    return data
+
+
+def run_sharepoint_tasks(sp_tasks, results_rows, all_headings, log_func):
+    """
+    Runs all SharePoint tasks sequentially using asyncio.
+    Appends rows with Document Name, Folder, SharePoint Link.
+    """
+    if not sp_tasks:
+        return
+
+    all_headings.add("SharePoint Link")
+
+    async def _runner():
+        for task in sp_tasks:
+            link = task["url"]
+            mapping = task["mapping"]
+            try:
+                data = await _sharepoint_list_files_for_link(link, log_func)
+            except Exception as e:
+                log_func(f"[SP] ERROR for {link}: {e}")
+                log_func(traceback.format_exc())
+                continue
+
+            for item in data:
+                try:
+                    file_name = str(item.get("file_name", "")).strip()
+                    file_url = str(item.get("file_url", "")).strip()
+                    if not file_name:
+                        continue
+
+                    row = {
+                        "Document Name": file_name,
+                        "Folder": link,
+                        "SharePoint Link": file_url or link,
+                        "FullPath": "",  # not local
+                    }
+
+                    # For listing-only SP case, mark headings as N/A
+                    for heading in mapping.keys():
+                        row[heading] = "N/A"
+
+                    results_rows.append(row)
+                    log_func(f"[SP] Added: {file_name} -> {file_url}")
+                except Exception as e:
+                    log_func(f"[SP] Row build error: {e}")
+                    continue
+
+    try:
+        asyncio.run(_runner())
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(_runner())
+        loop.close()
+
+
+# ----- SharePoint summary (single document) -----
+
+async def _summarize_sharepoint_url(url):
+    if LLM_AZURE is None:
+        raise RuntimeError("Azure OpenAI LLM is not configured.")
+
+    from browser_use import Agent, Browser
+
+    browser = Browser(
+        chrome_user_data_dir=CHROME_USER_DATA_DIR,
+        chrome_profile=CHROME_PROFILE_NAME,
+    )
+
+    task_text = f"""
+Open this SharePoint document URL in the browser:
+
+{url}
+
+Read the visible content in the preview (document body). 
+Then produce a concise professional summary in 6 bullet points.
+Focus on key purpose, main sections, and any important numbers/dates.
+
+Return ONLY the summary text. No markdown, no JSON, no explanations.
+"""
+
+    agent = Agent(
+        task=task_text.strip(),
+        llm=LLM_AZURE,
+        browser=browser,
+    )
+
+    history = await agent.run()
+    return str(history)
+
+
+def summarize_sharepoint_url(url):
+    try:
+        return asyncio.run(_summarize_sharepoint_url(url))
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        result = loop.run_until_complete(_summarize_sharepoint_url(url))
+        loop.close()
+        return result
+
+
+# ===================== MAIN TKINTER APP =====================
+
+class DocsSearchApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Docs Search Tool")
+        self.geometry("950x720")
+
+        self.tasks = []     # local tasks: {folder, mapping}
+        self.sp_tasks = []  # sharepoint tasks: {url, mapping}
+
+        self.selected_formats = {
+            ".docx": tk.BooleanVar(value=True),
+            ".doc": tk.BooleanVar(value=True),
+            ".xlsx": tk.BooleanVar(value=True),
+            ".xls": tk.BooleanVar(value=True),
+            ".pptx": tk.BooleanVar(value=False),
+            ".pdf": tk.BooleanVar(value=True),
+            ".txt": tk.BooleanVar(value=True),
+        }
+
+        self.output_path = None
+        self.total_files = 0
+        self.processed_files = 0
+        self.start_time = None
+
+        self.results_rows = []   # each row includes "FullPath" for local files
+        self.all_headings = set()
+
+        self.log_file = None
+        self.log_path = None
+
+        self._build_ui()
+
+    # -------- UI --------
+
+    def _build_ui(self):
+        frm_top = ttk.LabelFrame(self, text="Select file formats to search:")
+        frm_top.pack(fill="x", padx=10, pady=10)
+
+        for ext, var in self.selected_formats.items():
+            ttk.Checkbutton(frm_top, text=ext, variable=var).pack(
+                side="left", padx=4, pady=4
+            )
+
+        frm_btn = ttk.Frame(self)
+        frm_btn.pack(fill="x", padx=10, pady=5)
+
+        ttk.Button(frm_btn, text="Add Folder & Keywords", command=self.add_task).pack(
+            side="left", padx=5
+        )
+        ttk.Button(frm_btn, text="Add SharePoint Link", command=self.add_sp_task).pack(
+            side="left", padx=5
+        )
+        ttk.Button(frm_btn, text="Search", command=self.start_search).pack(
+            side="left", padx=5
+        )
+        ttk.Button(frm_btn, text="Open Output File", command=self.open_output).pack(
+            side="left", padx=5
+        )
+        ttk.Button(frm_btn, text="Summarize Document", command=self.summarize_document).pack(
+            side="left", padx=5
+        )
+
+        self.task_box = ScrolledText(self, height=7)
+        self.task_box.pack(fill="x", padx=10, pady=5)
+        self.task_box.insert("end", "No tasks added.\n")
+        self.task_box.configure(state="disabled")
+
+        frm_prog = ttk.Frame(self)
+        frm_prog.pack(fill="x", padx=10, pady=5)
+
+        self.progress = ttk.Progressbar(
+            frm_prog, orient="horizontal", mode="determinate"
+        )
+        self.progress.pack(fill="x", padx=5, pady=5)
+
+        self.lbl_status = ttk.Label(frm_prog, text="0 / 0 files | ETA: --:--")
+        self.lbl_status.pack(anchor="w")
+
+        ttk.Label(self, text="Log:").pack(anchor="w", padx=10)
+        self.log_box = ScrolledText(self, height=20)
+        self.log_box.pack(fill="both", expand=True, padx=10, pady=10)
+
+    # -------- Logging --------
+
+    def create_log_file(self):
+        log_dir = os.path.join(os.getcwd(), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_path = os.path.join(log_dir, f"log_{ts}.txt")
+        self.log_file = open(self.log_path, "a", encoding="utf-8", errors="ignore")
+        self.log(f"Log file created: {self.log_path}")
+
+    def close_log_file(self):
+        if self.log_file:
+            try:
+                self.log_file.close()
+            except Exception:
+                pass
+            self.log_file = None
+
+    def log(self, msg):
+        msg = str(msg)
+        self.log_box.insert("end", msg + "\n")
+        self.log_box.see("end")
+
+        if self.log_file:
+            try:
+                self.log_file.write(msg + "\n")
+                self.log_file.flush()
+            except Exception:
+                pass
+
+    # -------- Tasks --------
+
+    def add_task(self):
+        folder = filedialog.askdirectory(title="Select folder to scan")
+        if not folder:
+            return
+
+        mapping_path = filedialog.askopenfilename(
+            title="Select keyword mapping Excel",
+            filetypes=[("Excel files", "*.xlsx *.xls")],
+        )
+        if not mapping_path:
+            return
+
+        try:
+            mapping = load_keyword_mapping(mapping_path)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load mapping file:\n{e}")
+            return
+
+        self.tasks.append({"folder": folder, "mapping": mapping})
+
+        for h in mapping.keys():
+            self.all_headings.add(h)
+
+        self.task_box.configure(state="normal")
+        self.task_box.insert(
+            "end", f"[LOCAL] Folder: {folder}\nMapping: {mapping_path}\n\n"
+        )
+        self.task_box.configure(state="disabled")
+
+    def add_sp_task(self):
+        link = simpledialog.askstring(
+            "SharePoint Link", "Enter SharePoint document-library URL:"
+        )
+        if not link:
+            return
+
+        mapping_path = filedialog.askopenfilename(
+            title="Select keyword mapping Excel (for headings)",
+            filetypes=[("Excel files", "*.xlsx *.xls")],
+        )
+        if not mapping_path:
+            return
+
+        try:
+            mapping = load_keyword_mapping(mapping_path)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load mapping file:\n{e}")
+            return
+
+        self.sp_tasks.append({"url": link, "mapping": mapping})
+
+        for h in mapping.keys():
+            self.all_headings.add(h)
+
+        self.task_box.configure(state="normal")
+        self.task_box.insert(
+            "end", f"[SP] Link: {link}\nMapping: {mapping_path}\n\n"
+        )
+        self.task_box.configure(state="disabled")
+
+    # -------- Control buttons --------
+
+    def start_search(self):
+        if not self.tasks and not self.sp_tasks:
+            messagebox.showerror("Error", "Add at least one local folder or SharePoint link.")
+            return
+
+        exts = [ext for ext, v in self.selected_formats.items() if v.get()]
+        if not exts and self.tasks:
+            messagebox.showerror("Error", "Select at least one file format for local search.")
+            return
+
+        output_dir = os.path.join(os.getcwd(), "output")
+        os.makedirs(output_dir, exist_ok=True)
+        self.output_path = os.path.join(output_dir, "search_results.xlsx")
+        self.log(f"Output will be saved automatically to: {self.output_path}")
+
+        t = threading.Thread(target=self.run_search, args=(exts,), daemon=True)
+        t.start()
+
+    def open_output(self):
+        if self.output_path and os.path.isfile(self.output_path):
+            try:
+                os.startfile(self.output_path)
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to open file:\n{e}")
+        else:
+            messagebox.showinfo("Info", "No output file yet. Run a search first.")
+
+    # -------- Summarization --------
+
+    def summarize_document(self):
+        if not self.results_rows:
+            messagebox.showinfo("Info", "No search results yet.")
+            return
+        if LLM_AZURE is None:
+            messagebox.showerror("Error", "Azure OpenAI LLM is not configured.")
+            return
+
+        name = simpledialog.askstring(
+            "Summarize Document",
+            "Enter Document Name exactly as shown in Excel/log:",
+        )
+        if not name:
+            return
+
+        # find first matching row
+        target = None
+        for row in self.results_rows:
+            if row.get("Document Name") == name:
+                target = row
+                break
+
+        if not target:
+            messagebox.showerror("Error", f"No document found with name: {name}")
+            return
+
+        full_path = target.get("FullPath", "") or ""
+        sp_link = target.get("SharePoint Link", "") or ""
+
+        self.log(f"[SUMMARY] Generating summary for: {name}")
+
+        try:
+            if full_path:
+                # local file
+                temp_root = tempfile.mkdtemp(prefix="summary_")
+                try:
+                    text = extract_text(full_path, temp_root)
+                finally:
+                    shutil.rmtree(temp_root, ignore_errors=True)
+
+                if not text:
+                    summary = "No text could be extracted from this file."
+                else:
+                    # truncate to avoid excessive tokens
+                    snippet = text[:20000]
+                    prompt = (
+                        "Summarize the following document for a finance/operations reader "
+                        "in 6 concise bullet points:\n\n" + snippet
+                    )
+                    resp = LLM_AZURE.invoke(prompt)
+                    summary = str(resp.content)
+            elif sp_link:
+                summary = summarize_sharepoint_url(sp_link)
+            else:
+                summary = "No path or SharePoint link available for this document."
+
+            self.log("[SUMMARY RESULT]\n" + summary)
+            messagebox.showinfo("Summary", summary)
+        except Exception as e:
+            self.log(f"[SUMMARY ERROR] {e}")
+            self.log(traceback.format_exc())
+            messagebox.showerror("Error", f"Failed to summarize document:\n{e}")
+
+    # -------- Helpers --------
+
+    def _eta_str(self):
+        if self.processed_files == 0 or not self.start_time:
+            return "--:--"
+        elapsed = time.time() - self.start_time
+        per_file = elapsed / max(self.processed_files, 1)
+        remaining = max(self.total_files - self.processed_files, 0)
+        eta = int(per_file * remaining)
+        m, s = divmod(eta, 60)
+        return f"{m:02d}:{s:02d}"
+
+    def count_files(self, exts):
+        total = 0
+        for task in self.tasks:
+            folder = task["folder"]
+            for root, _, files in os.walk(folder):
+                for fname in files:
+                    ext = os.path.splitext(fname)[1].lower()
+                    full_path = os.path.join(root, fname)
+                    if ext in exts:
+                        total += 1
+                    elif ext == ".zip":
+                        total += count_files_in_zip(full_path, exts)
+        return total
+
+    def save_results(self):
+        if not self.results_rows:
+            return
+
+        # build column list, excluding internal "FullPath"
+        cols = ["Document Name", "Folder"]
+        extra_cols = sorted(h for h in self.all_headings if h != "FullPath")
+        if "SharePoint Link" in extra_cols:
+            # keep SharePoint Link right after Folder
+            extra_cols.remove("SharePoint Link")
+            cols.append("SharePoint Link")
+        cols.extend(extra_cols)
+
+        df = pd.DataFrame(self.results_rows)
+        # filter to these columns if they exist
+        cols = [c for c in cols if c in df.columns]
+        df = df[cols]
+
+        df.to_excel(self.output_path, index=False)
+        self.log(f"Results saved to: {self.output_path}")
+
+    def process_file(self, full_path, fname, rel_folder, mapping, temp_root):
+        try:
+            text = extract_text(full_path, temp_root)
+            text_lower = text.lower() if text else ""
+
+            row = {
+                "Document Name": fname,
+                "Folder": rel_folder,
+                "FullPath": full_path,
+            }
+
+            for heading, keywords in mapping.items():
+                found = [kw for kw in keywords if kw in text_lower]
+                row[heading] = ", ".join(sorted(set(found))) if found else "No Keywords Found"
+
+            self.results_rows.append(row)
+            self.log(f"OK: {full_path}")
+
+        except Exception as e:
+            self.log(f"ERROR in {full_path}: {e}")
+            self.log(traceback.format_exc())
+        finally:
+            self.processed_files += 1
+            self.progress["value"] = self.processed_files
+            eta = self._eta_str()
+            self.lbl_status.config(
+                text=f"{self.processed_files} / {self.total_files} files | ETA: {eta}"
+            )
+            self.update_idletasks()
+
+    # -------- Main search --------
+
+    def run_search(self, exts):
+        temp_root = tempfile.mkdtemp(prefix="docs_search_")
+        self.results_rows = []
+        self.processed_files = 0
+
+        self.create_log_file()
+        self.log_box.delete("1.0", "end")
+        self.log("Starting search...")
+
+        try:
+            # LOCAL FILES STAGE
+            if self.tasks:
+                self.total_files = self.count_files(exts)
+            else:
+                self.total_files = 0
+
+            if self.total_files == 0 and self.tasks:
+                self.log("No local files found with selected formats.")
+            self.progress["maximum"] = max(self.total_files, 1)
+            self.lbl_status.config(text=f"0 / {self.total_files} files | ETA: --:--")
+            self.start_time = time.time()
+
+            for task in self.tasks:
+                folder = task["folder"]
+                mapping = task["mapping"]
+                self.log(f"\n[LOCAL] Processing folder: {folder}")
+
+                for root, _, files in os.walk(folder):
+                    for fname in files:
+                        ext = os.path.splitext(fname)[1].lower()
+                        full_path = os.path.join(root, fname)
+                        rel_folder = os.path.relpath(root, folder)
+
+                        if ext == ".zip":
+                            self.log(f"Extracting ZIP: {full_path}")
+                            extracted_dir = extract_zip_recursive(full_path, temp_root)
+                            if extracted_dir:
+                                for eroot, _, efiles in os.walk(extracted_dir):
+                                    for efname in efiles:
+                                        eext = os.path.splitext(efname)[1].lower()
+                                        if eext not in exts:
+                                            continue
+                                        extracted_path = os.path.join(eroot, efname)
+                                        rel_folder_zip = os.path.relpath(eroot, folder)
+                                        self.process_file(
+                                            extracted_path,
+                                            efname,
+                                            rel_folder_zip,
+                                            mapping,
+                                            temp_root,
+                                        )
+                            else:
+                                self.log(f"Failed to extract ZIP: {full_path}")
+                            continue
+
+                        if ext in exts:
+                            self.process_file(
+                                full_path, fname, rel_folder, mapping, temp_root
+                            )
+
+                self.save_results()
+
+            # SHAREPOINT STAGE
+            if self.sp_tasks:
+                self.log("\n[SP] Starting SharePoint tasks (file listing only)...")
+                try:
+                    run_sharepoint_tasks(self.sp_tasks, self.results_rows, self.all_headings, self.log)
+                    self.save_results()
+                except Exception as e:
+                    self.log(f"[SP] Unexpected SharePoint error: {e}")
+                    self.log(traceback.format_exc())
+
+            self.log("\nSearch completed.")
+            self.log(f"Output: {self.output_path}")
+            self.log(f"Log: {self.log_path}")
+            messagebox.showinfo(
+                "Done",
+                f"Search completed.\n\nResults: {self.output_path}\nLog: {self.log_path}",
+            )
+
+        finally:
+            shutil.rmtree(temp_root, ignore_errors=True)
+            self.close_log_file()
+
+
+# ===================== RUN APP =====================
+
+if __name__ == "__main__":
+    app = DocsSearchApp()
+    app.mainloop()
