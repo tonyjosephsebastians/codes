@@ -1,0 +1,421 @@
+import io
+import zipfile
+from typing import List, Dict, Any
+from difflib import SequenceMatcher
+
+from lxml import etree
+
+
+WNS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+NS = {"w": WNS}
+
+
+class AIComparator:
+    """
+    AI-Enhanced DOCX comparator (WordprocessingML-aware):
+
+    - Does NOT use SequenceMatcher at block level.
+      Paragraphs/tables are aligned by their index in the document
+      (paragraph 1 with paragraph 1, etc.).
+    - For every changed paragraph/cell, we enqueue a semantic check.
+    - After diffing structure, we call Azure OpenAI in batches via AIUtils.
+    - AI decides which changes are meaningful:
+        * meaningful  -> rendered with red/green word-level diff
+        * trivial     -> rendered as clean updated text (no red/green)
+    """
+
+    def __init__(self, ai_utils, max_batch_size: int = 40) -> None:
+        """
+        ai_utils: instance of AIUtils
+        max_batch_size: how many paragraph changes to send to Azure per call
+        """
+        self.ai_utils = ai_utils
+        self.max_batch_size = max_batch_size
+        self.ai_queue: List[Dict[str, Any]] = []
+
+    # ==================================================================
+    # PUBLIC API
+    # ==================================================================
+    async def compare(self, baseline_docx: bytes, revised_docx: bytes) -> bytes:
+        """
+        baseline_docx: bytes of original DOCX (baseline template)
+        revised_docx : bytes of modified DOCX (supplier version)
+
+        Returns: bytes of new DOCX with inline colored changes
+        (meaningful only), suitable for docx-preview.
+        """
+        base_root = self._load_document_xml(baseline_docx)
+        rev_root = self._load_document_xml(revised_docx)
+
+        base_blocks = self._extract_blocks(base_root)  # [(kind, el)]
+        rev_blocks = self._extract_blocks(rev_root)
+
+        body = base_root.find("w:body", NS)
+
+        # Align blocks strictly by index (no SequenceMatcher)
+        max_len = max(len(base_blocks), len(rev_blocks))
+
+        for i in range(max_len):
+            base_block = base_blocks[i] if i < len(base_blocks) else None
+            rev_block = rev_blocks[i] if i < len(rev_blocks) else None
+
+            # both blocks exist
+            if base_block is not None and rev_block is not None:
+                kind_b, el_b = base_block
+                kind_r, el_r = rev_block
+
+                if kind_b == kind_r:
+                    self._diff_block_pair(kind_b, el_b, kind_r, el_r)
+                else:
+                    # type changed: mark old deleted, insert new
+                    self._mark_block_deleted(kind_b, el_b)
+                    self._append_inserted_block(body, kind_r, el_r)
+
+            # only baseline block exists → deletion
+            elif base_block is not None:
+                kind_b, el_b = base_block
+                self._mark_block_deleted(kind_b, el_b)
+
+            # only revised block exists → insertion
+            elif rev_block is not None:
+                kind_r, el_r = rev_block
+                self._append_inserted_block(body, kind_r, el_r)
+
+        # Now run AI semantic filter in batches over all collected changes
+        await self._apply_ai_semantic_filter()
+
+        # Serialize DOCX
+        return self._save_document_xml(baseline_docx, base_root)
+
+    # ==================================================================
+    # AI SEMANTIC FILTER
+    # ==================================================================
+    async def _apply_ai_semantic_filter(self) -> None:
+        """
+        Take all queued paragraph changes, send them to Azure in
+        batches, and apply the results to the XML tree.
+        """
+        if not self.ai_queue:
+            return
+
+        all_flags: List[bool] = []
+        idx = 0
+        n = len(self.ai_queue)
+
+        # Chunk into manageable batches for Azure
+        while idx < n:
+            chunk = self.ai_queue[idx : idx + self.max_batch_size]
+            pairs = [{"old": c["old"], "new": c["new"]} for c in chunk]
+
+            flags = await self.ai_utils.semantic_batch(pairs)
+            all_flags.extend(flags)
+            idx += self.max_batch_size
+
+        # Ensure we have one flag per queued change
+        if len(all_flags) < n:
+            all_flags.extend([True] * (n - len(all_flags)))
+        elif len(all_flags) > n:
+            all_flags = all_flags[:n]
+
+        # Apply decisions
+        for item, meaningful in zip(self.ai_queue, all_flags):
+            p_el = item["p_el"]
+            old = item["old"]
+            new = item["new"]
+
+            # Clear existing non-pPr children (we keep paragraph properties
+            # like numbering, alignment, etc.)
+            for child in list(p_el):
+                if etree.QName(child.tag).localname == "pPr":
+                    continue
+                p_el.remove(child)
+
+            if meaningful:
+                # Render word-level red/green diff
+                self._render_diff_runs(p_el, old, new)
+            else:
+                # Trivial change: render clean text (no red/green)
+                # If deletion only (new == ""), keep old baseline text.
+                text_to_show = new if new else old
+                if text_to_show:
+                    p_el.append(self._run_plain(text_to_show))
+
+        # Clear queue
+        self.ai_queue = []
+
+    # ==================================================================
+    # BLOCK DIFF
+    # ==================================================================
+    def _diff_block_pair(
+        self,
+        kind_b: str,
+        el_b: etree._Element,
+        kind_r: str,
+        el_r: etree._Element,
+    ) -> None:
+        """
+        For a base/rev block pair, enqueue or diff appropriately.
+        """
+        if kind_b == "p" and kind_r == "p":
+            old = self._get_text(el_b)
+            new = self._get_text(el_r)
+            self.ai_queue.append({"p_el": el_b, "old": old, "new": new})
+
+        elif kind_b == "tbl" and kind_r == "tbl":
+            self._apply_table_diff(el_b, el_r)
+
+        else:
+            # type mismatch → treat base as deleted, rev as inserted elsewhere
+            self._mark_block_deleted(kind_b, el_b)
+
+    def _mark_block_deleted(self, kind: str, el: etree._Element) -> None:
+        if kind == "p":
+            old = self._get_text(el)
+            self.ai_queue.append({"p_el": el, "old": old, "new": ""})
+        elif kind == "tbl":
+            for cell in el.findall("w:tc", NS):
+                for p in cell.findall("w:p", NS):
+                    old = self._get_text(p)
+                    self.ai_queue.append({"p_el": p, "old": old, "new": ""})
+
+    def _append_inserted_block(
+        self, body: etree._Element, kind: str, el_src: etree._Element
+    ) -> None:
+        new_text = self._get_text(el_src)
+        if not new_text:
+            return
+
+        if kind == "p":
+            # Insert new paragraph at end of body – layout is still stable
+            p = etree.SubElement(body, f"{{{WNS}}}p")
+            self.ai_queue.append({"p_el": p, "old": "", "new": new_text})
+        elif kind == "tbl":
+            # Flatten table as text if needed (optional)
+            p = etree.SubElement(body, f"{{{WNS}}}p")
+            table_text = f"[TABLE ADDED] {new_text}"
+            self.ai_queue.append({"p_el": p, "old": "", "new": table_text})
+
+    # ==================================================================
+    # TABLE DIFF
+    # ==================================================================
+    def _apply_table_diff(
+        self, base_tbl: etree._Element, rev_tbl: etree._Element
+    ) -> None:
+        """
+        Row/cell-aware diffing for tables.
+        We enqueue paragraph changes for each cell.
+        """
+        base_rows = base_tbl.findall("w:tr", NS)
+        rev_rows = rev_tbl.findall("w:tr", NS)
+
+        max_rows = max(len(base_rows), len(rev_rows))
+
+        for i in range(max_rows):
+            base_row = base_rows[i] if i < len(base_rows) else None
+            rev_row = rev_rows[i] if i < len(rev_rows) else None
+
+            if base_row is not None and rev_row is None:
+                # entire row deleted
+                for cell in base_row.findall("w:tc", NS):
+                    for p in cell.findall("w:p", NS):
+                        old = self._get_text(p)
+                        self.ai_queue.append({"p_el": p, "old": old, "new": ""})
+
+            elif base_row is None and rev_row is not None:
+                # row inserted → add a new row at end of base table
+                new_row = etree.SubElement(base_tbl, f"{{{WNS}}}tr")
+                for cell in rev_row.findall("w:tc", NS):
+                    new_cell = etree.SubElement(new_row, f"{{{WNS}}}tc")
+                    p = etree.SubElement(new_cell, f"{{{WNS}}}p")
+                    txt = self._get_text(cell)
+                    self.ai_queue.append({"p_el": p, "old": "", "new": txt})
+
+            else:
+                # both rows exist → compare cells
+                base_cells = base_row.findall("w:tc", NS)
+                rev_cells = rev_row.findall("w:tc", NS)
+                max_cols = max(len(base_cells), len(rev_cells))
+
+                for c in range(max_cols):
+                    base_cell = base_cells[c] if c < len(base_cells) else None
+                    rev_cell = rev_cells[c] if c < len(rev_cells) else None
+
+                    if base_cell is not None and rev_cell is None:
+                        # entire cell deleted
+                        for p in base_cell.findall("w:p", NS):
+                            old = self._get_text(p)
+                            self.ai_queue.append({"p_el": p, "old": old, "new": ""})
+
+                    elif base_cell is None and rev_cell is not None:
+                        # new cell inserted
+                        new_cell = etree.SubElement(base_row, f"{{{WNS}}}tc")
+                        p = etree.SubElement(new_cell, f"{{{WNS}}}p")
+                        txt = self._get_text(rev_cell)
+                        self.ai_queue.append({"p_el": p, "old": "", "new": txt})
+
+                    else:
+                        # both cells exist → diff paragraphs
+                        base_paras = base_cell.findall("w:p", NS)
+                        rev_paras = rev_cell.findall("w:p", NS)
+                        max_p = max(len(base_paras), len(rev_paras))
+
+                        for i_p in range(max_p):
+                            if i_p < len(base_paras) and i_p < len(rev_paras):
+                                old = self._get_text(base_paras[i_p])
+                                new = self._get_text(rev_paras[i_p])
+                                self.ai_queue.append(
+                                    {
+                                        "p_el": base_paras[i_p],
+                                        "old": old,
+                                        "new": new,
+                                    }
+                                )
+                            elif i_p < len(base_paras):
+                                old = self._get_text(base_paras[i_p])
+                                self.ai_queue.append(
+                                    {
+                                        "p_el": base_paras[i_p],
+                                        "old": old,
+                                        "new": "",
+                                    }
+                                )
+                            else:
+                                p = etree.SubElement(base_cell, f"{{{WNS}}}p")
+                                txt = self._get_text(rev_paras[i_p])
+                                self.ai_queue.append(
+                                    {"p_el": p, "old": "", "new": txt}
+                                )
+
+    # ==================================================================
+    # WORD-LEVEL DIFF RENDERING
+    # ==================================================================
+    def _render_diff_runs(
+        self, p_el: etree._Element, old_text: str, new_text: str
+    ) -> None:
+        """
+        Render word-level diff (insert/delete/equal) into <w:r> runs.
+        """
+        tokens = self._diff_words(old_text, new_text)
+
+        MAX_TOKENS = 400
+        if len(tokens) > MAX_TOKENS:
+            # If too complex, fall back to whole-paragraph delete/insert
+            if old_text:
+                p_el.append(self._run_delete(old_text))
+            if new_text:
+                p_el.append(self._run_insert(new_text))
+            return
+
+        for kind, word in tokens:
+            word_space = word + " "
+            if kind == "eq":
+                p_el.append(self._run_plain(word_space))
+            elif kind == "ins":
+                p_el.append(self._run_insert(word_space))
+            elif kind == "del":
+                p_el.append(self._run_delete(word_space))
+
+    def _diff_words(self, old: str, new: str):
+        a = old.split()
+        b = new.split()
+        sm = SequenceMatcher(None, a, b)
+        out = []
+        for op, i1, i2, j1, j2 in sm.get_opcodes():
+            if op == "equal":
+                for w in a[i1:i2]:
+                    out.append(("eq", w))
+            elif op == "delete":
+                for w in a[i1:i2]:
+                    out.append(("del", w))
+            elif op == "insert":
+                for w in b[j1:j2]:
+                    out.append(("ins", w))
+            elif op == "replace":
+                for w in a[i1:i2]:
+                    out.append(("del", w))
+                for w in b[j1:j2]:
+                    out.append(("ins", w))
+        return out
+
+    # ==================================================================
+    # RUN BUILDERS
+    # ==================================================================
+    def _run_plain(self, text: str) -> etree._Element:
+        r = etree.Element(f"{{{WNS}}}r")
+        t = etree.SubElement(r, f"{{{WNS}}}t")
+        t.text = text
+        return r
+
+    def _run_insert(self, text: str) -> etree._Element:
+        r = etree.Element(f"{{{WNS}}}r")
+        rPr = etree.SubElement(r, f"{{{WNS}}}rPr")
+        color = etree.SubElement(rPr, f"{{{WNS}}}color")
+        color.set(f"{{{WNS}}}val", "00AA00")  # green
+        etree.SubElement(rPr, f"{{{WNS}}}b")
+        t = etree.SubElement(r, f"{{{WNS}}}t")
+        t.text = text
+        return r
+
+    def _run_delete(self, text: str) -> etree._Element:
+        r = etree.Element(f"{{{WNS}}}r")
+        rPr = etree.SubElement(r, f"{{{WNS}}}rPr")
+        color = etree.SubElement(rPr, f"{{{WNS}}}color")
+        color.set(f"{{{WNS}}}val", "FF0000")  # red
+        etree.SubElement(rPr, f"{{{WNS}}}strike")
+        t = etree.SubElement(r, f"{{{WNS}}}t")
+        t.text = text
+        return r
+
+    # ==================================================================
+    # DOCX UTILITIES
+    # ==================================================================
+    def _load_document_xml(self, docx_bytes: bytes) -> etree._Element:
+        with io.BytesIO(docx_bytes) as f:
+            with zipfile.ZipFile(f) as z:
+                xml_bytes = z.read("word/document.xml")
+        return etree.fromstring(xml_bytes)
+
+    def _save_document_xml(
+        self, original_docx: bytes, new_root: etree._Element
+    ) -> bytes:
+        out_buf = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(original_docx)) as zin:
+            with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    data = zin.read(item.filename)
+                    if item.filename == "word/document.xml":
+                        data = etree.tostring(
+                            new_root,
+                            xml_declaration=True,
+                            encoding="UTF-8",
+                            standalone="yes",
+                        )
+                    zout.writestr(item, data)
+        return out_buf.getvalue()
+
+    def _extract_blocks(
+        self, root: etree._Element
+    ) -> List[Any]:
+        body = root.find("w:body", NS)
+        blocks: List[Any] = []
+        for child in body:
+            tag = etree.QName(child.tag).localname
+            if tag == "p":
+                blocks.append(("p", child))
+            elif tag == "tbl":
+                blocks.append(("tbl", child))
+        return blocks
+
+    def _get_text(self, el: etree._Element) -> str:
+        return " ".join(
+            t.text for t in el.findall(".//w:t", NS) if t.text
+        ).strip()
+
+    def _block_signature(self, kind: str, el: etree._Element) -> str:
+        """
+        Unused now, kept for compatibility if you later want to reintroduce
+        smarter alignment logic.
+        """
+        raw = self._get_text(el)
+        norm = " ".join(raw.lower().split())
+        return f"{kind}:{norm}"
