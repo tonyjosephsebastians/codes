@@ -1,0 +1,11 @@
+AZURE_OPENAI_API_KEY=xxxx
+AZURE_OPENAI_ENDPOINT=https://your-azure-openai-resource.openai.azure.com/
+AZURE_OPENAI_API_VERSION=2023-07-01-preview
+AZURE_OPENAI_CHAT_DEPLOYMENT_NAME=gpt4Preview   # or your deployment name
+
+
+
+
+pip install python-docx python-pptx PyPDF2 pandas openpyxl mammoth pyexcel pyexcel-xls pyexcel-xlsx
+pip install browser-use langchain-openai python-dotenv
+playwright install
