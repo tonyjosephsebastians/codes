@@ -1,0 +1,17 @@
+"C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="C:\chrome-debug"
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+
+options = Options()
+
+# 🔹 Attach to already opened enterprise Chrome
+options.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
+
+driver = webdriver.Chrome(options=options)
+
+print("✅ Connected to Corporate Chrome")
+print(driver.title)
+
+
+driver.get("https://yourcompany.sharepoint.com")
+chrome.exe --remote-debugging-port=9222 --disable-features=RendererCodeIntegrity --user-data-dir=C:\chrome-debug-profile
