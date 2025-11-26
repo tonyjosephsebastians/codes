@@ -1,0 +1,450 @@
+import os
+import time
+import threading
+import traceback
+import datetime
+
+import tkinter as tk
+from tkinter import ttk, messagebox, simpledialog
+from tkinter.scrolledtext import ScrolledText
+
+from dotenv import load_dotenv
+import pandas as pd
+from bs4 import BeautifulSoup
+
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from webdriver_manager.chrome import ChromeDriverManager
+
+from langchain_openai import AzureChatOpenAI
+
+# ===================== CONFIG =====================
+
+# Adjust if your Chrome profile folder name is different
+CHROME_USER_DATA_DIR = r"C:\Users\TAE7758\AppData\Local\Google\Chrome\User Data"
+CHROME_PROFILE = "Default"  # e.g. "Default", "Profile 1", etc.
+
+load_dotenv()
+
+
+def init_azure_llm():
+    try:
+        api_key = os.environ["AZURE_OPENAI_API_KEY"]
+        endpoint = os.environ["AZURE_OPENAI_ENDPOINT"]
+        api_version = os.environ["AZURE_OPENAI_API_VERSION"]
+        deployment = os.environ["AZURE_OPENAI_CHAT_DEPLOYMENT_NAME"]
+
+        llm = AzureChatOpenAI(
+            azure_endpoint=endpoint,
+            openai_api_key=api_key,
+            openai_api_version=api_version,
+            azure_deployment=deployment,
+            temperature=0.2,
+        )
+        return llm
+    except Exception as e:
+        print("Failed to initialize Azure OpenAI LLM:", e)
+        return None
+
+
+LLM_AZURE = init_azure_llm()
+
+
+# ===================== SELENIUM HELPERS =====================
+
+def get_driver():
+    """Create a Chrome driver using the org's Chrome profile (SSO already logged in)."""
+    opts = Options()
+    opts.add_argument(f"--user-data-dir={CHROME_USER_DATA_DIR}")
+    opts.add_argument(f"--profile-directory={CHROME_PROFILE}")
+    opts.add_argument("--start-maximized")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+
+    driver = webdriver.Chrome(ChromeDriverManager().install(), options=opts)
+    return driver
+
+
+def perform_sharepoint_search(driver, site_url, keyword, log_func):
+    """
+    Open SharePoint site, perform search for keyword, return list of {file_name, file_url, keyword}.
+    Uses SharePoint's built-in search.
+    """
+    results = []
+
+    log_func(f"[SP] Opening site for keyword '{keyword}': {site_url}")
+    driver.get(site_url)
+    time.sleep(5)
+
+    # Try to locate the search box in modern SharePoint
+    search_box = None
+    selectors = [
+        "input[aria-label='Search this site']",
+        "input[aria-label='Search']",
+        "input[type='search']",
+    ]
+
+    for sel in selectors:
+        try:
+            elems = driver.find_elements(By.CSS_SELECTOR, sel)
+            if elems:
+                search_box = elems[0]
+                break
+        except Exception:
+            continue
+
+    if search_box is None:
+        log_func("[SP] Could not find search box. Trying search URL pattern...")
+        # Fallback: construct a classic search URL
+        from urllib.parse import quote
+        search_url = site_url.rstrip("/") + "/_layouts/15/search.aspx?q=" + quote(keyword)
+        driver.get(search_url)
+        time.sleep(6)
+    else:
+        try:
+            search_box.clear()
+            search_box.send_keys(keyword)
+            search_box.send_keys(Keys.ENTER)
+            time.sleep(6)
+        except Exception as e:
+            log_func(f"[SP] Failed to type into search box: {e}")
+            return results
+
+    # Now parse the search results page
+    html = driver.page_source
+    soup = BeautifulSoup(html, "lxml")
+
+    # Heuristic: collect all <a> with href and some reasonable text, then filter by extension
+    links = soup.select("a")
+    allowed_exts = (".docx", ".doc", ".pdf", ".xlsx", ".xls", ".pptx", ".txt", ".csv", ".zip")
+
+    for a in links:
+        name = a.get_text(strip=True)
+        href = a.get("href", "")
+
+        if not name or not href:
+            continue
+
+        # Filter by extension in name OR in href
+        lower_name = name.lower()
+        lower_href = href.lower()
+        if not any(lower_name.endswith(ext) or lower_href.endswith(ext) for ext in allowed_exts):
+            continue
+
+        # Make absolute URL if relative
+        if href.startswith("/"):
+            base = driver.current_url.split("/")[2]  # hostname
+            href = "https://" + base + href
+
+        results.append({
+            "file_name": name,
+            "file_url": href,
+            "keyword": keyword
+        })
+
+    log_func(f"[SP] Found {len(results)} results for keyword '{keyword}'.")
+    return results
+
+
+def extract_sharepoint_text(driver, url, log_func):
+    """
+    Open a SharePoint document link in Chrome and extract visible text from the viewer.
+    This is generic: it just grabs body text.
+    """
+    log_func(f"[SP] Opening document for summary: {url}")
+    driver.get(url)
+    time.sleep(8)  # give time for Word/PDF/Excel web viewer to render
+
+    try:
+        body = driver.find_element(By.TAG_NAME, "body")
+        text = body.text or ""
+    except Exception as e:
+        log_func(f"[SP] Failed to extract body text: {e}")
+        text = ""
+
+    log_func(f"[SP] Extracted text length: {len(text)}")
+    return text
+
+
+def summarize_text_with_azure(text):
+    """Use Azure OpenAI to summarize text in 6 bullet points."""
+    if LLM_AZURE is None:
+        raise RuntimeError("Azure OpenAI LLM is not configured.")
+
+    snippet = text[:20000]  # avoid giant prompt
+    prompt = (
+        "Summarize the following document for a compliance/finance/operations reader. "
+        "Return exactly 6 concise bullet points.\n\n"
+        + snippet
+    )
+    resp = LLM_AZURE.invoke(prompt)
+    return str(resp.content)
+
+
+# ===================== TKINTER APP =====================
+
+class SharePointSearchApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("SharePoint Keyword Search & Summary Tool")
+        self.geometry("1100x700")
+
+        self.results = []  # list of dicts {Document Name, SharePoint Link, Keyword}
+        self.output_path = None
+        self.log_file = None
+        self.log_path = None
+
+        self._build_ui()
+
+    def _build_ui(self):
+        # Top frame for input
+        frm_top = ttk.LabelFrame(self, text="SharePoint Search")
+        frm_top.pack(fill="x", padx=10, pady=10)
+
+        # SharePoint URL
+        ttk.Label(frm_top, text="SharePoint Site / Library URL:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        self.entry_url = ttk.Entry(frm_top, width=80)
+        self.entry_url.grid(row=0, column=1, sticky="w", padx=5, pady=5)
+
+        # Keywords
+        ttk.Label(frm_top, text="Keywords (comma-separated):").grid(row=1, column=0, sticky="w", padx=5, pady=5)
+        self.entry_keywords = ttk.Entry(frm_top, width=80)
+        self.entry_keywords.grid(row=1, column=1, sticky="w", padx=5, pady=5)
+
+        # Buttons
+        btn_frame = ttk.Frame(frm_top)
+        btn_frame.grid(row=2, column=0, columnspan=2, sticky="w", padx=5, pady=5)
+
+        ttk.Button(btn_frame, text="Run SharePoint Search", command=self.start_search).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="Summarize Selected", command=self.summarize_selected).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="Open Output Excel", command=self.open_output).pack(side="left", padx=5)
+
+        # Results table
+        frm_table = ttk.LabelFrame(self, text="Search Results")
+        frm_table.pack(fill="both", expand=True, padx=10, pady=5)
+
+        columns = ("Document Name", "SharePoint Link", "Keyword")
+        self.tree = ttk.Treeview(frm_table, columns=columns, show="headings")
+        for col in columns:
+            self.tree.heading(col, text=col)
+            self.tree.column(col, width=300 if col != "Keyword" else 120, anchor="w")
+
+        vsb = ttk.Scrollbar(frm_table, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        # Progress + status
+        frm_prog = ttk.Frame(self)
+        frm_prog.pack(fill="x", padx=10, pady=5)
+
+        self.progress = ttk.Progressbar(frm_prog, orient="horizontal", mode="determinate")
+        self.progress.pack(fill="x", padx=5, pady=5)
+
+        self.lbl_status = ttk.Label(frm_prog, text="Status: Idle")
+        self.lbl_status.pack(anchor="w")
+
+        # Log box
+        ttk.Label(self, text="Log:").pack(anchor="w", padx=10)
+        self.log_box = ScrolledText(self, height=12)
+        self.log_box.pack(fill="both", expand=False, padx=10, pady=10)
+
+    # ---------- Logging ----------
+
+    def create_log_file(self):
+        log_dir = os.path.join(os.getcwd(), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_path = os.path.join(log_dir, f"log_{ts}.txt")
+        self.log_file = open(self.log_path, "a", encoding="utf-8", errors="ignore")
+        self.log(f"Log file created: {self.log_path}")
+
+    def close_log_file(self):
+        if self.log_file:
+            try:
+                self.log_file.close()
+            except Exception:
+                pass
+            self.log_file = None
+
+    def log(self, msg):
+        msg = str(msg)
+        self.log_box.insert("end", msg + "\n")
+        self.log_box.see("end")
+        if self.log_file:
+            try:
+                self.log_file.write(msg + "\n")
+                self.log_file.flush()
+            except Exception:
+                pass
+
+    # ---------- Actions ----------
+
+    def start_search(self):
+        url = self.entry_url.get().strip()
+        kw_str = self.entry_keywords.get().strip()
+
+        if not url:
+            messagebox.showerror("Error", "Please enter a SharePoint site or library URL.")
+            return
+        if not kw_str:
+            messagebox.showerror("Error", "Please enter at least one keyword.")
+            return
+
+        keywords = [k.strip() for k in kw_str.split(",") if k.strip()]
+        if not keywords:
+            messagebox.showerror("Error", "No valid keywords parsed.")
+            return
+
+        # Prepare output path
+        out_dir = os.path.join(os.getcwd(), "output")
+        os.makedirs(out_dir, exist_ok=True)
+        self.output_path = os.path.join(out_dir, "sharepoint_results.xlsx")
+        self.log(f"Output will be saved automatically to: {self.output_path}")
+
+        # Reset UI
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        self.results = []
+        self.progress["value"] = 0
+        self.progress["maximum"] = len(keywords)
+        self.lbl_status.config(text="Status: Running SharePoint search...")
+
+        # Start background thread
+        t = threading.Thread(target=self.run_search_thread, args=(url, keywords), daemon=True)
+        t.start()
+
+    def run_search_thread(self, url, keywords):
+        self.create_log_file()
+        try:
+            driver = get_driver()
+        except Exception as e:
+            self.log(f"[ERROR] Failed to start Chrome driver: {e}")
+            messagebox.showerror("Error", f"Failed to start Chrome driver:\n{e}")
+            self.close_log_file()
+            return
+
+        try:
+            all_rows = []
+            for i, kw in enumerate(keywords, start=1):
+                try:
+                    rows = perform_sharepoint_search(driver, url, kw, self.log)
+                    all_rows.extend(rows)
+                except Exception as e:
+                    self.log(f"[ERROR] Search failed for '{kw}': {e}")
+                    self.log(traceback.format_exc())
+                finally:
+                    self.progress["value"] = i
+                    self.lbl_status.config(text=f"Status: {i}/{len(keywords)} keywords processed")
+                    self.update_idletasks()
+
+            # Deduplicate by (file_name, file_url, keyword)
+            seen = set()
+            deduped = []
+            for r in all_rows:
+                key = (r["file_name"], r["file_url"], r["keyword"])
+                if key not in seen:
+                    seen.add(key)
+                    deduped.append(r)
+
+            self.results = deduped
+            self.populate_table()
+            self.save_results_to_excel()
+
+            self.lbl_status.config(text=f"Status: Completed. {len(self.results)} unique results.")
+            self.log("Search completed.")
+            self.log(f"Results saved to: {self.output_path}")
+            self.log(f"Log file: {self.log_path}")
+            messagebox.showinfo("Done", f"Search completed.\nResults: {self.output_path}\nLog: {self.log_path}")
+
+        finally:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+            self.close_log_file()
+
+    def populate_table(self):
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+
+        for r in self.results:
+            self.tree.insert(
+                "", "end",
+                values=(r["file_name"], r["file_url"], r["keyword"])
+            )
+
+    def save_results_to_excel(self):
+        if not self.results:
+            return
+        df = pd.DataFrame(self.results)
+        df.rename(columns={"file_name": "Document Name", "file_url": "SharePoint Link", "keyword": "Keyword"}, inplace=True)
+        df.to_excel(self.output_path, index=False)
+
+    def open_output(self):
+        if self.output_path and os.path.isfile(self.output_path):
+            try:
+                os.startfile(self.output_path)
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to open file:\n{e}")
+        else:
+            messagebox.showinfo("Info", "No output file yet. Run a search first.")
+
+    def summarize_selected(self):
+        if not self.results:
+            messagebox.showinfo("Info", "No results to summarize. Run a search first.")
+            return
+        if LLM_AZURE is None:
+            messagebox.showerror("Error", "Azure OpenAI LLM is not configured.")
+            return
+
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("Info", "Please select a row to summarize.")
+            return
+
+        item_id = sel[0]
+        vals = self.tree.item(item_id, "values")
+        doc_name, link, keyword = vals[0], vals[1], vals[2]
+
+        self.log(f"[SUMMARY] Summarizing document: {doc_name}")
+        self.lbl_status.config(text=f"Status: Summarizing '{doc_name}'...")
+
+        def worker():
+            try:
+                driver = get_driver()
+            except Exception as e:
+                self.log(f"[SUMMARY ERROR] Failed to start Chrome driver: {e}")
+                messagebox.showerror("Error", f"Failed to start Chrome driver:\n{e}")
+                return
+
+            try:
+                text = extract_sharepoint_text(driver, link, self.log)
+                if not text.strip():
+                    summary = "No readable text found in the SharePoint document preview."
+                else:
+                    summary = summarize_text_with_azure(text)
+                self.log("[SUMMARY RESULT]\n" + summary)
+                messagebox.showinfo("Summary", summary)
+            except Exception as e:
+                self.log(f"[SUMMARY ERROR] {e}")
+                self.log(traceback.format_exc())
+                messagebox.showerror("Error", f"Failed to summarize document:\n{e}")
+            finally:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                self.lbl_status.config(text="Status: Idle")
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+
+
+# ===================== RUN =====================
+
+if __name__ == "__main__":
+    app = SharePointSearchApp()
+    app.mainloop()
