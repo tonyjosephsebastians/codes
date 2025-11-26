@@ -1,0 +1,117 @@
+ def semantic_batch(self, changes: List[Dict[str, str]]) -> List[bool]:
+        """
+        Synchronous evaluator for a batch of changes.
+
+        changes: List of {"old": str, "new": str}
+
+        Returns: List[bool] of same length:
+          - True  -> change is LEGALLY meaningful (keep red/green diff)
+          - False -> change is trivial (spacing, punctuation, etc.)
+
+        This method is robust:
+          - Never raises if Azure fails
+          - Gracefully handles invalid JSON
+          - Always returns len(results) == len(changes)
+        """
+
+        if not changes:
+            return []
+
+        # Safety trim to reduce tokens
+        MAX_CHARS = 800
+        safe_changes: List[Dict[str, str]] = []
+        for ch in changes:
+            old = (ch.get("old") or "")[:MAX_CHARS]
+            new = (ch.get("new") or "")[:MAX_CHARS]
+            safe_changes.append({"old": old, "new": new})
+
+        prompt_payload: Dict[str, Any] = {
+            "instruction": (
+                "You are analyzing contract redlines. For each OLD/NEW pair, "
+                "decide if the change is LEGALLY meaningful.\n\n"
+                "Meaningful = changes obligations, rights, liabilities, scope, parties, "
+                "definitions, or risk allocation.\n"
+                "Trivial = only spacing, punctuation, capitalization, formatting, "
+                "or non-substantive rephrasing that does not alter meaning.\n\n"
+                "Return ONLY JSON: {\"results\": [true/false,...]} with the SAME length "
+                "as the input list."
+            ),
+            "items": safe_changes,
+        }
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.deployment_name,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Return only JSON. No explanations.",
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(prompt_payload),
+                    },
+                ],
+                temperature=0.0,
+                max_tokens=1024,
+                response_format={"type": "json_object"},
+            )
+
+            # Safely extract content
+            msg: Optional[str]
+            try:
+                msg = response.choices[0].message.content
+            except Exception as e:
+                logger.error(f"[AIUtils] No content in response: {e}")
+                msg = None
+
+            if not msg:
+                # Azure returned no content (timeout, error, etc.)
+                logger.error("[AIUtils] Empty content from Azure; treating all as meaningful.")
+                return [True] * len(changes)
+
+            try:
+                data = json.loads(msg)
+            except Exception as e:
+                logger.error(f"[AIUtils] JSON parse error: {e}; raw={msg!r}")
+                return [True] * len(changes)
+
+            results = data.get("results", [])
+
+            if not isinstance(results, list):
+                logger.error(f"[AIUtils] 'results' is not a list: {results!r}")
+                return [True] * len(changes)
+
+            out: List[bool] = []
+            for item in results:
+                if isinstance(item, bool):
+                    out.append(item)
+                else:
+                    # default to True (meaningful) if model misbehaves
+                    out.append(True)
+
+            # Enforce correct length
+            if len(out) < len(changes):
+                out.extend([True] * (len(changes) - len(out)))
+            elif len(out) > len(changes):
+                out = out[: len(changes)]
+
+            return out
+
+        except Exception as e:
+            logger.error(f"[AIUtils] semantic_batch failed: {e}")
+            # On ANY failure, treat all as meaningful (safer)
+            return [True] * len(changes)
+
+    # =====================================================================
+    # ASYNC: semantic_batch_async
+    # =====================================================================
+    async def semantic_batch_async(self, changes: List[Dict[str, str]]) -> List[bool]:
+        """
+        Async wrapper around semantic_batch, so it can be used
+        from async code (e.g., FastAPI endpoints, async comparator).
+
+        Uses run_in_executor to avoid blocking the event loop.
+        """
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self.semantic_batch, changes)
