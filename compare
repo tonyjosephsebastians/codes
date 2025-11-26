@@ -1,0 +1,143 @@
+import json
+import logging
+from typing import List, Dict, Any
+
+from openai import AzureOpenAI
+from azure.identity import ManagedIdentityCredential, get_bearer_token_provider
+
+import settings  # your existing config module
+
+
+logger = logging.getLogger(__name__)
+
+
+class AIUtils:
+    """
+    Azure OpenAI utilities for semantic classification of paragraph-level changes.
+    """
+
+    # Max characters per OLD/NEW text snippet sent to the model
+    MAX_CHARS_PER_ITEM = 1500
+
+    def __init__(self) -> None:
+        # Initialize Azure AD token provider for Azure OpenAI
+        try:
+            token_provider = get_bearer_token_provider(
+                ManagedIdentityCredential(
+                    client_id=settings.AZURE_OPENAI_CLIENT_ID
+                ),
+                settings.AZURE_OPENAI_SCOPES,
+            )
+        except Exception as e:
+            logger.error(f"[AIUtils] Error initializing token provider: {e}")
+            token_provider = None
+
+        # AzureOpenAI client
+        self.client = AzureOpenAI(
+            api_version=settings.AZURE_OPENAI_API_VERSION,
+            azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
+            azure_ad_token_provider=token_provider,
+        )
+
+        self.deployment_name: str = (
+            settings.AZURE_OPENAI_DEPLOYMENT_NAME or "gpt-4o"
+        )
+
+    # ------------------------------------------------------------------
+    # BATCH SEMANTIC FILTER
+    # ------------------------------------------------------------------
+    async def semantic_batch(
+        self, changes: List[Dict[str, str]]
+    ) -> List[bool]:
+        """
+        Input:
+            changes = [
+                {"old": "...", "new": "..."},
+                {"old": "...", "new": "..."},
+                ...
+            ]
+
+        Output:
+            [True, False, True, ...]  # True = meaningful change
+        """
+
+        if not changes:
+            return []
+
+        # Truncate each pair to protect against giant paragraphs
+        safe_changes: List[Dict[str, str]] = []
+        for item in changes:
+            old = (item.get("old") or "")[: self.MAX_CHARS_PER_ITEM]
+            new = (item.get("new") or "")[: self.MAX_CHARS_PER_ITEM]
+            safe_changes.append({"old": old, "new": new})
+
+        payload = {
+            "instruction": (
+                "For each OLD/NEW pair, decide if the change affects "
+                "legal meaning in a contract (e.g., NDA, MSA)."
+            ),
+            "rules": [
+                "Ignore purely formatting changes.",
+                "Ignore punctuation-only and whitespace-only changes.",
+                "Ignore capitalization-only changes.",
+                "Focus ONLY on changes that affect obligations, rights, "
+                "responsibilities, parties, scope, definitions, "
+                "exceptions, or liabilities.",
+                "Return ONLY JSON with a 'results' key containing a list "
+                "of booleans (true = meaningful change, false = trivial).",
+            ],
+            "items": safe_changes,
+        }
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.deployment_name,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a legal redline semantic filter. "
+                            "Return JSON only."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(payload),
+                    },
+                ],
+                temperature=0,
+                max_tokens=512,
+                response_format={"type": "json_object"},
+            )
+
+            content = response.choices[0].message.content
+            data = json.loads(content)
+            results = data.get("results", [])
+
+            # Normalize to a list[bool] with same length
+            if not isinstance(results, list):
+                logger.error(
+                    f"[AIUtils] semantic_batch: 'results' is not list: {results}"
+                )
+                return [True] * len(changes)
+
+            bool_results: List[bool] = []
+            for i, r in enumerate(results):
+                if isinstance(r, bool):
+                    bool_results.append(r)
+                else:
+                    # If model gives weird stuff, be safe and treat as meaningful
+                    bool_results.append(True)
+
+            # Pad or trim to exact length just in case
+            if len(bool_results) < len(changes):
+                bool_results.extend([True] * (len(changes) - len(bool_results)))
+            elif len(bool_results) > len(changes):
+                bool_results = bool_results[: len(changes)]
+
+            return bool_results
+
+        except Exception as e:
+            logger.error(f"[AIUtils] semantic_batch failed: {e}")
+            # Fallback: treat all as meaningful so we never miss risk
+            return [True] * len(changes)
