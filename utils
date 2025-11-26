@@ -1,0 +1,76 @@
+import json
+import logging
+from typing import List, Dict, Any
+
+logger = logging.getLogger(__name__)
+
+
+class AIUtils:
+    def __init__(self):
+        # your existing __init__ from screenshot
+        token_provider = self._get_token_provider()
+        self.client = AzureOpenAI(
+            api_version=settings.AZURE_OPENAI_API_VERSION,
+            azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
+            azure_ad_token_provider=token_provider,
+        )
+        self.deployment_name = settings.AZURE_OPENAI_DEPLOYMENT_NAME or "gpt-4o"
+
+        # existing stuff: encoding, clause_patterns, etc.
+        ...
+
+    # --- NEW: lightweight semantic-change checker --- #
+    def judge_semantic_change(self, old: str, new: str) -> bool:
+        """
+        Ask Azure OpenAI whether the change from old → new is
+        semantically meaningful.
+
+        Returns:
+            True  -> show diff (meaningful change)
+            False -> ignore diff (trivial / cosmetic)
+        """
+
+        # Safety: truncate long paragraphs to reduce tokens and cost
+        MAX_CHARS = 1500
+        old_trim = (old or "")[:MAX_CHARS]
+        new_trim = (new or "")[:MAX_CHARS]
+
+        prompt = (
+            "You are a contract comparison assistant. "
+            "Given OLD and NEW text versions of a clause, decide whether the "
+            "change is semantically meaningful.\n\n"
+            "Respond with exactly one word:\n"
+            "  'yes' = the change is legally or semantically meaningful\n"
+            "  'no'  = the change is trivial (whitespace, punctuation, "
+            "synonyms that do not affect obligations, etc.).\n\n"
+            f"OLD:\n{old_trim}\n\nNEW:\n{new_trim}"
+        )
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.deployment_name,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You output only 'yes' or 'no'.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.0,
+                max_tokens=2,
+                top_p=0,
+            )
+
+            answer = (
+                response.choices[0].message.content.strip().lower()
+                if response.choices and response.choices[0].message.content
+                else ""
+            )
+
+            logger.info(f"[AIUtils] semantic_change answer: {answer!r}")
+            return answer.startswith("y")
+
+        except Exception as e:
+            logger.error(f"[AIUtils] judge_semantic_change failed: {e}")
+            # On any error, be safe and treat change as meaningful so you don't miss risks
+            return True
