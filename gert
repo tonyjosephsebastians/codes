@@ -1,0 +1,131 @@
+import os
+import shutil
+import tempfile
+import subprocess
+
+
+class AIComparator:
+    """
+    AIComparator using LibreOffice native DOCX Compare.
+
+    FIXED VERSION:
+    - Correct LibreOffice CLI syntax (previous version was wrong)
+    - Creates per-comparison temporary user profile (LO requirement)
+    - Writes output as <basename>-compare.docx (LO default)
+    - Works reliably on RHEL/CentOS/Fedora
+    """
+
+    def __init__(self):
+        self.soffice_path = shutil.which("soffice")
+        if not self.soffice_path:
+            raise RuntimeError("LibreOffice (soffice) not found in PATH!")
+
+    # -------------------------------------------------------------------
+    # Helper: Write DOCX temp file
+    # -------------------------------------------------------------------
+    def _write(self, folder: str, name: str, content: bytes) -> str:
+        path = os.path.join(folder, name)
+        with open(path, "wb") as f:
+            f.write(content)
+        return path
+
+    # -------------------------------------------------------------------
+    # Helper: Find LO-generated diff file
+    # -------------------------------------------------------------------
+    def _find_diff(self, folder: str):
+        for f in os.listdir(folder):
+            name = f.lower()
+
+            # LibreOffice naming patterns
+            if "-compare" in name and name.endswith(".docx"):
+                return os.path.join(folder, f)
+
+            if "comparison" in name and name.endswith(".docx"):
+                return os.path.join(folder, f)
+
+            if "diff" in name and name.endswith(".docx"):
+                return os.path.join(folder, f)
+
+        # fallback: newest docx
+        candidates = [
+            os.path.join(folder, f)
+            for f in os.listdir(folder)
+            if f.lower().endswith(".docx")
+        ]
+        if not candidates:
+            return None
+
+        return max(candidates, key=lambda p: os.path.getmtime(p))
+
+    # -------------------------------------------------------------------
+    # MAIN: Run LibreOffice Compare
+    # -------------------------------------------------------------------
+    def _run_libreoffice_compare(self, base_bytes: bytes, rev_bytes: bytes) -> bytes:
+        """
+        LibreOffice correct compare syntax:
+
+        soffice --headless \
+            --compare <revised.docx> <baseline.docx> \
+            --outdir <output>
+        """
+        # Separate temp workspace
+        workdir = tempfile.mkdtemp(prefix="lo_cmp_")
+        profiledir = tempfile.mkdtemp(prefix="lo_profile_")
+
+        try:
+            base_path = self._write(workdir, "baseline.docx", base_bytes)
+            rev_path = self._write(workdir, "revised.docx", rev_bytes)
+
+            cmd = [
+                self.soffice_path,
+                "--headless",
+                "--nologo",
+                "--nodefault",
+                "--nolockcheck",
+                "--norestore",
+                f"-env:UserInstallation=file://{profiledir}",
+
+                "--compare",        # IMPORTANT
+                rev_path,           # revised
+                base_path,          # baseline
+
+                "--convert-to", "docx",
+                "--outdir", workdir
+            ]
+
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=120,
+            )
+
+            # Check for LibreOffice errors
+            stderr = proc.stderr.strip()
+            if "Fatal" in stderr or "Error" in stderr:
+                raise RuntimeError(f"LibreOffice Compare failed:\n{stderr}")
+
+            # Find LO output docx
+            diff_path = self._find_diff(workdir)
+            if not diff_path:
+                raise RuntimeError("Comparison succeeded but diff DOCX not found")
+
+            with open(diff_path, "rb") as f:
+                return f.read()
+
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+            shutil.rmtree(profiledir, ignore_errors=True)
+
+    # -------------------------------------------------------------------
+    # PUBLIC API
+    # -------------------------------------------------------------------
+    def compare(self, baseline_docx: bytes, revised_docx: bytes) -> bytes:
+        """
+        Returns:
+            A DOCX with <w:ins>, <w:del>, <w:moveFrom>, <w:moveTo>
+
+        EXACTLY the same output as MS Word "Compare Documents".
+        """
+        return self._run_libreoffice_compare(baseline_docx, revised_docx)
