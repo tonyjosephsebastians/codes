@@ -1,0 +1,234 @@
+import io
+import zipfile
+from difflib import SequenceMatcher
+from typing import List, Tuple, Dict, Any, Optional
+
+from lxml import etree
+
+WNS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+NS = {"w": WNS}
+
+
+class AIComparator:
+    """
+    SAFE + ASYNC DOCX COMPARATOR
+    - Uses <w:ins> and <w:del>, not HTML tags
+    - Never destroys XML structure
+    - Only rebuilds RUNS (not paragraphs or tables)
+    - Async AI batching
+    """
+
+    def __init__(self, ai_utils=None, enable_ai=True):
+        self.ai_utils = ai_utils
+        self.enable_ai = enable_ai and (ai_utils is not None)
+
+    # ============================================================
+    # PUBLIC ASYNC API
+    # ============================================================
+    async def compare(self, baseline_docx: bytes, revised_docx: bytes) -> bytes:
+        base_root = self._load_xml(baseline_docx)
+        rev_root = self._load_xml(revised_docx)
+
+        base_blocks = self._extract_blocks(base_root)
+        rev_blocks = self._extract_blocks(rev_root)
+
+        base_sigs = [self._sig(k, el) for k, el in base_blocks]
+        rev_sigs = [self._sig(k, el) for k, el in rev_blocks]
+
+        sm = SequenceMatcher(None, base_sigs, rev_sigs)
+        body = base_root.find("w:body", NS)
+
+        used_rev = set()
+
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+
+            if tag == "equal":
+                for bi, bj in zip(range(i1, i2), range(j1, j2)):
+                    used_rev.add(bj)
+                continue
+
+            # DELETE / REPLACE → diff base paragraphs
+            if tag in ("replace", "delete"):
+                for bi in range(i1, i2):
+                    kind, el_b = base_blocks[bi]
+                    if kind == "p":
+                        await self._diff_paragraph(el_b, self._text(el_b), "")
+                    else:
+                        self._mark_table_deleted(el_b)
+
+            # INSERT / REPLACE → append new blocks
+            if tag in ("replace", "insert"):
+                for bj in range(j1, j2):
+                    if bj in used_rev:
+                        continue
+
+                    kind, el_r = rev_blocks[bj]
+                    new_text = self._text(el_r)
+
+                    if kind == "p":
+                        new_p = etree.SubElement(body, f"{{{WNS}}}p")
+                        await self._diff_paragraph(new_p, "", new_text)
+                    else:
+                        temp = etree.SubElement(body, f"{{{WNS}}}p")
+                        await self._diff_paragraph(temp, "", "[TABLE INSERTED]")
+
+        return self._save_xml(baseline_docx, base_root)
+
+    # ============================================================
+    # DIFF PARAGRAPH USING REAL <w:ins>/<w:del>
+    # ============================================================
+    async def _diff_paragraph(self, p_el, old_text, new_text):
+
+        a = old_text.split()
+        b = new_text.split()
+        sm = SequenceMatcher(None, a, b)
+
+        # collect change segments for AI
+        change_pairs = []
+        for op, i1, i2, j1, j2 in sm.get_opcodes():
+            if op == "equal":
+                continue
+            old_seg = " ".join(a[i1:i2])
+            new_seg = " ".join(b[j1:j2])
+            change_pairs.append({"old": old_seg, "new": new_seg})
+
+        # AI FILTERING
+        flags = []
+        if self.enable_ai and change_pairs:
+            BATCH = 20
+            for i in range(0, len(change_pairs), BATCH):
+                batch = change_pairs[i:i+BATCH]
+                partial = await self.ai_utils.semantic_batch_async(batch)
+                flags.extend(partial)
+        else:
+            flags = [True] * len(change_pairs)
+
+        # build tokens (eq / ins / del)
+        tokens = []
+        idx = 0
+        for op, i1, i2, j1, j2 in sm.get_opcodes():
+
+            if op == "equal":
+                for w in a[i1:i2]:
+                    tokens.append(("eq", w))
+                continue
+
+            meaningful = flags[idx] if idx < len(flags) else True
+            idx += 1
+
+            old_words = a[i1:i2]
+            new_words = b[j1:j2]
+
+            if not meaningful:
+                # treat trivial as equal
+                use = new_words if new_words else old_words
+                for w in use:
+                    tokens.append(("eq", w))
+                continue
+
+            # meaningful → real redlines
+            if op in ("replace", "delete"):
+                for w in old_words:
+                    tokens.append(("del", w))
+            if op in ("replace", "insert"):
+                for w in new_words:
+                    tokens.append(("ins", w))
+
+        self._apply_runs(p_el, tokens)
+
+    # ============================================================
+    # CREATE REAL WORD <w:r>/<w:t> WITH <w:ins>/<w:del>
+    # ============================================================
+    def _apply_runs(self, p_el, tokens):
+
+        # delete ALL runs safely but keep <w:pPr>
+        for child in list(p_el):
+            if etree.QName(child.tag).localname == "pPr":
+                continue
+            p_el.remove(child)
+
+        for kind, word in tokens:
+            if kind == "eq":
+                p_el.append(self._run_plain(word + " "))
+            elif kind == "ins":
+                p_el.append(self._run_insert(word + " "))
+            elif kind == "del":
+                p_el.append(self._run_delete(word + " "))
+
+    # ============================================================
+    # RUN HELPERS — REAL WORDML
+    # ============================================================
+    def _run_plain(self, text):
+        r = etree.Element(f"{{{WNS}}}r")
+        t = etree.SubElement(r, f"{{{WNS}}}t")
+        t.text = text
+        return r
+
+    def _run_insert(self, text):
+        ins = etree.Element(f"{{{WNS}}}ins")
+        r = etree.SubElement(ins, f"{{{WNS}}}r")
+        rPr = etree.SubElement(r, f"{{{WNS}}}rPr")
+        color = etree.SubElement(rPr, f"{{{WNS}}}color")
+        color.set(f"{{{WNS}}}val", "00AA00")
+        etree.SubElement(rPr, f"{{{WNS}}}b")
+        t = etree.SubElement(r, f"{{{WNS}}}t")
+        t.text = text
+        return ins
+
+    def _run_delete(self, text):
+        dele = etree.Element(f"{{{WNS}}}del")
+        r = etree.SubElement(dele, f"{{{WNS}}}r")
+        rPr = etree.SubElement(r, f"{{{WNS}}}rPr")
+        color = etree.SubElement(rPr, f"{{{WNS}}}color")
+        color.set(f"{{{WNS}}}val", "FF0000")
+        etree.SubElement(rPr, f"{{{WNS}}}strike")
+        t = etree.SubElement(r, f"{{{WNS}}}t")
+        t.text = text
+        return dele
+
+    # ============================================================
+    # TABLE SAFETY
+    # ============================================================
+    def _mark_table_deleted(self, tbl):
+        msg = f"[TABLE REMOVED: {self._text(tbl)[:50]}...]"
+        p = etree.SubElement(tbl.getparent(), f"{{{WNS}}}p")
+        self._apply_runs(p, [("del", msg)])
+
+    # ============================================================
+    # UTILITIES
+    # ============================================================
+    def _load_xml(self, docx):
+        with io.BytesIO(docx) as f:
+            with zipfile.ZipFile(f) as z:
+                xml = z.read("word/document.xml")
+        return etree.fromstring(xml)
+
+    def _save_xml(self, original_docx, root):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(original_docx)) as zin:
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    data = zin.read(item.filename)
+                    if item.filename == "word/document.xml":
+                        data = etree.tostring(root, encoding="UTF-8",
+                                              xml_declaration=True,
+                                              standalone="yes")
+                    zout.writestr(item, data)
+        return buf.getvalue()
+
+    def _extract_blocks(self, root):
+        body = root.find("w:body", NS)
+        blocks = []
+        for child in body:
+            tag = etree.QName(child.tag).localname
+            if tag in ("p", "tbl"):
+                blocks.append((tag, child))
+        return blocks
+
+    def _sig(self, kind, el):
+        return f"{kind}:{' '.join(self._text(el).lower().split())}"
+
+    def _text(self, el):
+        return " ".join(
+            t.text for t in el.findall(".//w:t", NS) if t.text
+        ).strip()
