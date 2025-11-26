@@ -1,0 +1,99 @@
+def _is_semantic_change(self, old: str, new: str) -> bool:
+    # normalize whitespace
+    old_clean = " ".join(old.split())
+    new_clean = " ".join(new.split())
+
+    # identical after whitespace normalization → no change
+    if old_clean == new_clean:
+        return False
+
+    # ignore capitalization differences
+    if old_clean.lower() == new_clean.lower():
+        return False
+
+    # ignore punctuation/quote-only changes
+    strip_punct = lambda s: ''.join(c for c in s.lower() if c.isalnum() or c.isspace())
+    if strip_punct(old_clean) == strip_punct(new_clean):
+        return False
+
+    # ignore "means" vs "means:" vs "means -" trivial changes
+    trivial_ending = [":", "-", "–", "—"]
+    if old_clean.rstrip("".join(trivial_ending)) == new_clean.rstrip("".join(trivial_ending)):
+        return False
+
+    # ignore changes only in stopwords (legal irrelevant)
+    stopwords = {"the", "a", "an", "any", "to", "of", "in", "on", "and", "or"}
+    old_tokens = [w for w in old_clean.lower().split() if w not in stopwords]
+    new_tokens = [w for w in new_clean.lower().split() if w not in stopwords]
+
+    if old_tokens == new_tokens:
+        return False
+
+    # If highly different → meaningful (no AI needed)
+    similarity = SequenceMatcher(None, old_clean.lower(), new_clean.lower()).ratio()
+    if similarity < 0.80:
+        return True
+
+    # If AI not set → fallback: treat as meaningful
+    if not self.enable_ai:
+        return True
+
+    # Delegate to AI
+    try:
+        return self.ai_utils.judge_semantic_change(old_clean, new_clean)
+    except Exception:
+        return True
+
+
+
+def judge_semantic_change(self, old: str, new: str) -> bool:
+    """
+    Legal-aware semantic difference checker.
+    Returns True if the change affects legal meaning.
+    """
+
+    prompt = f"""
+You are a senior legal counsel specializing in NDAs.
+
+Your task: decide whether the change from OLD to NEW changes legal meaning.
+
+Ignore these:
+- punctuation
+- quotes
+- capitalization
+- stop words (any, the, a, an, to, of, in)
+- reordering without meaning change
+- formatting or style corrections
+- “means” vs “means:” vs “means -”
+- grammatical rewording with identical legal effect
+
+Mark as MEANINGFUL only if the change affects:
+- obligations
+- rights
+- definitions
+- responsibilities
+- liabilities
+- indemnity
+- confidentiality scope
+- exclusions/exceptions
+- entity names (TD, Supplier, Affiliates)
+- included/excluded personnel
+
+Respond ONLY with "yes" or "no".
+
+OLD: {old}
+NEW: {new}
+"""
+
+    response = self.client.chat.completions.create(
+        model=self.deployment_name,
+        messages=[
+            {"role": "system", "content": "Respond only yes or no."},
+            {"role": "user", "content": prompt},
+        ],
+        max_tokens=2,
+        temperature=0,
+    )
+
+    ans = response.choices[0].message.content.strip().lower()
+    return ans.startswith("y")
