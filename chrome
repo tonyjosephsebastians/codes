@@ -1,0 +1,18 @@
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+
+options = Options()
+
+# Use corporate Chrome install
+options.binary_location = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+
+# SAFE MODERN FLAGS (No security triggers)
+options.add_argument("--start-maximized")
+options.add_argument("--disable-notifications")
+options.add_argument("--disable-infobars")
+options.add_argument("--disable-extensions")
+
+service = Service()   # default service (no custom flags)
+
+driver = webdriver.Chrome(service=service, options=options)
