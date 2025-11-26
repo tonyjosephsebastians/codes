@@ -1,0 +1,95 @@
+def semantic_batch(self, changes: List[Dict[str, str]]) -> List[bool]:
+    """
+    Robust AI batch evaluator for contract diffs.
+    Always returns list[bool] same length as 'changes'.
+    Never crashes on Azure errors or invalid JSON.
+    """
+
+    # If empty input, return empty
+    if not changes:
+        return []
+
+    # Safety trim to reduce token usage
+    MAX_CHARS = 800
+    safe_changes = []
+    for ch in changes:
+        old = (ch.get("old") or "")[:MAX_CHARS]
+        new = (ch.get("new") or "")[:MAX_CHARS]
+        safe_changes.append({"old": old, "new": new})
+
+    # Instruction given to model
+    prompt_payload = {
+        "instruction": (
+            "You are analyzing contract redlines. For each OLD/NEW pair, "
+            "decide if the change is LEGALLY meaningful.\n"
+            "Meaningful = changes obligations, rights, liabilities, scope, parties, definitions.\n"
+            "Trivial = spacing, punctuation, capitalization, formatting, stylistic rewording.\n"
+            "Return ONLY JSON: {\"results\": [true/false,...]} with EXACT length."
+        ),
+        "items": safe_changes,
+    }
+
+    try:
+        # -------- CALL AZURE OPENAI -------- #
+        response = self.client.chat.completions.create(
+            model=self.deployment_name,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Return only JSON. No explanations."
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(prompt_payload)
+                }
+            ],
+            temperature=0.0,
+            max_tokens=1024,
+            response_format={"type": "json_object"},
+        )
+
+        # --- SAFE EXTRACT CONTENT ---
+        msg = None
+        try:
+            msg = response.choices[0].message.content
+        except:
+            msg = None
+
+        # If Azure returned nothing → fallback to meaningful=True
+        if not msg:
+            return [True] * len(changes)
+
+        # --- SAFE JSON PARSE ---
+        try:
+            data = json.loads(msg)
+        except Exception as e:
+            print("JSON parse error:", e)
+            print("Raw content:", msg)
+            return [True] * len(changes)
+
+        results = data.get("results", [])
+
+        # --- VALIDATION ---
+        if not isinstance(results, list):
+            return [True] * len(changes)
+
+        # Coerce each item into boolean
+        final = []
+        for item in results:
+            if isinstance(item, bool):
+                final.append(item)
+            else:
+                final.append(True)
+
+        # --- LENGTH FIX ---
+        if len(final) < len(changes):
+            final.extend([True] * (len(changes) - len(final)))
+        elif len(final) > len(changes):
+            final = final[:len(changes)]
+
+        return final
+
+    except Exception as e:
+        print("semantic_batch failed:", e)
+        # On ANY failure → treat all changes as meaningful
+        return [True] * len(changes)
