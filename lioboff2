@@ -1,0 +1,457 @@
+# app/utils/ai_comparator.py
+
+import os
+import io
+import shutil
+import tempfile
+import subprocess
+import zipfile
+from difflib import SequenceMatcher
+from typing import List, Tuple
+
+from lxml import etree
+
+
+WNS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+NS = {"w": WNS}
+
+
+class AIComparator:
+    """
+    Advanced DOCX comparator with LibreOffice normalization.
+
+    - Step 1: Normalize both DOCX files through LibreOffice (headless)
+              so numbering, lists, tables, etc. have stable XML structure.
+    - Step 2: Run a fast, Word-like diff in Python:
+        * Green bold for insertions
+        * Red strikethrough for deletions
+        * Paragraph & table-aware
+    - Output is a DOCX that docx-preview can render (using <w:r> + rPr).
+    """
+
+    # ---------------------- INIT / LIBREOFFICE ---------------------- #
+    def __init__(self):
+        # Locate LibreOffice "soffice" binary
+        self.soffice_path = shutil.which("soffice")
+        if not self.soffice_path:
+            raise RuntimeError("LibreOffice (soffice) not found in PATH!")
+
+        # Re-usable headless profile in RAM (avoids user-install issues)
+        self.profile_dir = "/dev/shm/lo_profile"
+        os.makedirs(self.profile_dir, exist_ok=True)
+
+    def _normalize_docx_with_lo(self, docx_bytes: bytes) -> bytes:
+        """
+        Run LibreOffice in headless mode to re-save the DOCX.
+        This flattens / normalizes numbering, lists, tables, etc.
+
+        If LibreOffice fails for any reason, we gracefully fall back to
+        the original bytes so comparison still works.
+        """
+        workdir = tempfile.mkdtemp(prefix="lo_norm_", dir="/dev/shm")
+        try:
+            in_path = os.path.join(workdir, "input.docx")
+            out_dir = workdir
+
+            with open(in_path, "wb") as f:
+                f.write(docx_bytes)
+
+            cmd = [
+                self.soffice_path,
+                "--headless",
+                "--nologo",
+                "--nodefault",
+                "--nolockcheck",
+                "--norestore",
+                f"-env:UserInstallation=file://{self.profile_dir}",
+                "--convert-to",
+                "docx",
+                "--outdir",
+                out_dir,
+                in_path,
+            ]
+
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=90,
+            )
+
+            if proc.returncode != 0:
+                # Fallback: use original bytes if LO fails
+                return docx_bytes
+
+            # Find the converted DOCX (usually input.docx, but safer to search)
+            candidates = [
+                os.path.join(out_dir, f)
+                for f in os.listdir(out_dir)
+                if f.lower().endswith(".docx")
+            ]
+            if not candidates:
+                return docx_bytes
+
+            out_path = max(candidates, key=lambda p: os.path.getmtime(p))
+
+            with open(out_path, "rb") as f:
+                return f.read()
+
+        except Exception:
+            # Hard fallback: return original
+            return docx_bytes
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    # ---------------------- PUBLIC API ---------------------- #
+    def compare(self, baseline_docx: bytes, revised_docx: bytes) -> bytes:
+        """
+        Main entry point.
+
+        baseline_docx: original DOCX bytes
+        revised_docx : modified DOCX bytes
+
+        Returns: new DOCX bytes with inline colored changes.
+        """
+
+        # 1) Normalize both documents via LibreOffice
+        baseline_norm = self._normalize_docx_with_lo(baseline_docx)
+        revised_norm = self._normalize_docx_with_lo(revised_docx)
+
+        # 2) Run our fast XML diff on the normalized docs
+        base_root = self._load_document_xml(baseline_norm)
+        rev_root = self._load_document_xml(revised_norm)
+
+        base_blocks = self._extract_blocks(base_root)
+        rev_blocks = self._extract_blocks(rev_root)
+
+        base_sigs = [self._block_signature(kind, el) for kind, el in base_blocks]
+        rev_sigs = [self._block_signature(kind, el) for kind, el in rev_blocks]
+
+        sm = SequenceMatcher(None, base_sigs, rev_sigs)
+        body = base_root.find("w:body", NS)
+
+        used_rev_indices = set()
+
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == "equal":
+                # Blocks that are structurally & textually equivalent — leave as-is
+                for bi, bj in zip(range(i1, i2), range(j1, j2)):
+                    used_rev_indices.add(bj)
+
+            elif tag == "replace":
+                span = min(i2 - i1, j2 - j1)
+
+                # overlapping portion: diff pairwise
+                for k in range(span):
+                    bi = i1 + k
+                    bj = j1 + k
+                    kind_b, el_b = base_blocks[bi]
+                    kind_r, el_r = rev_blocks[bj]
+                    used_rev_indices.add(bj)
+                    self._diff_block_pair(kind_b, el_b, kind_r, el_r)
+
+                # base-only = deletions
+                for bi in range(i1 + span, i2):
+                    kind_b, el_b = base_blocks[bi]
+                    self._mark_block_deleted(kind_b, el_b)
+
+                # rev-only = insertions
+                for bj in range(j1 + span, j2):
+                    if bj in used_rev_indices:
+                        continue
+                    kind_r, el_r = rev_blocks[bj]
+                    self._append_inserted_block(body, kind_r, el_r)
+
+            elif tag == "delete":
+                for bi in range(i1, i2):
+                    kind_b, el_b = base_blocks[bi]
+                    self._mark_block_deleted(kind_b, el_b)
+
+            elif tag == "insert":
+                for bj in range(j1, j2):
+                    kind_r, el_r = rev_blocks[bj]
+                    self._append_inserted_block(body, kind_r, el_r)
+
+        # 3) Save modified baseline as final diff
+        return self._save_document_xml(baseline_norm, base_root)
+
+    # ---------------------- DOCX UTILITIES ---------------------- #
+    def _load_document_xml(self, docx_bytes: bytes) -> etree._Element:
+        with io.BytesIO(docx_bytes) as f:
+            with zipfile.ZipFile(f) as z:
+                xml_bytes = z.read("word/document.xml")
+        return etree.fromstring(xml_bytes)
+
+    def _save_document_xml(self, original_docx: bytes, new_root: etree._Element) -> bytes:
+        out_buf = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(original_docx)) as zin:
+            with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    data = zin.read(item.filename)
+                    if item.filename == "word/document.xml":
+                        data = etree.tostring(
+                            new_root,
+                            xml_declaration=True,
+                            encoding="UTF-8",
+                            standalone="yes",
+                        )
+                    zout.writestr(item, data)
+        return out_buf.getvalue()
+
+    def _extract_blocks(self, root: etree._Element) -> List[Tuple[str, etree._Element]]:
+        body = root.find("w:body", NS)
+        blocks: List[Tuple[str, etree._Element]] = []
+        if body is None:
+            return blocks
+
+        for child in body:
+            tag = etree.QName(child.tag).localname
+            if tag == "p":
+                blocks.append(("p", child))
+            elif tag == "tbl":
+                blocks.append(("tbl", child))
+        return blocks
+
+    def _get_text(self, el: etree._Element) -> str:
+        return " ".join(
+            t.text for t in el.findall(".//w:t", NS) if t.text
+        ).strip()
+
+    def _block_signature(self, kind: str, el: etree._Element) -> str:
+        raw = self._get_text(el)
+        norm = " ".join(raw.lower().split())
+        return f"{kind}:{norm}"
+
+    # ---------------------- WORD-LEVEL DIFF ---------------------- #
+    def _diff_words(self, old: str, new: str):
+        """
+        Word-level diff via SequenceMatcher.
+
+        To avoid giant DOMs and frontend stack overflows, if a paragraph
+        becomes too huge, we fallback to "treat whole para as changed".
+        """
+        old_norm = " ".join(old.split())
+        new_norm = " ".join(new.split())
+
+        # If para text is actually identical when normalized → no diff
+        if old_norm == new_norm:
+            return [("eq", old)]
+
+        a = old.split()
+        b = new.split()
+
+        # If extremely long, skip fine-grained diff to protect browser
+        if len(a) + len(b) > 2000:
+            return [("del", old), ("ins", new)]
+
+        sm = SequenceMatcher(None, a, b)
+        out = []
+        for op, i1, i2, j1, j2 in sm.get_opcodes():
+            if op == "equal":
+                out.append(("eq", " ".join(a[i1:i2])))
+            elif op == "delete":
+                out.append(("del", " ".join(a[i1:i2])))
+            elif op == "insert":
+                out.append(("ins", " ".join(b[j1:j2])))
+            elif op == "replace":
+                out.append(("del", " ".join(a[i1:i2])))
+                out.append(("ins", " ".join(b[j1:j2])))
+        return out
+
+    # ---------------------- RUN BUILDERS ---------------------- #
+    def _run_plain(self, text: str) -> etree._Element:
+        r = etree.Element(f"{{{WNS}}}r")
+        t = etree.SubElement(r, f"{{{WNS}}}t")
+        t.text = text + " "
+        return r
+
+    def _run_insert(self, text: str) -> etree._Element:
+        r = etree.Element(f"{{{WNS}}}r")
+        rPr = etree.SubElement(r, f"{{{WNS}}}rPr")
+        color = etree.SubElement(rPr, f"{{{WNS}}}color")
+        color.set(f"{{{WNS}}}val", "00AA00")  # green
+        etree.SubElement(rPr, f"{{{WNS}}}b")
+        t = etree.SubElement(r, f"{{{WNS}}}t")
+        t.text = text + " "
+        return r
+
+    def _run_delete(self, text: str) -> etree._Element:
+        r = etree.Element(f"{{{WNS}}}r")
+        rPr = etree.SubElement(r, f"{{{WNS}}}rPr")
+        color = etree.SubElement(rPr, f"{{{WNS}}}color")
+        color.set(f"{{{WNS}}}val", "FF0000")  # red
+        etree.SubElement(rPr, f"{{{WNS}}}strike")
+        t = etree.SubElement(r, f"{{{WNS}}}t")
+        t.text = text + " "
+        return r
+
+    # ---------------------- PARAGRAPH DIFF ---------------------- #
+    def _clear_para_runs(self, p_el: etree._Element):
+        """
+        Remove only run-like children (r, ins, del) and keep pPr, numPr, etc.
+        This preserves numbering, indentation, styles, etc.
+        """
+        for child in list(p_el):
+            tag = etree.QName(child.tag).localname
+            if tag in ("r", "ins", "del"):
+                p_el.remove(child)
+
+    def _apply_paragraph_diff(self, p_el: etree._Element, old_text: str, new_text: str):
+        old_norm = " ".join((old_text or "").split())
+        new_norm = " ".join((new_text or "").split())
+
+        # If paragraph text is effectively unchanged, keep original formatting
+        if old_norm == new_norm:
+            return
+
+        self._clear_para_runs(p_el)
+
+        for kind, chunk in self._diff_words(old_text, new_text):
+            if not chunk:
+                continue
+            if kind == "eq":
+                p_el.append(self._run_plain(chunk))
+            elif kind == "ins":
+                p_el.append(self._run_insert(chunk))
+            elif kind == "del":
+                p_el.append(self._run_delete(chunk))
+
+    # ---------------------- TABLE DIFF ---------------------- #
+    def _apply_table_diff(self, base_tbl: etree._Element, rev_tbl: etree._Element):
+        """
+        Row- & cell-aware table diff that preserves table layout.
+        """
+        base_rows = base_tbl.findall("w:tr", NS)
+        rev_rows = rev_tbl.findall("w:tr", NS)
+
+        max_rows = max(len(base_rows), len(rev_rows))
+
+        for i in range(max_rows):
+            base_row = base_rows[i] if i < len(base_rows) else None
+            rev_row = rev_rows[i] if i < len(rev_rows) else None
+
+            if base_row is not None and rev_row is None:
+                self._mark_row_deleted(base_row)
+                continue
+
+            if base_row is None and rev_row is not None:
+                self._append_table_row_insert(base_tbl, rev_row)
+                continue
+
+            base_cells = base_row.findall("w:tc", NS)
+            rev_cells = rev_row.findall("w:tc", NS)
+
+            max_cols = max(len(base_cells), len(rev_cells))
+
+            for c in range(max_cols):
+                base_cell = base_cells[c] if c < len(base_cells) else None
+                rev_cell = rev_cells[c] if c < len(rev_cells) else None
+
+                if base_cell is not None and rev_cell is None:
+                    self._mark_cell_deleted(base_cell)
+                    continue
+
+                if base_cell is None and rev_cell is not None:
+                    self._append_table_cell_insert(base_row, rev_cell)
+                    continue
+
+                self._diff_table_cell(base_cell, rev_cell)
+
+    def _mark_row_deleted(self, row: etree._Element):
+        for cell in row.findall("w:tc", NS):
+            self._mark_cell_deleted(cell)
+
+    def _append_table_row_insert(self, base_tbl: etree._Element, rev_row: etree._Element):
+        new_row = etree.SubElement(base_tbl, f"{{{WNS}}}tr")
+        for rev_cell in rev_row.findall("w:tc", NS):
+            self._append_table_cell_insert(new_row, rev_cell)
+
+    def _mark_cell_deleted(self, cell: etree._Element):
+        for p in cell.findall("w:p", NS):
+            txt = self._get_text(p)
+            self._clear_para_runs(p)
+            if txt:
+                p.append(self._run_delete(txt))
+
+    def _append_table_cell_insert(self, base_row: etree._Element, rev_cell: etree._Element):
+        new_cell = etree.SubElement(base_row, f"{{{WNS}}}tc")
+        p = etree.SubElement(new_cell, f"{{{WNS}}}p")
+        txt = self._get_text(rev_cell)
+        if txt:
+            self._apply_paragraph_diff(p, "", txt)
+
+    def _diff_table_cell(self, base_cell: etree._Element, rev_cell: etree._Element):
+        base_paras = base_cell.findall("w:p", NS)
+        rev_paras = rev_cell.findall("w:p", NS)
+
+        max_p = max(len(base_paras), len(rev_paras))
+
+        for i in range(max_p):
+            if i < len(base_paras) and i < len(rev_paras):
+                old = self._get_text(base_paras[i])
+                new = self._get_text(rev_paras[i])
+                self._apply_paragraph_diff(base_paras[i], old, new)
+            elif i < len(base_paras):
+                old = self._get_text(base_paras[i])
+                self._apply_paragraph_diff(base_paras[i], old, "")
+            else:
+                new_p = etree.SubElement(base_cell, f"{{{WNS}}}p")
+                txt = self._get_text(rev_paras[i])
+                self._apply_paragraph_diff(new_p, "", txt)
+
+    # ---------------------- BLOCK-LEVEL HELPERS ---------------------- #
+    def _diff_block_pair(
+        self,
+        kind_b: str,
+        el_b: etree._Element,
+        kind_r: str,
+        el_r: etree._Element,
+    ):
+        if kind_b == "p" and kind_r == "p":
+            old = self._get_text(el_b)
+            new = self._get_text(el_r)
+            self._apply_paragraph_diff(el_b, old, new)
+        elif kind_b == "tbl" and kind_r == "tbl":
+            self._apply_table_diff(el_b, el_r)
+        else:
+            self._mark_block_deleted(kind_b, el_b)
+
+    def _mark_block_deleted(self, kind: str, el: etree._Element):
+        if kind == "p":
+            text = self._get_text(el)
+            self._apply_paragraph_diff(el, text, "")
+        elif kind == "tbl":
+            for cell in el.findall("w:tc", NS):
+                self._mark_cell_deleted(cell)
+
+    def _append_inserted_block(self, body: etree._Element, kind: str, el_src: etree._Element):
+        txt = self._get_text(el_src)
+        if not txt:
+            return
+
+        if kind == "p":
+            p = etree.SubElement(body, f"{{{WNS}}}p")
+            self._apply_paragraph_diff(p, "", txt)
+        elif kind == "tbl":
+            # Insert an entire new table by cloning structure, then diff against empty
+            new_tbl = etree.SubElement(body, f"{{{WNS}}}tbl")
+            # basic clone of rows/cells structure as "inserted"
+            for row in el_src.findall("w:tr", NS):
+                new_row = etree.SubElement(new_tbl, f"{{{WNS}}}tr")
+                for cell in row.findall("w:tc", NS):
+                    new_cell = etree.SubElement(new_row, f"{{{WNS}}}tc")
+                    p = etree.SubElement(new_cell, f"{{{WNS}}}p")
+                    cell_txt = self._get_text(cell)
+                    self._apply_paragraph_diff(p, "", cell_txt)
+
+    def _handle_block_replace(
+        self,
+        body: etree._Element,
+        kind_b: str,
+        el_b: etree._Element,
+        kind_r: str,
+        el_r: etree._Element,
+    ):
+        self._mark_block_deleted(kind_b, el_b)
+        self._append_inserted_block(body, kind_r, el_r)
