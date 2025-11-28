@@ -1,0 +1,181 @@
+import { useEffect, useMemo, useState } from "react";
+import { useNavigate } from "react-router-dom";
+import html2canvas from "html2canvas";
+import jsPDF from "jspdf";
+import * as XLSX from "xlsx";
+
+type Risk = "High" | "Medium" | "Low";
+
+type Row = {
+  user: string;
+  project: string;
+  score: number;
+  risk: Risk;
+};
+
+const MOCK_DATA: Row[] = [
+  { user: "TAE7758", project: "NDA Review", score: 7.6, risk: "High" },
+  { user: "TAE7758", project: "Vendor Test", score: 1.2, risk: "Low" },
+  { user: "TAE9911", project: "Cresta NDA", score: 4.2, risk: "Medium" },
+  { user: "TAE1089", project: "Security Review", score: 8.9, risk: "High" },
+  { user: "TAE0011", project: "Internal NDA", score: 0.5, risk: "Low" },
+];
+
+export default function InsightsDashboard() {
+  const navigate = useNavigate();
+
+  const [selectedUser, setSelectedUser] = useState("All");
+  const [data, setData] = useState<Row[]>(MOCK_DATA);
+
+  // auto refresh every 30s
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setData([...MOCK_DATA]); // later replace with API
+      console.log("Insights auto refreshed");
+    }, 30000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const users = [...new Set(MOCK_DATA.map(x => x.user))];
+
+  const filtered = useMemo(() => {
+    return selectedUser === "All"
+      ? data
+      : data.filter(x => x.user === selectedUser);
+  }, [selectedUser, data]);
+
+  const count = (r: Risk) => filtered.filter(x => x.risk === r).length;
+
+  const exportPDF = async () => {
+    const el = document.getElementById("dashboard");
+    if (!el) return;
+    const canvas = await html2canvas(el);
+    const img = canvas.toDataURL("image/png");
+    const pdf = new jsPDF("landscape");
+    pdf.addImage(img, "PNG", 10, 10, 270, 150);
+    pdf.save("TD-ContractBuddy-Insights.pdf");
+  };
+
+  const exportExcel = () => {
+    const sheet = XLSX.utils.json_to_sheet(filtered);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, sheet, "Insights");
+    XLSX.writeFile(wb, "TD-Insights.xlsx");
+  };
+
+  const badge = (risk: Risk) => {
+    if (risk === "High") return "bg-red-600";
+    if (risk === "Medium") return "bg-amber-500";
+    return "bg-green-600";
+  };
+
+  const heat = (risk: Risk) => {
+    if (risk === "High") return "bg-red-100";
+    if (risk === "Medium") return "bg-amber-100";
+    return "bg-green-100";
+  };
+
+  return (
+    <div className="p-6 bg-gray-50 min-h-screen" id="dashboard">
+
+      {/* Header */}
+      <div className="flex justify-between mb-4">
+        <h1 className="text-xl font-bold text-green-900">
+          TD ContractBuddy — Insights
+        </h1>
+
+        <div className="flex gap-2">
+          <select
+            value={selectedUser}
+            onChange={e => setSelectedUser(e.target.value)}
+            className="border rounded px-2 py-1"
+          >
+            <option>All</option>
+            {users.map(u => <option key={u}>{u}</option>)}
+          </select>
+
+          <button onClick={exportPDF} className="bg-green-700 text-white px-3 py-1 rounded">
+            PDF
+          </button>
+
+          <button onClick={exportExcel} className="bg-green-600 text-white px-3 py-1 rounded">
+            Excel
+          </button>
+        </div>
+      </div>
+
+      {/* KPIs */}
+      <div className="grid grid-cols-4 gap-4 mb-5">
+        <KPI title="High Risk" value={count("High")} color="text-red-600"/>
+        <KPI title="Medium Risk" value={count("Medium")} color="text-amber-500"/>
+        <KPI title="Low Risk" value={count("Low")} color="text-green-600"/>
+        <KPI title="Total Projects" value={filtered.length} color="text-gray-800"/>
+      </div>
+
+      {/* Trends */}
+      <div className="bg-white p-4 rounded shadow mb-5">
+        <h2 className="font-semibold mb-2">Risk Trend (Mock)</h2>
+        <div className="flex gap-2">
+          {[3,5,2,6,7].map((v,i)=>(
+            <div key={i} className="bg-green-700 h-24 w-10 text-white text-xs flex items-end justify-center">
+              {v}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Heatmap */}
+      <div className="bg-white rounded shadow p-4 mb-5">
+        <h2 className="font-semibold mb-2">Risk Heatmap</h2>
+        <div className="grid grid-cols-4 gap-2">
+          {filtered.map((r,i)=>(
+            <div key={i} className={`p-3 rounded cursor-pointer ${heat(r.risk)}`}
+              onClick={()=>navigate(`/iterationtracker?user=${r.user}`)}
+            >
+              <div className="text-xs font-medium">{r.user}</div>
+              <div className="text-xs">{r.project}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Drill table */}
+      <table className="w-full bg-white rounded shadow">
+        <thead className="bg-green-700 text-white text-sm">
+          <tr>
+            <th className="p-2">User</th>
+            <th>Project</th>
+            <th>Score</th>
+            <th>Risk</th>
+          </tr>
+        </thead>
+        <tbody>
+          {filtered.map((r,i)=>(
+            <tr key={i} className="border-b cursor-pointer hover:bg-gray-100"
+              onClick={()=>navigate(`/iterationtracker?user=${r.user}`)}
+            >
+              <td className="p-2">{r.user}</td>
+              <td>{r.project}</td>
+              <td>{r.score.toFixed(1)}</td>
+              <td>
+                <span className={`text-white px-2 py-1 rounded ${badge(r.risk)}`}>
+                  {r.risk}
+                </span>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+    </div>
+  );
+}
+
+function KPI({ title, value, color }: {title:string,value:number,color:string}) {
+  return (
+    <div className="bg-white p-4 rounded shadow">
+      <p className="text-sm">{title}</p>
+      <p className={`text-2xl font-bold ${color}`}>{value}</p>
+    </div>
+  );
+}
