@@ -1,0 +1,197 @@
+import React, { useMemo, useState, useRef } from "react";
+import {
+  Chart as ChartJS,
+  ArcElement,
+  Tooltip,
+  Legend,
+  CategoryScale,
+  LinearScale,
+  BarElement,
+  PointElement,
+  LineElement,
+} from "chart.js";
+
+import { Pie, Bar } from "react-chartjs-2";
+import html2canvas from "html2canvas";
+import jsPDF from "jspdf";
+import * as XLSX from "xlsx";
+
+ChartJS.register(
+  ArcElement,
+  Tooltip,
+  Legend,
+  CategoryScale,
+  LinearScale,
+  BarElement,
+  PointElement,
+  LineElement
+);
+
+// ---------------- MOCK DATABASE -----------------
+const DATA = [
+  { user: "TAE7758", date: "2024-11-27", name: "NDA Cresta", risk: "High", score: 7.69, clauses: 22 },
+  { user: "USR2001", date: "2024-11-26", name: "NDA Vendor A", risk: "Medium", score: 3.2, clauses: 18 },
+  { user: "USR2001", date: "2024-11-21", name: "NDA Vendor B", risk: "Low", score: 0.8, clauses: 14 },
+  { user: "USR4000", date: "2024-11-18", name: "NDA Partner X", risk: "High", score: 6.1, clauses: 26 },
+  { user: "USR4000", date: "2024-11-15", name: "NDA Partner Y", risk: "Medium", score: 2.5, clauses: 17 },
+];
+
+const COLORS = {
+  High: "#dc2626",
+  Medium: "#f59e0b",
+  Low: "#10b981"
+};
+
+
+// ---------------- PAGE -----------------
+export default function InsightsDashboard() {
+  const ref = useRef<HTMLDivElement>(null);
+  const [userFilter, setUserFilter] = useState("");
+  const [dateFilter, setDateFilter] = useState("");
+
+  const filtered = DATA.filter(d =>
+    (!userFilter || d.user === userFilter) &&
+    (!dateFilter || d.date === dateFilter)
+  );
+
+  const stats = useMemo(() => {
+    const high = filtered.filter(f => f.risk === "High").length;
+    const medium = filtered.filter(f => f.risk === "Medium").length;
+    const low = filtered.filter(f => f.risk === "Low").length;
+    const users = new Set(filtered.map(d => d.user)).size;
+
+    return { high, medium, low, total: filtered.length, users };
+  }, [filtered]);
+
+  const pieData = {
+    labels: ["High", "Medium", "Low"],
+    datasets: [{
+      data: [stats.high, stats.medium, stats.low],
+      backgroundColor: [COLORS.High, COLORS.Medium, COLORS.Low]
+    }]
+  };
+
+  const userChart = {
+    labels: [...new Set(filtered.map(d => d.user))],
+    datasets: [{
+      label: "Contracts",
+      data: [...new Set(filtered.map(d => d.user))].map(
+        u => filtered.filter(f => f.user === u).length
+      ),
+      backgroundColor: "#16a34a"
+    }]
+  };
+
+  const exportExcel = () => {
+    const ws = XLSX.utils.json_to_sheet(filtered);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Insights");
+    XLSX.writeFile(wb, "nda-insights.xlsx");
+  };
+
+  const exportPDF = async () => {
+    const canvas = await html2canvas(ref.current!);
+    const img = canvas.toDataURL("image/png");
+    const pdf = new jsPDF("landscape","pt","a4");
+    pdf.addImage(img, "PNG", 20, 20, 800, 500);
+    pdf.save("nda-dashboard.pdf");
+  };
+
+  return (
+    <div ref={ref} className="p-5 bg-gray-50 min-h-screen">
+
+      <div className="flex justify-between mb-4">
+        <h1 className="text-lg font-bold text-emerald-700">
+          TD ContractBuddy – NDA Risk Insights
+        </h1>
+        <div className="flex gap-2">
+          <button onClick={exportExcel} className="btn">Excel</button>
+          <button onClick={exportPDF} className="btn">PDF</button>
+        </div>
+      </div>
+
+      {/* FILTERS */}
+      <div className="flex gap-4 mb-4">
+        <select className="input" onChange={e=>setUserFilter(e.target.value)}>
+          <option value="">All Users</option>
+          {[...new Set(DATA.map(d=>d.user))].map(u=><option key={u}>{u}</option>)}
+        </select>
+
+        <select className="input" onChange={e=>setDateFilter(e.target.value)}>
+          <option value="">All Dates</option>
+          {[...new Set(DATA.map(d=>d.date))].map(d=><option key={d}>{d}</option>)}
+        </select>
+      </div>
+
+      {/* CARDS */}
+      <div className="grid grid-cols-5 gap-3 mb-4">
+        <Card title="NDAs" value={stats.total}/>
+        <Card title="High" value={stats.high} color="text-red-600"/>
+        <Card title="Medium" value={stats.medium} color="text-orange-500"/>
+        <Card title="Low" value={stats.low} color="text-green-600"/>
+        <Card title="Users" value={stats.users}/>
+      </div>
+
+      {/* CHARTS */}
+      <div className="grid grid-cols-3 gap-4 mb-4">
+        <Box title="Risk Distribution">
+          <Pie data={pieData}/>
+        </Box>
+
+        <Box title="User Contract Load">
+          <Bar data={userChart}/>
+        </Box>
+
+        <Box title="Top Risk NDAs">
+          {filtered
+            .sort((a,b)=>b.score-a.score)
+            .slice(0,5)
+            .map(e=>(
+              <div key={e.name} className="flex justify-between text-sm">
+                {e.name}
+                <span className="text-red-600 font-bold">{e.score}</span>
+              </div>
+            ))}
+        </Box>
+      </div>
+
+      {/* ITERATION TRACKER TABLE */}
+      <Box title="Iteration Tracker (Live Insight Table)">
+        <table className="w-full text-xs border">
+          <thead className="bg-gray-100">
+            <tr>
+              <th>User</th><th>Date</th><th>NDA</th><th>Score</th><th>Risk</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map((d,i)=>(
+              <tr key={i} className="border-b">
+                <td>{d.user}</td>
+                <td>{d.date}</td>
+                <td>{d.name}</td>
+                <td>{d.score}</td>
+                <td style={{color:COLORS[d.risk]}}>{d.risk}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </Box>
+
+    </div>
+  );
+}
+
+// -------- COMPONENTS --------
+const Card = ({title,value,color}:any)=>(
+  <div className="bg-white p-3 rounded shadow">
+    <p className="text-xs text-gray-500">{title}</p>
+    <p className={`text-xl font-bold ${color||""}`}>{value}</p>
+  </div>
+);
+
+const Box = ({title,children}:any)=>(
+  <div className="bg-white p-3 rounded shadow">
+    <h3 className="text-xs font-bold mb-2">{title}</h3>
+    {children}
+  </div>
+);
