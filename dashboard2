@@ -1,0 +1,193 @@
+IterationTracker.tsx (or IterationTrackerDashboard.tsx)
+
+Wrap it with tabs:
+
+import { useState } from "react";
+import IterationTable from "./IterationTable";
+import InsightsDashboard from "../pages/InsightsDashboard";
+
+export default function IterationTrackerDashboard() {
+  const [activeTab, setActiveTab] = useState<"table" | "insights">("table");
+
+  return (
+    <div className="flex flex-col h-full">
+
+      {/* TOP TAB BAR */}
+      <div className="bg-white border-b px-4 py-2 flex gap-3">
+        <button
+          onClick={() => setActiveTab("table")}
+          className={`px-3 py-1 rounded text-sm ${
+            activeTab === "table"
+              ? "bg-emerald-600 text-white"
+              : "bg-gray-100 text-gray-700"
+          }`}
+        >
+          Iterations
+        </button>
+
+        <button
+          onClick={() => setActiveTab("insights")}
+          className={`px-3 py-1 rounded text-sm ${
+            activeTab === "insights"
+              ? "bg-emerald-600 text-white"
+              : "bg-gray-100 text-gray-700"
+          }`}
+        >
+          Insights
+        </button>
+      </div>
+
+      {/* CONTENT */}
+      <div className="flex-1 overflow-auto">
+        {activeTab === "table" && <IterationTable />}
+        {activeTab === "insights" && <InsightsDashboard />}
+      </div>
+
+    </div>
+  );
+}
+
+
+✅ Now Insights becomes part of the tracker itself.
+
+STEP 2 — Add Live Filters to Insights
+
+Open:
+
+📄 InsightsDashboard.tsx
+
+Add filters at the top (below header):
+
+{/* FILTER BAR */}
+<div className="flex gap-3 text-xs mb-4">
+  <select className="border rounded px-2 py-1"
+    onChange={(e) => setYearFilter(e.target.value)}
+  >
+    <option value="All">All Years</option>
+    {yearOptions.map(y => <option key={y}>{y}</option>)}
+  </select>
+
+  <select className="border rounded px-2 py-1"
+    onChange={(e) => setUserFilter(e.target.value)}
+  >
+    <option value="All">All Users</option>
+    {[...new Set(projects.map(p => p.username))].map(u =>
+      <option key={u}>{u}</option>
+    )}
+  </select>
+
+  <select className="border rounded px-2 py-1"
+    onChange={(e) => setRiskFilter(e.target.value)}
+  >
+    <option value="All">All Risk</option>
+    <option value="High">High Risk</option>
+    <option value="Medium">Medium Risk</option>
+    <option value="Low">Low Risk</option>
+  </select>
+</div>
+
+
+Add state:
+
+const [userFilter, setUserFilter] = useState("All");
+const [riskFilter, setRiskFilter] = useState("All");
+
+
+Apply filters:
+
+const filteredProjects = projects.filter(p => {
+  if (yearFilter !== "All" && !p.created_at.startsWith(yearFilter)) return false;
+  if (userFilter !== "All" && p.username !== userFilter) return false;
+
+  if (riskFilter !== "All") {
+    const score = p.total_weighted_score || 0;
+    if (riskFilter === "High" && score <= 3) return false;
+    if (riskFilter === "Medium" && (score <= 1 || score > 3)) return false;
+    if (riskFilter === "Low" && score > 1) return false;
+  }
+  return true;
+});
+
+
+Change all calculations to use:
+
+filteredProjects (instead of projects)
+
+
+✅ Insights now supports filtering without backend change
+
+STEP 3 — Enable PDF Export (Already in code)
+
+You already have:
+
+handleExportPdf()
+
+
+Button:
+
+<button onClick={handleExportPdf}>Export PDF</button>
+
+
+✅ Exports entire dashboard cleanly
+
+STEP 4 — Column Mapping (Important)
+
+Your API fields already align:
+
+Backend Field	Frontend
+project.id	id
+project.username	username
+low_risk_count	riskSummary.lowRiskCount
+total_weighted_score	total_weighted_score
+created_at	created_at
+
+✅ Nothing else required.
+
+STEP 5 — Navigation (Optional if using sidebar)
+
+Add sidebar item:
+
+<NavItem label="Insights" to="/tracker" />
+
+
+So users directly open the tracker.
+
+STEP 6 — OPTIONAL: Downloadable Excel Report
+
+Add CSV export:
+
+const exportCSV = () => {
+  const headers = ["Project","User","Score","High","Medium","Low"];
+  const rows = projects.map(p => [
+    p.name,
+    p.username,
+    p.total_weighted_score,
+    p.riskSummary?.highRiskCount || 0,
+    p.riskSummary?.mediumRiskCount || 0,
+    p.riskSummary?.lowRiskCount || 0
+  ].join(","));
+
+  const csv = [headers.join(","), ...rows].join("\n");
+
+  const blob = new Blob([csv], { type: "text/csv" });
+  const url = window.URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "risk-insights.csv";
+  link.click();
+};
+
+
+Add button:
+
+<button onClick={exportCSV}>Export Excel</button>
+
+✅ Now You Have
+Feature	Status
+Iteration tracker	✅
+Insights tab	✅
+Live API data	✅
+Filters	✅
+PDF export	✅
+Excel export	✅
+PowerBI-style UI	✅
