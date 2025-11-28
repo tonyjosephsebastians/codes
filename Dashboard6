@@ -1,0 +1,640 @@
+// src/pages/InsightsDashboard.tsx (or Insights.tsx)
+import React, { useMemo, useState } from "react";
+import { Link } from "react-router-dom";
+import { BarChart3, FileText, Users, AlertTriangle, RefreshCw } from "lucide-react";
+
+const TD_GREEN = "#007c41";
+
+type RiskLevel = "High" | "Medium" | "Low";
+
+interface ProjectInsight {
+  id: string;
+  user: string;
+  projectName: string;
+  category: string;
+  riskLevel: RiskLevel;
+  totalWeightedScore: number;
+  documentCount: number;
+  createdAt: string; // ISO string
+  updatedAt: string; // ISO string
+}
+
+const MOCK_PROJECTS: ProjectInsight[] = [
+  {
+    id: "1",
+    user: "TAE7758",
+    projectName: "NDA – Cresta rev. 2025.11.17",
+    category: "NDA",
+    riskLevel: "High",
+    totalWeightedScore: 7.69,
+    documentCount: 2,
+    createdAt: "2025-11-28T01:18:19Z",
+    updatedAt: "2025-11-28T01:18:19Z",
+  },
+  {
+    id: "2",
+    user: "TAE7758",
+    projectName: "NDA – Baseline",
+    category: "NDA",
+    riskLevel: "Low",
+    totalWeightedScore: 0.0,
+    documentCount: 2,
+    createdAt: "2025-11-28T01:38:55Z",
+    updatedAt: "2025-11-28T01:38:55Z",
+  },
+  {
+    id: "3",
+    user: "JSM1234",
+    projectName: "Master Services Agreement",
+    category: "MSA",
+    riskLevel: "Medium",
+    totalWeightedScore: 2.8,
+    documentCount: 3,
+    createdAt: "2025-10-10T15:20:00Z",
+    updatedAt: "2025-10-18T12:00:00Z",
+  },
+  {
+    id: "4",
+    user: "LGL9001",
+    projectName: "Data Processing Addendum – Vendor X",
+    category: "DPA",
+    riskLevel: "High",
+    totalWeightedScore: 6.3,
+    documentCount: 2,
+    createdAt: "2025-09-05T09:00:00Z",
+    updatedAt: "2025-09-06T10:00:00Z",
+  },
+  {
+    id: "5",
+    user: "OPS2200",
+    projectName: "Support & Maintenance Agreement",
+    category: "Support",
+    riskLevel: "Low",
+    totalWeightedScore: 0.9,
+    documentCount: 1,
+    createdAt: "2025-08-01T10:15:00Z",
+    updatedAt: "2025-08-03T08:30:00Z",
+  },
+  // add more mock rows later if you want to simulate 1000 docs
+];
+
+const riskColor = (risk: RiskLevel) => {
+  switch (risk) {
+    case "High":
+      return "bg-red-500 text-red-800";
+    case "Medium":
+      return "bg-amber-400 text-amber-800";
+    case "Low":
+      return "bg-emerald-500 text-emerald-900";
+    default:
+      return "bg-gray-300 text-gray-800";
+  }
+};
+
+const riskDotColor = (risk: RiskLevel) => {
+  switch (risk) {
+    case "High":
+      return "bg-red-500";
+    case "Medium":
+      return "bg-amber-400";
+    case "Low":
+      return "bg-emerald-500";
+    default:
+      return "bg-gray-400";
+  }
+};
+
+const formatDate = (iso: string) => {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "–";
+  return d.toLocaleString();
+};
+
+const InsightsDashboard: React.FC = () => {
+  const [userFilter, setUserFilter] = useState<string>("All");
+  const [riskFilter, setRiskFilter] = useState<"All" | RiskLevel>("All");
+  const [periodFilter, setPeriodFilter] = useState<"30d" | "90d" | "365d">("90d");
+
+  // Live refresh placeholder – in future you can attach real API here
+  const handleRefresh = () => {
+    console.log("Refresh clicked – hook this to real API later");
+  };
+
+  // PDF / Excel export placeholders
+  const handleExportPDF = () => {
+    console.log("Export PDF – wire up to real export endpoint later");
+  };
+
+  const handleExportExcel = () => {
+    console.log("Export Excel – wire up to real export endpoint later");
+  };
+
+  // ---- Data shaping (this will scale fine even for 1000 docs) ----
+
+  const uniqueUsers = useMemo(
+    () => Array.from(new Set(MOCK_PROJECTS.map((p) => p.user))),
+    []
+  );
+
+  const filteredProjects = useMemo(() => {
+    const now = new Date();
+    const maxAgeDays =
+      periodFilter === "30d" ? 30 : periodFilter === "90d" ? 90 : 365;
+
+    return MOCK_PROJECTS.filter((p) => {
+      const ageDays =
+        (now.getTime() - new Date(p.updatedAt).getTime()) / (1000 * 60 * 60 * 24);
+
+      const byUser = userFilter === "All" || p.user === userFilter;
+      const byRisk = riskFilter === "All" || p.riskLevel === riskFilter;
+      const byAge = ageDays <= maxAgeDays;
+
+      return byUser && byRisk && byAge;
+    });
+  }, [userFilter, riskFilter, periodFilter]);
+
+  const stats = useMemo(() => {
+    const totalProjects = filteredProjects.length;
+    const totalDocs = filteredProjects.reduce(
+      (sum, p) => sum + p.documentCount,
+      0
+    );
+    const high = filteredProjects.filter((p) => p.riskLevel === "High").length;
+    const med = filteredProjects.filter((p) => p.riskLevel === "Medium").length;
+    const low = filteredProjects.filter((p) => p.riskLevel === "Low").length;
+    const avgScore =
+      totalProjects === 0
+        ? 0
+        : filteredProjects.reduce((sum, p) => sum + p.totalWeightedScore, 0) /
+          totalProjects;
+
+    return {
+      totalProjects,
+      totalDocs,
+      high,
+      med,
+      low,
+      avgScore: Number(avgScore.toFixed(2)),
+    };
+  }, [filteredProjects]);
+
+  // Risk distribution for bar visualization
+  const riskDistribution = useMemo(() => {
+    const total = stats.high + stats.med + stats.low || 1;
+    return {
+      highPct: (stats.high / total) * 100,
+      medPct: (stats.med / total) * 100,
+      lowPct: (stats.low / total) * 100,
+    };
+  }, [stats]);
+
+  // Top 5 high-risk projects
+  const topHighRisk = useMemo(
+    () =>
+      [...filteredProjects]
+        .filter((p) => p.riskLevel === "High")
+        .sort((a, b) => b.totalWeightedScore - a.totalWeightedScore)
+        .slice(0, 5),
+    [filteredProjects]
+  );
+
+  // “Heat map” style aggregation – category x risk
+  const categoryRiskHeat = useMemo(() => {
+    const map = new Map<string, { high: number; medium: number; low: number }>();
+    filteredProjects.forEach((p) => {
+      const entry =
+        map.get(p.category) || { high: 0, medium: 0, low: 0 };
+      if (p.riskLevel === "High") entry.high += 1;
+      if (p.riskLevel === "Medium") entry.medium += 1;
+      if (p.riskLevel === "Low") entry.low += 1;
+      map.set(p.category, entry);
+    });
+    return Array.from(map.entries()).map(([category, counts]) => ({
+      category,
+      ...counts,
+    }));
+  }, [filteredProjects]);
+
+  return (
+    <div className="flex min-h-screen bg-gray-50">
+      {/* SIDEBAR – reuse TD branding style similar to IterationTracker */}
+      <aside
+        className="w-56 text-white flex flex-col"
+        style={{ backgroundColor: TD_GREEN }}
+      >
+        <div className="flex items-center gap-3 px-4 py-5 border-b border-white/20">
+          <div className="bg-white rounded-md h-9 w-9 flex items-center justify-center shadow">
+            <span className="text-xs font-bold text-emerald-700">TD</span>
+          </div>
+          <div className="flex flex-col leading-tight">
+            <span className="text-xs opacity-80">ContractBuddy</span>
+            <span className="text-sm font-semibold">Insights</span>
+          </div>
+        </div>
+
+        <nav className="mt-3 text-xs space-y-1 px-2">
+          <Link
+            to="/iterationtracker"
+            className="flex items-center gap-2 px-3 py-2 rounded-md hover:bg-emerald-800/70"
+          >
+            <BarChart3 size={14} />
+            <span>Iteration Tracker</span>
+          </Link>
+          <button
+            className="flex items-center gap-2 px-3 py-2 rounded-md bg-white/10 text-white cursor-default"
+            disabled
+          >
+            <BarChart3 size={14} />
+            <span>Insights Dashboard</span>
+          </button>
+        </nav>
+
+        <div className="mt-auto px-4 py-4 text-[11px] text-emerald-100/80">
+          <p>Showing analytics from mock data</p>
+          <p className="opacity-80">Wire to APIs later.</p>
+        </div>
+      </aside>
+
+      {/* MAIN CONTENT */}
+      <main className="flex-1 p-6 space-y-4">
+        {/* Header row */}
+        <div className="flex items-center justify-between flex-wrap gap-3">
+          <div>
+            <h1 className="text-lg font-semibold text-gray-800">
+              Risk Insights Dashboard
+            </h1>
+            <p className="text-xs text-gray-500">
+              Overview of contract risk across users and documents
+            </p>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <button
+              onClick={handleExportPDF}
+              className="text-xs px-3 py-1 rounded-full border bg-white hover:bg-gray-50 shadow-sm"
+            >
+              PDF
+            </button>
+            <button
+              onClick={handleExportExcel}
+              className="text-xs px-3 py-1 rounded-full border bg-white hover:bg-gray-50 shadow-sm"
+            >
+              Excel
+            </button>
+            <button
+              onClick={handleRefresh}
+              className="flex items-center gap-1 text-xs px-3 py-1 rounded-full border bg-white hover:bg-gray-50 shadow-sm"
+            >
+              <RefreshCw size={12} />
+              <span>Refresh</span>
+            </button>
+          </div>
+        </div>
+
+        {/* Filter row */}
+        <div className="flex flex-wrap items-center gap-3 text-xs">
+          <div className="flex items-center gap-2">
+            <span className="text-gray-600">User</span>
+            <select
+              value={userFilter}
+              onChange={(e) => setUserFilter(e.target.value)}
+              className="border rounded-full px-3 py-1 bg-white shadow-sm text-xs"
+            >
+              <option value="All">All users</option>
+              {uniqueUsers.map((u) => (
+                <option key={u} value={u}>
+                  {u}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <span className="text-gray-600">Risk</span>
+            <select
+              value={riskFilter}
+              onChange={(e) => setRiskFilter(e.target.value as any)}
+              className="border rounded-full px-3 py-1 bg-white shadow-sm text-xs"
+            >
+              <option value="All">All risks</option>
+              <option value="High">High only</option>
+              <option value="Medium">Medium only</option>
+              <option value="Low">Low only</option>
+            </select>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <span className="text-gray-600">Period</span>
+            <select
+              value={periodFilter}
+              onChange={(e) =>
+                setPeriodFilter(e.target.value as "30d" | "90d" | "365d")
+              }
+              className="border rounded-full px-3 py-1 bg-white shadow-sm text-xs"
+            >
+              <option value="30d">Last 30 days</option>
+              <option value="90d">Last 90 days</option>
+              <option value="365d">Last 12 months</option>
+            </select>
+          </div>
+
+          <div className="flex items-center gap-2 text-[11px] text-gray-500 ml-auto">
+            <span className="inline-flex items-center gap-1">
+              <span className="h-2 w-2 rounded-full bg-red-500" /> High
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <span className="h-2 w-2 rounded-full bg-amber-400" /> Medium
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <span className="h-2 w-2 rounded-full bg-emerald-500" /> Low
+            </span>
+          </div>
+        </div>
+
+        {/* Top summary tiles */}
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+          <div className="bg-white rounded-xl shadow-sm border p-4 flex flex-col gap-1">
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] text-gray-500">Projects</span>
+              <Users size={14} className="text-emerald-700" />
+            </div>
+            <div className="text-xl font-semibold text-gray-900">
+              {stats.totalProjects}
+            </div>
+            <p className="text-[11px] text-gray-500">
+              Active analysed projects
+            </p>
+          </div>
+
+          <div className="bg-white rounded-xl shadow-sm border p-4 flex flex-col gap-1">
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] text-gray-500">Documents</span>
+              <FileText size={14} className="text-emerald-700" />
+            </div>
+            <div className="text-xl font-semibold text-gray-900">
+              {stats.totalDocs}
+            </div>
+            <p className="text-[11px] text-gray-500">
+              Supplier & baseline documents
+            </p>
+          </div>
+
+          <div className="bg-white rounded-xl shadow-sm border p-4 flex flex-col gap-1">
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] text-gray-500">Average Score</span>
+              <AlertTriangle size={14} className="text-amber-500" />
+            </div>
+            <div className="text-xl font-semibold text-gray-900">
+              {stats.avgScore}
+            </div>
+            <p className="text-[11px] text-gray-500">
+              Mean total weighted score
+            </p>
+          </div>
+
+          <div className="bg-white rounded-xl shadow-sm border p-4 flex flex-col gap-2">
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] text-gray-500">Risk Mix</span>
+              <BarChart3 size={14} className="text-emerald-700" />
+            </div>
+            <div className="h-2 rounded-full bg-gray-100 overflow-hidden flex">
+              <div
+                className="bg-red-500"
+                style={{ width: `${riskDistribution.highPct}%` }}
+              />
+              <div
+                className="bg-amber-400"
+                style={{ width: `${riskDistribution.medPct}%` }}
+              />
+              <div
+                className="bg-emerald-500"
+                style={{ width: `${riskDistribution.lowPct}%` }}
+              />
+            </div>
+            <div className="flex justify-between text-[11px] text-gray-600">
+              <span>H: {stats.high}</span>
+              <span>M: {stats.med}</span>
+              <span>L: {stats.low}</span>
+            </div>
+          </div>
+        </div>
+
+        {/* Middle row: left = Top high risk; right = “heatmap” */}
+        <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+          {/* Top high-risk cards */}
+          <div className="bg-white rounded-xl shadow-sm border p-4">
+            <div className="flex items-center justify-between mb-2">
+              <h2 className="text-sm font-semibold text-gray-800">
+                Top High-Risk Contracts
+              </h2>
+              <span className="text-[11px] text-gray-400">
+                Click a row to review in Iteration Tracker
+              </span>
+            </div>
+            <div className="divide-y text-xs">
+              {topHighRisk.length === 0 && (
+                <p className="text-[11px] text-gray-500 py-3">
+                  No high-risk projects in the current filter.
+                </p>
+              )}
+              {topHighRisk.map((p) => (
+                <Link
+                  key={p.id}
+                  to={`/iterationtracker?user=${encodeURIComponent(p.user)}`}
+                  className="flex items-center justify-between py-2 hover:bg-gray-50 rounded-md px-2 -mx-2"
+                >
+                  <div className="flex flex-col">
+                    <span className="font-medium text-gray-800">
+                      {p.projectName}
+                    </span>
+                    <span className="text-[11px] text-gray-500">
+                      {p.user} · {p.category}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-4">
+                    <div className="flex flex-col items-end">
+                      <span className="text-sm font-semibold text-gray-900">
+                        {p.totalWeightedScore.toFixed(2)}
+                      </span>
+                      <span className="text-[11px] text-gray-500">
+                        Total score
+                      </span>
+                    </div>
+                    <span
+                      className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium ${riskColor(
+                        p.riskLevel
+                      )}`}
+                    >
+                      <span
+                        className={`h-2 w-2 rounded-full ${riskDotColor(
+                          p.riskLevel
+                        )}`}
+                      />
+                      {p.riskLevel}
+                    </span>
+                  </div>
+                </Link>
+              ))}
+            </div>
+          </div>
+
+          {/* Category vs risk “heatmap” */}
+          <div className="bg-white rounded-xl shadow-sm border p-4">
+            <div className="flex items-center justify-between mb-2">
+              <h2 className="text-sm font-semibold text-gray-800">
+                Risk by Contract Category
+              </h2>
+              <span className="text-[11px] text-gray-400">
+                Simple heat-strip per category
+              </span>
+            </div>
+            {categoryRiskHeat.length === 0 ? (
+              <p className="text-[11px] text-gray-500 py-3">
+                No data available for the selected filters.
+              </p>
+            ) : (
+              <div className="space-y-2 text-xs">
+                {categoryRiskHeat.map((row) => {
+                  const total = row.high + row.medium + row.low || 1;
+                  const highPct = (row.high / total) * 100;
+                  const medPct = (row.medium / total) * 100;
+                  const lowPct = (row.low / total) * 100;
+
+                  return (
+                    <div key={row.category} className="space-y-1">
+                      <div className="flex justify-between">
+                        <span className="font-medium text-gray-700">
+                          {row.category}
+                        </span>
+                        <span className="text-[11px] text-gray-400">
+                          {total} projects
+                        </span>
+                      </div>
+                      <div className="h-3 rounded-full bg-gray-100 overflow-hidden flex">
+                        <div
+                          className="bg-red-500"
+                          style={{ width: `${highPct}%` }}
+                          title="High"
+                        />
+                        <div
+                          className="bg-amber-400"
+                          style={{ width: `${medPct}%` }}
+                          title="Medium"
+                        />
+                        <div
+                          className="bg-emerald-500"
+                          style={{ width: `${lowPct}%` }}
+                          title="Low"
+                        />
+                      </div>
+                      <div className="flex justify-between text-[10px] text-gray-500">
+                        <span>H: {row.high}</span>
+                        <span>M: {row.medium}</span>
+                        <span>L: {row.low}</span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Bottom: raw table (like compact global view) */}
+        <div className="bg-white rounded-xl shadow-sm border p-4">
+          <div className="flex items-center justify-between mb-2">
+            <h2 className="text-sm font-semibold text-gray-800">
+              All Projects (current filters)
+            </h2>
+            <span className="text-[11px] text-gray-400">
+              Designed to scale for 100+ users / 1000+ documents
+            </span>
+          </div>
+
+          <div className="overflow-x-auto">
+            <table className="min-w-full text-xs text-left">
+              <thead className="bg-gray-100 text-gray-600 uppercase text-[10px]">
+                <tr>
+                  <th className="px-3 py-2">User</th>
+                  <th className="px-3 py-2">Project</th>
+                  <th className="px-3 py-2">Category</th>
+                  <th className="px-3 py-2">Documents</th>
+                  <th className="px-3 py-2">Total Score</th>
+                  <th className="px-3 py-2">Risk</th>
+                  <th className="px-3 py-2">Created</th>
+                  <th className="px-3 py-2">Last Modified</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filteredProjects.length === 0 && (
+                  <tr>
+                    <td
+                      colSpan={8}
+                      className="px-3 py-4 text-center text-[11px] text-gray-500"
+                    >
+                      No projects match the current filters.
+                    </td>
+                  </tr>
+                )}
+                {filteredProjects.map((p) => (
+                  <tr
+                    key={p.id}
+                    className="border-t last:border-b hover:bg-gray-50"
+                  >
+                    <td className="px-3 py-2 whitespace-nowrap">{p.user}</td>
+                    <td className="px-3 py-2">
+                      <div className="flex flex-col">
+                        <span className="truncate max-w-xs">
+                          {p.projectName}
+                        </span>
+                        <Link
+                          to={`/iterationtracker?user=${encodeURIComponent(
+                            p.user
+                          )}`}
+                          className="text-[11px] text-emerald-700 underline decoration-emerald-400"
+                        >
+                          Open in Iteration Tracker
+                        </Link>
+                      </div>
+                    </td>
+                    <td className="px-3 py-2 whitespace-nowrap">
+                      {p.category}
+                    </td>
+                    <td className="px-3 py-2 text-center">
+                      {p.documentCount}
+                    </td>
+                    <td className="px-3 py-2 whitespace-nowrap font-semibold">
+                      {p.totalWeightedScore.toFixed(2)}
+                    </td>
+                    <td className="px-3 py-2 whitespace-nowrap">
+                      <span
+                        className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium ${riskColor(
+                          p.riskLevel
+                        )}`}
+                      >
+                        <span
+                          className={`h-2 w-2 rounded-full ${riskDotColor(
+                            p.riskLevel
+                          )}`}
+                        />
+                        {p.riskLevel}
+                      </span>
+                    </td>
+                    <td className="px-3 py-2 whitespace-nowrap">
+                      {formatDate(p.createdAt)}
+                    </td>
+                    <td className="px-3 py-2 whitespace-nowrap">
+                      {formatDate(p.updatedAt)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </main>
+    </div>
+  );
+};
+
+export default InsightsDashboard;
