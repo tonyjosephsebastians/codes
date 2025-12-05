@@ -1,0 +1,53 @@
+#!/bin/bash
+
+echo "===== Starting 3PCRM App (Azure + VM Compatible) ====="
+
+# Move into the package root directory
+cd "$(dirname "$0")/src"
+
+echo "Working directory: $(pwd)"
+echo "Python version: $(python3 --version)"
+
+# Start the Gunicorn launcher
+python3 app.py
+
+
+import os
+import subprocess
+import sys
+
+def log(msg):
+    print(f"[3PCRM] {msg}", flush=True)
+
+
+if __name__ == "__main__":
+    log("Gunicorn launcher starting...")
+
+    # Azure assigns PORT dynamically. 
+    # Locally (VM), it falls back to 8000.
+    port = os.environ.get("PORT", "8000")
+    log(f"Using PORT={port}")
+
+    gunicorn_command = [
+        "gunicorn",
+        "main:app",                             # FastAPI entry point
+        "--bind", f"0.0.0.0:{port}",
+        "--workers", "4",
+        "--worker-class", "uvicorn.workers.UvicornWorker",
+        "--timeout", "120",
+        "--log-level", "info"
+    ]
+
+    log(f"Running Gunicorn with command: {' '.join(gunicorn_command)}")
+
+    try:
+        subprocess.run(gunicorn_command, check=True)
+    except subprocess.CalledProcessError as e:
+        log(f"Gunicorn failed to start: {e}")
+        sys.exit(1)
+    except Exception as e:
+        log(f"Unexpected error: {e}")
+        sys.exit(1)
+
+
+
