@@ -1,0 +1,228 @@
+import re
+import json
+from difflib import SequenceMatcher
+from lxml import etree
+from typing import List, Dict, Optional
+
+WNS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+NS = {"w": WNS}
+
+# ---------------- ENUM NORMALIZATION ---------------- #
+
+ROMAN_MAP = {"i":1,"v":5,"x":10,"l":50,"c":100,"d":500,"m":1000}
+
+def roman_to_int(s: str) -> int:
+    s = (s or "").lower()
+    total, prev = 0, 0
+    for ch in reversed(s):
+        val = ROMAN_MAP.get(ch, 0)
+        if val < prev:
+            total -= val
+        else:
+            total += val
+            prev = val
+    return total
+
+def enum_key(enum: Optional[str]) -> Optional[int]:
+    if not enum:
+        return None
+    e = enum.strip()
+
+    m = re.match(r"^\(?\s*(\d+)\s*\)?[.)]?$", e)
+    if m:
+        return int(m.group(1))
+
+    m = re.match(r"^([A-Z])[.)]$", e)
+    if m:
+        return ord(m.group(1)) - ord("A") + 1
+
+    m = re.match(r"^\(\s*([a-z])\s*\)$", e)
+    if m:
+        return ord(m.group(1)) - ord("a") + 1
+
+    m = re.match(r"^\(\s*([ivxlcdm]+)\s*\)$", e, re.IGNORECASE)
+    if m:
+        return roman_to_int(m.group(1))
+
+    return None
+
+# ---------------- WORD NUMBERING (REAL WORD LIST ID) ---------------- #
+
+def extract_num_id(p):
+    num = p.find(".//w:numPr/w:numId", NS)
+    if num is not None:
+        return num.get(f"{{{WNS}}}val")
+    return None
+
+# ---------------- CLAUSE MODEL ---------------- #
+
+class Clause:
+    def __init__(self, section, enum, text, p_elem):
+        self.section = section
+        self.enum = enum
+        self.enum_key = enum_key(enum)
+        self.num_id = extract_num_id(p_elem)
+        self.body = text
+        self.norm = self.normalize(text)
+        self.p = p_elem
+
+    def normalize(self, t):
+        return re.sub(r"\s+", " ", t.lower()).strip()
+
+# ---------------- RENDERER ---------------- #
+
+class Renderer:
+    def clear_runs(self, p):
+        for r in list(p):
+            p.remove(r)
+
+    def insert_run(self, p, text, color=None, strike=False):
+        r = etree.SubElement(p, f"{{{WNS}}}r")
+        if color or strike:
+            rp = etree.SubElement(r, f"{{{WNS}}}rPr")
+            if color:
+                c = etree.SubElement(rp, f"{{{WNS}}}color")
+                c.set(f"{{{WNS}}}val", color)
+            if strike:
+                etree.SubElement(rp, f"{{{WNS}}}strike")
+        t = etree.SubElement(r, f"{{{WNS}}}t")
+        t.text = text
+
+    def diff_paragraph(self, p, old, new):
+        self.clear_runs(p)
+
+        def tok(s):
+            return re.findall(r"\w+|[^\w\s]|\s+", s or "", flags=re.UNICODE)
+
+        a = tok(old)
+        b = tok(new)
+        sm = SequenceMatcher(None, a, b)
+
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == "equal":
+                self.insert_run(p, "".join(a[i1:i2]))
+            elif tag == "delete":
+                self.insert_run(p, "".join(a[i1:i2]), color="FF0000", strike=True)
+            elif tag == "insert":
+                self.insert_run(p, "".join(b[j1:j2]), color="00AA00")
+            elif tag == "replace":
+                self.insert_run(p, "".join(a[i1:i2]), color="FF0000", strike=True)
+                self.insert_run(p, "".join(b[j1:j2]), color="00AA00")
+
+# ---------------- AI COMPARATOR ---------------- #
+
+class AIComparator:
+    def __init__(self, ai_utils=None, enable_ai=True):
+        self.renderer = Renderer()
+        self.ai_utils = ai_utils
+        self.enable_ai = enable_ai
+
+    # -------- Clause extraction -------- #
+
+    def extract_clauses(self, body):
+        clauses = []
+        current_section = "General"
+
+        for p in body.findall(".//w:p", NS):
+            text = "".join(p.itertext()).strip()
+            if not text:
+                continue
+
+            m = re.match(r"^(\d+\.|\d+\)|[A-Z]\.|[IVX]+\.)\s*(.+)", text)
+            enum = m.group(1) if m else None
+            body_text = m.group(2) if m else text
+
+            if text.isupper() and len(text) < 50:
+                current_section = text
+                continue
+
+            clauses.append(Clause(current_section, enum, body_text, p))
+
+        return clauses
+
+    # -------- Replace alignment -------- #
+
+    def align_replace(self, base, rev):
+        pairs = []
+        used = set()
+
+        rev_by_key = {}
+        for r in rev:
+            if r.enum_key is not None:
+                rev_by_key.setdefault((r.section, r.enum_key), []).append(r)
+
+        for b in base:
+            key = (b.section, b.enum_key)
+            if b.enum_key and key in rev_by_key and rev_by_key[key]:
+                r = rev_by_key[key].pop(0)
+                used.add(id(r))
+                pairs.append((b, r))
+            else:
+                pairs.append((b, None))
+
+        leftovers = [r for r in rev if id(r) not in used]
+        return pairs, leftovers
+
+    # -------- Main compare -------- #
+
+    def compare(self, base_body, rev_body):
+        base = self.extract_clauses(base_body)
+        rev = self.extract_clauses(rev_body)
+
+        pairs, _ = self.align_replace(base, rev)
+
+        semantic_changes = []
+        semantic_pairs = []
+
+        for b, r in pairs:
+            if not r:
+                self.renderer.diff_paragraph(b.p, b.body, "")
+                continue
+            if b.norm == r.norm:
+                continue
+
+            self.renderer.diff_paragraph(b.p, b.body, r.body)
+            semantic_pairs.append({"old": b.body, "new": r.body})
+
+        if self.enable_ai and semantic_pairs:
+            flags = self.semantic_batch(semantic_pairs)
+            # future hook for risk weighting
+
+    # -------- Semantic batch (unchanged logic) -------- #
+
+    def semantic_batch(self, changes: List[Dict[str, str]]) -> List[bool]:
+        if not changes:
+            return []
+
+        MAX_CHARS = 800
+        safe = []
+        for ch in changes:
+            safe.append({
+                "old": (ch.get("old") or "")[:MAX_CHARS],
+                "new": (ch.get("new") or "")[:MAX_CHARS],
+            })
+
+        prompt = {
+            "instruction":
+                "Determine if each change is legally meaningful. "
+                "Meaningful = changes obligations, rights, liabilities, scope. "
+                "Return JSON only: {\"results\": [true/false]}",
+            "items": safe,
+        }
+
+        try:
+            resp = self.ai_utils.client.chat.completions.create(
+                model=self.ai_utils.deployment_name,
+                messages=[
+                    {"role": "system", "content": "Return JSON only."},
+                    {"role": "user", "content": json.dumps(prompt)},
+                ],
+                temperature=0,
+                max_tokens=1024,
+                response_format={"type": "json_object"},
+            )
+            data = json.loads(resp.choices[0].message.content)
+            res = data.get("results", [])
+            return res[:len(changes)]
+        except Exception:
+            return [True] * len(changes)
