@@ -1,0 +1,372 @@
+import io
+import zipfile
+import re
+from copy import deepcopy
+from difflib import SequenceMatcher
+from lxml import etree
+
+# =========================================================
+# Namespaces
+# =========================================================
+WNS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+NS = {"w": WNS}
+
+# =========================================================
+# Enumeration handling (CRITICAL FIX)
+# =========================================================
+ENUM_RE = re.compile(
+    r"""^\s*
+    (
+        \(\d+\)|        # (10)
+        \d+\.|          # 10.
+        [A-Z]\.|        # J.
+        \([a-z]\)|      # (a)
+        \([ivxlcdm]+\)  # (x)
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE
+)
+
+def split_enum(text: str):
+    if not text:
+        return None, ""
+    m = ENUM_RE.match(text)
+    if not m:
+        return None, text.strip()
+    return m.group(1), text[m.end():].strip()
+
+# =========================================================
+# Clause Models
+# =========================================================
+class Clause:
+    def __init__(self, section, text, el):
+        self.section = section
+        self.enum, self.body = split_enum(text)
+        self.norm = self._norm(self.body)
+        self.el = el
+
+    def signature(self):
+        # ENUM REMOVED → fixes (10) vs J.
+        return f"{self.section}::{self.norm}"
+
+    def _norm(self, t):
+        return " ".join((t or "").lower().split())
+
+
+class TableClause:
+    def __init__(self, section, tbl_el):
+        self.section = section
+        self.el = tbl_el
+        self.norm = self._normalize()
+
+    def signature(self):
+        return f"{self.section}::TABLE::{self.norm}"
+
+    def _normalize(self):
+        texts = []
+        for t in self.el.findall(".//w:t", NS):
+            texts.append((t.text or "").strip().lower())
+        return " ".join(texts)
+
+# =========================================================
+# Section-aware parser (headings + numbering)
+# =========================================================
+class SectionParser:
+    def parse(self, root):
+        clauses = []
+        section_stack = []
+
+        body = root.find("w:body", NS)
+        if body is None:
+            return clauses
+
+        for el in body:
+            tag = etree.QName(el.tag).localname
+
+            if tag == "p":
+                text = self._text(el)
+                if self._is_heading(el, text):
+                    section_stack = [text.strip()[:80]]
+                    continue
+
+                section = " > ".join(section_stack) if section_stack else "ROOT"
+                clauses.append(Clause(section, text, el))
+
+            elif tag == "tbl":
+                section = " > ".join(section_stack) if section_stack else "ROOT"
+                clauses.append(TableClause(section, el))
+
+        return clauses
+
+    def _is_heading(self, p, text):
+        if not text:
+            return False
+
+        # numbering-based heading
+        if re.match(r"^\d+\.?\s+[A-Z]", text):
+            return True
+
+        # Word heading styles
+        pPr = p.find("w:pPr", NS)
+        if pPr is not None:
+            pStyle = pPr.find("w:pStyle", NS)
+            if pStyle is not None:
+                val = pStyle.get(f"{{{WNS}}}val", "").lower()
+                if val.startswith("heading"):
+                    return True
+        return False
+
+    def _text(self, el):
+        return "".join(t.text or "" for t in el.findall(".//w:t", NS))
+
+# =========================================================
+# Renderer (SAFE XML – no overrides)
+# =========================================================
+class Renderer:
+    # ---------- Paragraph ----------
+    def clear_runs(self, p):
+        for r in list(p):
+            if r.tag.endswith("r"):
+                p.remove(r)
+
+    def insert_run(self, p, text, color=None, strike=False):
+        r = etree.SubElement(p, f"{{{WNS}}}r")
+        if color or strike:
+            rPr = etree.SubElement(r, f"{{{WNS}}}rPr")
+            if color:
+                etree.SubElement(rPr, f"{{{WNS}}}color").set(
+                    f"{{{WNS}}}val", color
+                )
+            if strike:
+                etree.SubElement(rPr, f"{{{WNS}}}strike")
+        t = etree.SubElement(r, f"{{{WNS}}}t")
+        t.text = text
+
+    def diff_paragraph(self, p, old, new):
+        self.clear_runs(p)
+        if old:
+            self.insert_run(p, old, color="FF0000", strike=True)
+        if new:
+            self.insert_run(p, new, color="00AA00")
+
+    # ---------- Table ----------
+    def insert_table_row(self, tbl, rev_row):
+        new_row = deepcopy(rev_row)
+        tbl.append(new_row)
+        self._mark_inserted(new_row)
+
+    def insert_table_cell(self, row, rev_cell):
+        new_cell = deepcopy(rev_cell)
+        row.append(new_cell)
+        self._mark_inserted(new_cell)
+
+    def mark_table_row_deleted(self, row):
+        self._mark_deleted(row)
+
+    def mark_table_cell_deleted(self, cell):
+        self._mark_deleted(cell)
+
+    def diff_table_cell(self, base_cell, rev_cell):
+        base_text = self._cell_text(base_cell)
+        rev_text = self._cell_text(rev_cell)
+
+        if base_text == rev_text:
+            return
+
+        self.clear_runs_in(base_cell)
+        self.insert_run(base_cell, base_text, color="FF0000", strike=True)
+        self.insert_run(base_cell, rev_text, color="00AA00")
+
+    # ---------- Helpers ----------
+    def clear_runs_in(self, el):
+        for r in el.findall(".//w:r", NS):
+            parent = r.getparent()
+            if parent is not None:
+                parent.remove(r)
+
+    def _cell_text(self, cell):
+        return " ".join(t.text or "" for t in cell.findall(".//w:t", NS))
+
+    def _mark_inserted(self, el):
+        for r in el.findall(".//w:r", NS):
+            rPr = r.find("w:rPr", NS)
+            if rPr is None:
+                rPr = etree.SubElement(r, f"{{{WNS}}}rPr")
+            etree.SubElement(rPr, f"{{{WNS}}}color").set(
+                f"{{{WNS}}}val", "00AA00"
+            )
+
+    def _mark_deleted(self, el):
+        for r in el.findall(".//w:r", NS):
+            rPr = r.find("w:rPr", NS)
+            if rPr is None:
+                rPr = etree.SubElement(r, f"{{{WNS}}}rPr")
+            etree.SubElement(rPr, f"{{{WNS}}}color").set(
+                f"{{{WNS}}}val", "FF0000"
+            )
+            etree.SubElement(rPr, f"{{{WNS}}}strike")
+
+# =========================================================
+# Table diff engine (ROW + CELL SAFE)
+# =========================================================
+class TableDiffEngine:
+    def diff(self, base_tbl, rev_tbl, renderer):
+        base_rows = base_tbl.el.findall("w:tr", NS)
+        rev_rows = rev_tbl.el.findall("w:tr", NS)
+
+        sm = SequenceMatcher(
+            None,
+            [self._row_sig(r) for r in base_rows],
+            [self._row_sig(r) for r in rev_rows],
+        )
+
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == "equal":
+                continue
+
+            if tag == "replace":
+                for br, rr in zip(base_rows[i1:i2], rev_rows[j1:j2]):
+                    self._diff_row(br, rr, renderer)
+
+            elif tag == "delete":
+                for br in base_rows[i1:i2]:
+                    renderer.mark_table_row_deleted(br)
+
+            elif tag == "insert":
+                for rr in rev_rows[j1:j2]:
+                    renderer.insert_table_row(base_tbl.el, rr)
+
+    def _row_sig(self, row):
+        return " ".join(
+            (t.text or "").lower() for t in row.findall(".//w:t", NS)
+        )
+
+    def _diff_row(self, base_row, rev_row, renderer):
+        base_cells = base_row.findall("w:tc", NS)
+        rev_cells = rev_row.findall("w:tc", NS)
+
+        for i in range(max(len(base_cells), len(rev_cells))):
+            if i < len(base_cells) and i < len(rev_cells):
+                renderer.diff_table_cell(base_cells[i], rev_cells[i])
+            elif i < len(base_cells):
+                renderer.mark_table_cell_deleted(base_cells[i])
+            else:
+                renderer.insert_table_cell(base_row, rev_cells[i])
+
+# =========================================================
+# DOCX IO (body + headers + footers)
+# =========================================================
+class DocxIO:
+    def load_parts(self, docx_bytes):
+        parts = {}
+        with zipfile.ZipFile(io.BytesIO(docx_bytes)) as z:
+            for name in z.namelist():
+                if name.startswith("word/") and name.endswith(".xml"):
+                    parts[name] = etree.fromstring(z.read(name))
+        return parts
+
+    def save(self, original, updated_parts):
+        out = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(original)) as zin:
+            with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    if item.filename in updated_parts:
+                        zout.writestr(
+                            item.filename,
+                            etree.tostring(
+                                updated_parts[item.filename],
+                                encoding="utf-8",
+                                xml_declaration=True,
+                            ),
+                        )
+                    else:
+                        zout.writestr(item, zin.read(item.filename))
+        return out.getvalue()
+
+# =========================================================
+# AIComparator (DROP-IN)
+# =========================================================
+class AIComparator:
+    def __init__(self, ai_utils=None, enable_ai=False):
+        self.ai_utils = ai_utils
+        self.enable_ai = enable_ai
+        self.parser = SectionParser()
+        self.renderer = Renderer()
+        self.matcher = SequenceMatcher
+        self.table_diff = TableDiffEngine()
+        self.io = DocxIO()
+
+    def compare(self, base_docx: bytes, rev_docx: bytes) -> bytes:
+        base_parts = self.io.load_parts(base_docx)
+        rev_parts = self.io.load_parts(rev_docx)
+
+        for part in base_parts:
+            if part not in rev_parts:
+                continue
+
+            base_root = base_parts[part]
+            rev_root = rev_parts[part]
+
+            base_clauses = self.parser.parse(base_root)
+            rev_clauses = self.parser.parse(rev_root)
+
+            sm = SequenceMatcher(
+                None,
+                [c.signature() for c in base_clauses],
+                [c.signature() for c in rev_clauses],
+            )
+
+            for tag, i1, i2, j1, j2 in sm.get_opcodes():
+                if tag == "replace":
+                    semantic_pairs = []
+                    pair_map = []
+
+                    for b, r in zip(
+                        base_clauses[i1:i2], rev_clauses[j1:j2]
+                    ):
+                        if isinstance(b, TableClause):
+                            self.table_diff.diff(b, r, self.renderer)
+                            continue
+
+                        if b.norm == r.norm:
+                            continue
+
+                        semantic_pairs.append(
+                            {"old": b.body, "new": r.body}
+                        )
+                        pair_map.append((b, r))
+
+                    if semantic_pairs:
+                        if self.enable_ai and self.ai_utils:
+                            keep = self.ai_utils.semantic_batch(
+                                semantic_pairs
+                            )
+                        else:
+                            keep = [True] * len(semantic_pairs)
+
+                        for k, (b, r) in zip(keep, pair_map):
+                            if k:
+                                self.renderer.diff_paragraph(
+                                    b.el, b.body, r.body
+                                )
+
+                elif tag == "delete":
+                    for b in base_clauses[i1:i2]:
+                        if isinstance(b, TableClause):
+                            self.renderer.mark_table_row_deleted(b.el)
+                        else:
+                            self.renderer.diff_paragraph(
+                                b.el, b.body, ""
+                            )
+
+                elif tag == "insert":
+                    for r in rev_clauses[j1:j2]:
+                        if isinstance(r, TableClause):
+                            # inserted table → deep copy whole table
+                            base_root.append(deepcopy(r.el))
+                        else:
+                            self.renderer.diff_paragraph(
+                                r.el, "", r.body
+                            )
+
+        return self.io.save(base_docx, base_parts)
