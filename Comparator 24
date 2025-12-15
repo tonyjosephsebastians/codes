@@ -1,0 +1,6 @@
+def iter_all_paragraphs(root):
+    for p in root.findall(".//w:p", NS):
+        yield p
+
+
+for p in iter_all_paragraphs(body):
