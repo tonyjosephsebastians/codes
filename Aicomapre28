@@ -1,0 +1,38 @@
+def _append_inserted_block_after(self, anchor_block: Block, r: Block):
+    """
+    Insert r immediately AFTER anchor_block in the correct parent.
+    This prevents green text from going to the bottom.
+    """
+    anchor_el = anchor_block.el
+    parent = anchor_el.getparent()
+    if parent is None:
+        return
+
+    insert_index = parent.index(anchor_el) + 1
+
+    if r.kind == "p":
+        new_p = etree.Element(_w("p"))
+        self.renderer.diff_paragraph(new_p, "", r.text)
+        parent.insert(insert_index, new_p)
+
+    elif r.kind == "tbl":
+        # Tables are tricky — safest is a paragraph notice
+        new_p = etree.Element(_w("p"))
+        self.renderer.diff_paragraph(new_p, "", f"[TABLE ADDED] {r.text}")
+        parent.insert(insert_index, new_p)
+
+
+if b is None and r is not None:
+    # Find nearest previous base block
+    anchor = None
+    for prev_b, _ in reversed(paired[:i]):
+        if prev_b is not None:
+            anchor = prev_b
+            break
+
+    if anchor:
+        self._append_inserted_block_after(anchor, r)
+    else:
+        # fallback (very rare)
+        self._append_inserted_block_after(base_blocks[0], r)
+    continue
