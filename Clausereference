@@ -1,0 +1,42 @@
+useEffect(() => {
+  if (!activeClauseReference || !containerRef.current || !scrollContainerRef.current) {
+    return;
+  }
+
+  const container = containerRef.current;
+  const scrollContainer = scrollContainerRef.current;
+
+  // Normalize helper
+  const normalize = (text: string) =>
+    text
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .replace(/[^\w\s().-]/g, "")
+      .trim();
+
+  const targetText = normalize(activeClauseReference);
+
+  const paragraphs = Array.from(container.querySelectorAll("p"));
+
+  const match = paragraphs.find(p =>
+    normalize(p.textContent || "").includes(targetText)
+  );
+
+  if (!match) {
+    console.warn("Clause not found in DOCX:", activeClauseReference);
+    return;
+  }
+
+  // 🔑 CRITICAL FIX: scroll the DOCX container, not the element
+  const containerTop = scrollContainer.getBoundingClientRect().top;
+  const matchTop = match.getBoundingClientRect().top;
+
+  const scrollOffset =
+    scrollContainer.scrollTop + (matchTop - containerTop) - 40;
+
+  scrollContainer.scrollTo({
+    top: scrollOffset,
+    behavior: "smooth",
+  });
+
+}, [activeClauseReference]);
