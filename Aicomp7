@@ -1,0 +1,821 @@
+# ai_comparator.py
+"""
+Contract Buddy - Robust DOCX Word-level Comparator
+--------------------------------------------------
+- Word-level redline for:
+  * body paragraphs
+  * tables (cell-by-cell)
+  * headers and footers
+- Section-aware alignment to reduce "paragraph overriding" / misplaced numbering:
+  * Detects headings + clause labels (e.g., "1.", "(10)", "J.", "iv)")
+  * Canonicalizes labels so "(10)" and "J." are treated as the same "10"
+  * Keeps labels stable while diffing the remainder of the paragraph
+
+API:
+    diff_bytes = AIComparator(ai_utils=AIUtils(...), enable_ai=True).compare(base_bytes, rev_bytes)
+
+Notes:
+- This module rewrites text content in base doc XML with redline runs.
+- It preserves numbering done via Word list numbering (w:numPr) because we don't touch pPr.
+- If a document uses typed-in numbering (e.g., "(10)" literally in text), we preserve the
+  label segment and diff the rest to avoid "entire paragraph cut down".
+
+Dependencies:
+    pip install lxml
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import zipfile
+from dataclasses import dataclass
+from difflib import SequenceMatcher
+from io import BytesIO
+from typing import Dict, Iterable, List, Optional, Tuple
+
+from lxml import etree
+
+# ----------------------------- Namespaces -----------------------------
+
+WNS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+NS = {"w": WNS}
+
+
+# ----------------------------- Utilities -----------------------------
+
+
+def _w(tag: str) -> str:
+    """QName helper for WordprocessingML tags."""
+    return f"{{{WNS}}}{tag}"
+
+
+def _safe_text(s: str) -> str:
+    return (s or "").replace("\u00a0", " ").replace("\r", "").strip()
+
+
+def _norm_space(s: str) -> str:
+    return re.sub(r"\s+", " ", _safe_text(s)).strip()
+
+
+def _is_whitespace_only(s: str) -> bool:
+    return len(_norm_space(s)) == 0
+
+
+def _iter_xml_files_in_docx(z: zipfile.ZipFile) -> List[str]:
+    """
+    Return all relevant Word xml parts:
+      - document.xml
+      - header*.xml
+      - footer*.xml
+    """
+    names = []
+    for n in z.namelist():
+        if not (n.startswith("word/") and n.endswith(".xml")):
+            continue
+        base = n.rsplit("/", 1)[-1]
+        if base == "document.xml" or base.startswith("header") or base.startswith("footer"):
+            names.append(n)
+    # Ensure document.xml first (nice for debugging)
+    names.sort(key=lambda x: (0 if x.endswith("document.xml") else 1, x))
+    return names
+
+
+def load_docx_xmls(docx_bytes: bytes) -> Dict[str, etree._Element]:
+    """Parse relevant Word XML parts from DOCX bytes into etree roots."""
+    xmls: Dict[str, etree._Element] = {}
+    with zipfile.ZipFile(BytesIO(docx_bytes)) as z:
+        for name in _iter_xml_files_in_docx(z):
+            try:
+                xmls[name] = etree.fromstring(z.read(name))
+            except Exception:
+                # If any part is malformed, skip rather than crash
+                continue
+    return xmls
+
+
+def rebuild_docx(original_bytes: bytes, xmls: Dict[str, etree._Element]) -> bytes:
+    """Replace XML parts inside the original docx and return new bytes."""
+    out = BytesIO()
+    with zipfile.ZipFile(BytesIO(original_bytes)) as zin:
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                if item.filename in xmls:
+                    zout.writestr(item, etree.tostring(xmls[item.filename]))
+                else:
+                    zout.writestr(item, zin.read(item.filename))
+    return out.getvalue()
+
+
+def iter_all_paragraphs(root: etree._Element) -> Iterable[etree._Element]:
+    """Yield all paragraphs under this root (includes table cell paragraphs too)."""
+    yield from root.findall(".//w:p", NS)
+
+
+def iter_body_blocks(root: etree._Element) -> Iterable[Tuple[str, etree._Element]]:
+    """
+    Iterate block-level elements in order for the main body:
+      - ("p", <w:p>)
+      - ("tbl", <w:tbl>)
+    For headers/footers, there isn't a w:body; we fall back to all top-level blocks.
+    """
+    body = root.find(".//w:body", NS)
+    if body is not None:
+        for ch in list(body):
+            if etree.QName(ch.tag).localname == "p":
+                yield ("p", ch)
+            elif etree.QName(ch.tag).localname == "tbl":
+                yield ("tbl", ch)
+        return
+
+    # Header/footer: typically root children include w:p and w:tbl directly
+    for ch in list(root):
+        if etree.QName(ch.tag).localname == "p":
+            yield ("p", ch)
+        elif etree.QName(ch.tag).localname == "tbl":
+            yield ("tbl", ch)
+
+
+def get_text(el: etree._Element) -> str:
+    """Extract visible paragraph/table text."""
+    if el is None:
+        return ""
+    parts: List[str] = []
+    for t in el.findall(".//w:t", NS):
+        if t.text:
+            parts.append(t.text)
+    return "".join(parts)
+
+
+# ----------------------------- Label / Heading Logic -----------------------------
+
+
+_ROMAN_RE = re.compile(r"^(?=[ivxlcdmIVXLCDM]+$)[ivxlcdmIVXLCDM]+$")
+_LABEL_RE = re.compile(
+    r"^\s*"
+    r"(?P<label>"
+    r"\(\s*(?P<num1>\d+)\s*\)"          # (10)
+    r"|(?P<num2>\d+)"                  # 10
+    r"|(?P<alpha>[A-Z])"               # J
+    r"|(?P<roman>[ivxlcdmIVXLCDM]+)"   # iv
+    r")"
+    r"\s*(?P<punct>[.)])\s+"
+)
+
+
+def _roman_to_int(s: str) -> Optional[int]:
+    """Very small roman parser; returns None if invalid."""
+    s = (s or "").upper()
+    if not _ROMAN_RE.match(s):
+        return None
+    vals = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
+    total = 0
+    prev = 0
+    for ch in reversed(s):
+        v = vals[ch]
+        if v < prev:
+            total -= v
+        else:
+            total += v
+            prev = v
+    return total if total > 0 else None
+
+
+def split_leading_label(text: str) -> Tuple[str, str, Optional[int]]:
+    """
+    Returns (label_text, remainder_text, canonical_label_int)
+    If no label detected: ("", full_text, None)
+    """
+    t = _safe_text(text)
+    m = _LABEL_RE.match(t)
+    if not m:
+        return ("", t, None)
+
+    label = m.group("label") + m.group("punct")  # keep original punctuation
+    rest = t[m.end():]
+
+    canon: Optional[int] = None
+    if m.group("num1"):
+        canon = int(m.group("num1"))
+    elif m.group("num2"):
+        canon = int(m.group("num2"))
+    elif m.group("alpha"):
+        canon = ord(m.group("alpha")) - ord("A") + 1
+    elif m.group("roman"):
+        canon = _roman_to_int(m.group("roman"))
+
+    return (label, rest, canon)
+
+
+def looks_like_heading(text: str) -> bool:
+    """
+    Heuristic heading detector:
+      - short
+      - not ending with period
+      - contains letters
+      - often Title-ish / all caps
+    """
+    t = _norm_space(text)
+    if len(t) < 3:
+        return False
+    if len(t) > 90:
+        return False
+    if t.endswith("."):
+        return False
+    if not re.search(r"[A-Za-z]", t):
+        return False
+    # too many punctuation often means not a heading
+    if re.search(r"[;,:]\s", t):
+        return False
+    # if it's a single word or 2-5 words, likely heading
+    words = t.split()
+    if 1 <= len(words) <= 7:
+        return True
+    return False
+
+
+def heading_key(text: str) -> str:
+    """Normalized heading key."""
+    t = _norm_space(text).lower()
+    t = re.sub(r"[^a-z0-9 ]+", "", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+# ----------------------------- Diff Rendering -----------------------------
+
+
+class WordRenderer:
+    """
+    Writes redline runs inside paragraphs.
+    - Insert: green
+    - Delete: red + strike
+    """
+
+    def __init__(self, insert_color: str = "00AA00", delete_color: str = "FF0000"):
+        self.insert_color = insert_color
+        self.delete_color = delete_color
+
+    def _clear_runs(self, p: etree._Element) -> None:
+        """Remove all children except pPr (so numbering/styling in pPr stays)."""
+        ppr = p.find("w:pPr", NS)
+        for ch in list(p):
+            if ppr is not None and ch is ppr:
+                continue
+            p.remove(ch)
+
+    def _append_run_plain(self, p: etree._Element, text: str) -> None:
+        if text == "":
+            return
+        r = etree.SubElement(p, _w("r"))
+        t = etree.SubElement(r, _w("t"))
+        # preserve spaces
+        if text.startswith(" ") or text.endswith(" ") or "  " in text:
+            t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+        t.text = text
+
+    def _append_run_colored(self, p: etree._Element, text: str, color_hex: str, strike: bool = False) -> None:
+        if text == "":
+            return
+        r = etree.SubElement(p, _w("r"))
+        rpr = etree.SubElement(r, _w("rPr"))
+        c = etree.SubElement(rpr, _w("color"))
+        c.set(_w("val"), color_hex)
+        if strike:
+            etree.SubElement(rpr, _w("strike"))
+        t = etree.SubElement(r, _w("t"))
+        if text.startswith(" ") or text.endswith(" ") or "  " in text:
+            t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+        t.text = text
+
+    def _tokenize_words(self, s: str) -> List[str]:
+        """
+        Tokenize into "word-ish" + whitespace + punctuation tokens,
+        so we can keep spacing stable in output.
+        """
+        if s == "":
+            return []
+        # words / numbers / punctuation / whitespace
+        return re.findall(r"\s+|[A-Za-z0-9]+|[^\w\s]", s)
+
+    def diff_paragraph(self, p: etree._Element, old_text: str, new_text: str) -> None:
+        """
+        Replace paragraph content with a word-level redline between old_text and new_text.
+        """
+        old = old_text or ""
+        new = new_text or ""
+
+        # Preserve leading label equivalences (e.g., "(10)" vs "J.")
+        old_label, old_rest, old_canon = split_leading_label(old)
+        new_label, new_rest, new_canon = split_leading_label(new)
+
+        self._clear_runs(p)
+
+        # If canon labels match, keep base label as stable text and diff the remainder only.
+        if old_canon is not None and new_canon is not None and old_canon == new_canon:
+            if old_label:
+                self._append_run_plain(p, old_label + " ")
+            self._diff_inline(p, old_rest, new_rest)
+            return
+
+        # Otherwise, include label differences but avoid nuking the whole paragraph:
+        # - keep old label as normal text
+        # - show new label insert if different and present
+        if old_label:
+            self._append_run_plain(p, old_label + " ")
+        if new_label and new_label != old_label:
+            self._append_run_colored(p, new_label + " ", self.insert_color, strike=False)
+        self._diff_inline(p, old_rest if old_label else old, new_rest if new_label else new)
+
+    def _diff_inline(self, p: etree._Element, old: str, new: str) -> None:
+        ot = self._tokenize_words(old or "")
+        nt = self._tokenize_words(new or "")
+        sm = SequenceMatcher(a=ot, b=nt)
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == "equal":
+                self._append_run_plain(p, "".join(ot[i1:i2]))
+            elif tag == "delete":
+                self._append_run_colored(p, "".join(ot[i1:i2]), self.delete_color, strike=True)
+            elif tag == "insert":
+                self._append_run_colored(p, "".join(nt[j1:j2]), self.insert_color, strike=False)
+            elif tag == "replace":
+                self._append_run_colored(p, "".join(ot[i1:i2]), self.delete_color, strike=True)
+                self._append_run_colored(p, "".join(nt[j1:j2]), self.insert_color, strike=False)
+
+
+# ----------------------------- Block Model -----------------------------
+
+
+@dataclass
+class Block:
+    kind: str              # "p" or "tbl"
+    el: etree._Element     # underlying element
+    text: str              # extracted visible text (for tbl: joined)
+    heading: str           # current heading key context
+    label_canon: Optional[int]  # canonical label if detected at start (paragraph only)
+    key: str               # alignment key
+    is_heading: bool       # whether this block is a heading paragraph
+
+
+def table_text(tbl: etree._Element) -> str:
+    """Collapse table text for alignment signals."""
+    chunks: List[str] = []
+    for cell in tbl.findall(".//w:tc", NS):
+        chunks.append(_norm_space(get_text(cell)))
+    return " | ".join([c for c in chunks if c])
+
+
+def build_blocks(root: etree._Element) -> List[Block]:
+    """
+    Build ordered block list with heading context + alignment keys.
+    This is the heart of the "no overriding / better paragraph pairing" fix.
+    """
+    blocks: List[Block] = []
+    current_heading_key = ""
+
+    for kind, el in iter_body_blocks(root):
+        if kind == "p":
+            txt = _safe_text(get_text(el))
+            if _is_whitespace_only(txt):
+                # keep empty paragraph blocks (they can matter for spacing), but weak key
+                blocks.append(Block(kind="p", el=el, text="", heading=current_heading_key,
+                                    label_canon=None, key=f"{current_heading_key}|EMPTY", is_heading=False))
+                continue
+
+            is_head = looks_like_heading(txt)
+            if is_head:
+                current_heading_key = heading_key(txt)
+
+            label_text, rest, canon = split_leading_label(txt)
+            # For alignment, we strongly prefer (heading + canonical label) if present,
+            # otherwise (heading + normalized first ~10 words).
+            rest_norm = _norm_space(rest).lower()
+            rest_sig = " ".join(rest_norm.split()[:10])
+            if canon is not None:
+                key = f"{current_heading_key}|L{canon}"
+            else:
+                key = f"{current_heading_key}|T:{rest_sig or _norm_space(txt).lower()[:80]}"
+
+            blocks.append(Block(
+                kind="p",
+                el=el,
+                text=txt,
+                heading=current_heading_key,
+                label_canon=canon,
+                key=key,
+                is_heading=is_head
+            ))
+
+        else:  # tbl
+            txt = table_text(el)
+            # Tables aligned by heading context + first row signature
+            first_row = el.find(".//w:tr", NS)
+            row_sig = _norm_space(get_text(first_row)).lower()[:120] if first_row is not None else ""
+            key = f"{current_heading_key}|TBL:{row_sig}"
+            blocks.append(Block(
+                kind="tbl",
+                el=el,
+                text=txt,
+                heading=current_heading_key,
+                label_canon=None,
+                key=key,
+                is_heading=False
+            ))
+
+    return blocks
+
+
+# ----------------------------- Alignment -----------------------------
+
+
+def align_blocks(base: List[Block], rev: List[Block]) -> List[Tuple[Optional[Block], Optional[Block]]]:
+    """
+    Two-pass alignment:
+      1) Key-based greedy match (stable for headings/labels/tables)
+      2) Sequence fallback for remaining (by normalized text similarity)
+    """
+    pairs: List[Tuple[Optional[Block], Optional[Block]]] = []
+
+    # Index rev blocks by key
+    rev_by_key: Dict[str, List[int]] = {}
+    for idx, b in enumerate(rev):
+        rev_by_key.setdefault(b.key, []).append(idx)
+
+    used_rev = set()
+
+    # Pass 1: match by key in order
+    for b in base:
+        lst = rev_by_key.get(b.key, [])
+        j = None
+        for cand in lst:
+            if cand not in used_rev:
+                j = cand
+                break
+        if j is not None:
+            used_rev.add(j)
+            pairs.append((b, rev[j]))
+        else:
+            pairs.append((b, None))
+
+    # Collect remaining rev blocks (unmatched)
+    remaining_rev = [rev[i] for i in range(len(rev)) if i not in used_rev]
+    if not remaining_rev:
+        return pairs
+
+    # Pass 2: try to attach remaining rev blocks to nearest unmatched base blocks
+    # using a mild similarity to prevent bad "paragraph overriding".
+    def sim(a: str, b: str) -> float:
+        aa = _norm_space(a).lower()
+        bb = _norm_space(b).lower()
+        if not aa or not bb:
+            return 0.0
+        return SequenceMatcher(a=aa, b=bb).ratio()
+
+    # Map base indices that are currently (b, None)
+    open_base_positions = [i for i, (bb, rr) in enumerate(pairs) if bb is not None and rr is None]
+
+    # Greedy insert unmatched rev near best base match inside same heading context
+    for r in remaining_rev:
+        best_i = None
+        best_score = 0.0
+        for i in open_base_positions:
+            b = pairs[i][0]
+            if b is None:
+                continue
+            # Require same heading context (massive accuracy boost)
+            if b.heading != r.heading:
+                continue
+            s = sim(b.text, r.text)
+            if s > best_score:
+                best_score = s
+                best_i = i
+
+        # Only pair if reasonably similar; else treat as pure insertion
+        if best_i is not None and best_score >= 0.55:
+            b = pairs[best_i][0]
+            pairs[best_i] = (b, r)
+            open_base_positions.remove(best_i)
+        else:
+            # Insert after the last block in the same heading if possible, else at end
+            insert_at = len(pairs)
+            for i in range(len(pairs) - 1, -1, -1):
+                bb, _ = pairs[i]
+                if bb is not None and bb.heading == r.heading:
+                    insert_at = i + 1
+                    break
+            pairs.insert(insert_at, (None, r))
+
+    return pairs
+
+
+# ----------------------------- AI Utilities (optional) -----------------------------
+
+
+class AIUtils:
+    """
+    Minimal wrapper around an Azure OpenAI client.
+    You can pass your existing object as ai_utils if it has:
+      - client
+      - deployment_name
+    """
+
+    def __init__(self, client=None, deployment_name: str = ""):
+        self.client = client
+        self.deployment_name = deployment_name
+
+
+# ----------------------------- Comparator -----------------------------
+
+
+class AIComparator:
+    def __init__(self, ai_utils: Optional[AIUtils] = None, enable_ai: bool = False):
+        self.ai_utils = ai_utils or AIUtils()
+        self.enable_ai = enable_ai
+        self.renderer = WordRenderer()
+
+    # ------------------------ Public API ------------------------
+
+    def compare(self, base_bytes: bytes, rev_bytes: bytes) -> bytes:
+        """
+        Compare supplier/revised DOCX against baseline DOCX and return
+        baseline DOCX with redline markup applied.
+        """
+        if not isinstance(base_bytes, (bytes, bytearray)) or not isinstance(rev_bytes, (bytes, bytearray)):
+            raise TypeError("compare() expects raw DOCX bytes for base_bytes and rev_bytes")
+
+        base_xmls = load_docx_xmls(base_bytes)
+        rev_xmls = load_docx_xmls(rev_bytes)
+
+        # Diff parts that exist in both
+        for part_name, base_root in base_xmls.items():
+            rev_root = rev_xmls.get(part_name)
+            if rev_root is None:
+                continue
+            self._diff_root(base_root, rev_root)
+
+        return rebuild_docx(base_bytes, base_xmls)
+
+    # ------------------------ Root diff ------------------------
+
+    def _diff_root(self, base_root: etree._Element, rev_root: etree._Element) -> None:
+        base_blocks = build_blocks(base_root)
+        rev_blocks = build_blocks(rev_root)
+
+        paired = align_blocks(base_blocks, rev_blocks)
+
+        # Apply diffs
+        for b, r in paired:
+            if b is None and r is not None:
+                # Insert new content into base: we must attach it somewhere.
+                # We do a safe approach: append after last body element in base in same heading
+                self._append_inserted_block(base_root, r)
+                continue
+            if b is not None and r is None:
+                self._mark_block_deleted(b)
+                continue
+            if b is None or r is None:
+                continue
+
+            # Both present
+            if b.kind == "p" and r.kind == "p":
+                # Headings: keep as-is unless changed materially
+                if b.is_heading or r.is_heading:
+                    # Compare heading text; if changed, redline it; otherwise do nothing
+                    if _norm_space(b.text) != _norm_space(r.text):
+                        self.renderer.diff_paragraph(b.el, b.text, r.text)
+                    continue
+
+                if _norm_space(b.text) == _norm_space(r.text):
+                    continue
+                self.renderer.diff_paragraph(b.el, b.text, r.text)
+
+            elif b.kind == "tbl" and r.kind == "tbl":
+                self._diff_table(b.el, r.el)
+
+            else:
+                # Kind mismatch (paragraph replaced by table, etc.)
+                self._mark_block_deleted(b)
+                self._append_inserted_block(base_root, r)
+
+    # ------------------------ Block operations ------------------------
+
+    def _mark_block_deleted(self, b: Block) -> None:
+        if b.kind == "p":
+            # Redline entire paragraph text to empty (deletion)
+            if not _is_whitespace_only(b.text):
+                self.renderer.diff_paragraph(b.el, b.text, "")
+        elif b.kind == "tbl":
+            # Mark all cells deleted (safe)
+            for cell in b.el.findall(".//w:tc", NS):
+                for p in cell.findall(".//w:p", NS):
+                    txt = get_text(p)
+                    if not _is_whitespace_only(txt):
+                        self.renderer.diff_paragraph(p, txt, "")
+
+    def _append_inserted_block(self, base_root: etree._Element, r: Block) -> None:
+        """
+        Insert a representation of r into base_root.
+        We append to the end of body/root with green insert runs to avoid structural surprises.
+        """
+        # Determine insertion parent (w:body if exists else root)
+        parent = base_root.find(".//w:body", NS)
+        if parent is None:
+            parent = base_root
+
+        if r.kind == "p":
+            new_p = etree.SubElement(parent, _w("p"))
+            # Put inserted content as all-green "new text"
+            self.renderer.diff_paragraph(new_p, "", r.text)
+
+        elif r.kind == "tbl":
+            # Create a placeholder paragraph indicating table added, and then a shallow clone of table text
+            new_p = etree.SubElement(parent, _w("p"))
+            self.renderer.diff_paragraph(new_p, "", f"[TABLE ADDED] {r.text}")
+
+    # ------------------------ Table diff ------------------------
+
+    def _diff_table(self, base_tbl: etree._Element, rev_tbl: etree._Element) -> None:
+        """
+        Diff tables by structure:
+          - match rows by index
+          - match cells by index
+          - within each cell, diff each paragraph by index
+        """
+        base_rows = base_tbl.findall(".//w:tr", NS)
+        rev_rows = rev_tbl.findall(".//w:tr", NS)
+        max_r = max(len(base_rows), len(rev_rows))
+
+        for i in range(max_r):
+            br = base_rows[i] if i < len(base_rows) else None
+            rr = rev_rows[i] if i < len(rev_rows) else None
+
+            if br is None and rr is not None:
+                # Table row inserted: mark as inserted by adding a green paragraph into first cell of base_tbl
+                # (we avoid complex row insertion to keep doc stable)
+                self._table_row_insert_notice(base_tbl, rr, i)
+                continue
+
+            if br is not None and rr is None:
+                # Row deleted: mark each cell contents deleted
+                for bc in br.findall(".//w:tc", NS):
+                    self._mark_cell_deleted(bc)
+                continue
+
+            if br is None or rr is None:
+                continue
+
+            base_cells = br.findall(".//w:tc", NS)
+            rev_cells = rr.findall(".//w:tc", NS)
+            max_c = max(len(base_cells), len(rev_cells))
+
+            for j in range(max_c):
+                bc = base_cells[j] if j < len(base_cells) else None
+                rc = rev_cells[j] if j < len(rev_cells) else None
+
+                if bc is None and rc is not None:
+                    # Cell inserted: add inserted text into last base cell of row if possible
+                    if base_cells:
+                        self._append_cell_insert_text(base_cells[-1], rc)
+                    continue
+
+                if bc is not None and rc is None:
+                    self._mark_cell_deleted(bc)
+                    continue
+
+                if bc is None or rc is None:
+                    continue
+
+                self._diff_cell(bc, rc)
+
+    def _diff_cell(self, base_tc: etree._Element, rev_tc: etree._Element) -> None:
+        base_ps = base_tc.findall(".//w:p", NS)
+        rev_ps = rev_tc.findall(".//w:p", NS)
+        max_p = max(len(base_ps), len(rev_ps))
+
+        for k in range(max_p):
+            bp = base_ps[k] if k < len(base_ps) else None
+            rp = rev_ps[k] if k < len(rev_ps) else None
+
+            if bp is None and rp is not None:
+                # Insert paragraph into cell: append at end of base cell
+                new_p = etree.SubElement(base_tc, _w("p"))
+                self.renderer.diff_paragraph(new_p, "", get_text(rp))
+                continue
+
+            if bp is not None and rp is None:
+                txt = get_text(bp)
+                if not _is_whitespace_only(txt):
+                    self.renderer.diff_paragraph(bp, txt, "")
+                continue
+
+            if bp is None or rp is None:
+                continue
+
+            old = get_text(bp)
+            new = get_text(rp)
+            if _norm_space(old) == _norm_space(new):
+                continue
+            self.renderer.diff_paragraph(bp, old, new)
+
+    def _mark_cell_deleted(self, tc: etree._Element) -> None:
+        for p in tc.findall(".//w:p", NS):
+            txt = get_text(p)
+            if not _is_whitespace_only(txt):
+                self.renderer.diff_paragraph(p, txt, "")
+
+    def _append_cell_insert_text(self, base_tc: etree._Element, rev_tc: etree._Element) -> None:
+        txt = _safe_text(get_text(rev_tc))
+        if not txt:
+            return
+        new_p = etree.SubElement(base_tc, _w("p"))
+        self.renderer.diff_paragraph(new_p, "", txt)
+
+    def _table_row_insert_notice(self, base_tbl: etree._Element, rr: etree._Element, row_idx: int) -> None:
+        txt = _safe_text(get_text(rr))
+        # put a notice at end of table (simplest stable approach)
+        last_tc = base_tbl.find(".//w:tc", NS)
+        if last_tc is None:
+            return
+        new_p = etree.SubElement(last_tc, _w("p"))
+        self.renderer.diff_paragraph(new_p, "", f"[ROW {row_idx + 1} ADDED] {txt}")
+
+    # ------------------------ Optional Semantic Batch ------------------------
+
+    def semantic_batch(self, changes: List[Dict[str, str]]) -> List[bool]:
+        """
+        Robust AI batch evaluator for contract diffs.
+        Always returns list[bool] same length as 'changes'.
+        Never crashes on Azure errors or invalid JSON.
+        """
+        if not changes:
+            return []
+
+        MAX_CHARS = 800
+        safe_changes = []
+        for ch in changes:
+            old = (ch.get("old") or "")[:MAX_CHARS]
+            new = (ch.get("new") or "")[:MAX_CHARS]
+            safe_changes.append({"old": old, "new": new})
+
+        prompt_payload = {
+            "instruction": (
+                "You are analyzing contract redlines. For each OLD/NEW pair, "
+                "decide if the change is LEGALLY meaningful.\n"
+                "Meaningful = changes obligations, rights, liabilities, scope, parties, dates, definitions.\n"
+                "Trivial = spacing, punctuation, capitalization, formatting, stylistic rewording.\n"
+                'Return ONLY JSON: {"results":[true/false,...]} with EXACT length.'
+            ),
+            "items": safe_changes,
+        }
+
+        # If no client, default to treating changes as meaningful (conservative)
+        if not getattr(self.ai_utils, "client", None) or not getattr(self.ai_utils, "deployment_name", ""):
+            return [True] * len(changes)
+
+        try:
+            response = self.ai_utils.client.chat.completions.create(
+                model=self.ai_utils.deployment_name,
+                messages=[
+                    {"role": "system", "content": "Return only JSON. No explanations."},
+                    {"role": "user", "content": json.dumps(prompt_payload)},
+                ],
+                temperature=0.0,
+                max_tokens=1024,
+                response_format={"type": "json_object"},
+            )
+
+            msg = None
+            try:
+                msg = response.choices[0].message.content
+            except Exception:
+                msg = None
+
+            if not msg:
+                return [True] * len(changes)
+
+            try:
+                data = json.loads(msg)
+            except Exception:
+                return [True] * len(changes)
+
+            results = data.get("results", [])
+            if not isinstance(results, list):
+                return [True] * len(changes)
+
+            final: List[bool] = []
+            for item in results:
+                if isinstance(item, bool):
+                    final.append(item)
+                else:
+                    final.append(True)
+
+            # Length fix
+            if len(final) < len(changes):
+                final.extend([True] * (len(changes) - len(final)))
+            elif len(final) > len(changes):
+                final = final[: len(changes)]
+
+            return final
+
+        except Exception:
+            return [True] * len(changes)
