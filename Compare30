@@ -1,0 +1,87 @@
+function normalizeKey(text: string) {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function parseClauseName(clauseName: string) {
+  // "6. General - Section (13)"
+  const [clausePart, sectionPart] = clauseName.split("- Section").map(s => s.trim());
+
+  const sectionMatch = sectionPart?.match(/\((\d+)\)/);
+
+  return {
+    clauseHeading: clausePart,        // "6. General"
+    sectionNumber: sectionMatch?.[1]  // "13" | undefined
+  };
+}
+
+
+const paragraphs = containerRef.current?.querySelectorAll("p") || [];
+
+paragraphs.forEach((p) => {
+  const text = p.textContent?.trim();
+  if (!text) return;
+
+  // Match numbered clause headings like "6. General"
+  const clauseMatch = text.match(/^(\d+)\.\s+[A-Za-z ]+/);
+  if (clauseMatch) {
+    p.setAttribute(
+      "data-clause-heading",
+      normalizeKey(clauseMatch[0])
+    );
+  }
+
+  // Intro support
+  if (/^intro$/i.test(text)) {
+    p.setAttribute("data-clause-heading", "intro");
+  }
+});
+
+
+useEffect(() => {
+  if (!activeClauseReference || !containerRef.current) return;
+
+  const { clauseHeading, sectionNumber } =
+    parseClauseName(activeClauseReference);
+
+  const headingKey = normalizeKey(clauseHeading);
+
+  // STEP 1: scroll to clause heading
+  const headingEl = containerRef.current.querySelector(
+    `[data-clause-heading="${headingKey}"]`
+  ) as HTMLElement | null;
+
+  if (!headingEl) return;
+
+  headingEl.scrollIntoView({ behavior: "smooth", block: "start" });
+
+  // STEP 2: scroll to subsection if present
+  if (!sectionNumber) return;
+
+  let el = headingEl.nextElementSibling as HTMLElement | null;
+
+  while (el) {
+    const text = el.textContent?.trim() || "";
+
+    // Match "(13)"
+    if (text.startsWith(`(${sectionNumber})`)) {
+      el.scrollIntoView({ behavior: "smooth", block: "start" });
+
+      // highlight
+      el.style.background = "#fff7cc";
+      setTimeout(() => (el.style.background = ""), 1500);
+      break;
+    }
+
+    // Stop when next clause starts
+    if (/^\d+\.\s+[A-Za-z ]+/.test(text)) break;
+
+    el = el.nextElementSibling as HTMLElement | null;
+  }
+}, [activeClauseReference]);
+
+
+
+
