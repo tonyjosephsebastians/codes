@@ -1,0 +1,33 @@
+useEffect(() => {
+  if (!activeClauseReference || !containerRef.current) return;
+
+  const container = containerRef.current;
+
+  // Normalize text for matching
+  const normalize = (text: string) =>
+    text.toLowerCase().replace(/\s+/g, " ").trim();
+
+  // Extract "1 Confidentiality" from "1. Confidentiality - Section (5)"
+  const headingMatch = activeClauseReference.match(/^(\d+)\.\s*([A-Za-z]+)/);
+  if (!headingMatch) return;
+
+  const clauseNumber = headingMatch[1];
+  const clauseName = headingMatch[2];
+
+  const targetText = normalize(`${clauseNumber} ${clauseName}`);
+
+  const paragraphs = Array.from(container.querySelectorAll("p, div, span"));
+
+  const match = paragraphs.find(el =>
+    normalize(el.textContent || "").startsWith(targetText)
+  );
+
+  if (match) {
+    match.scrollIntoView({
+      behavior: "smooth",
+      block: "start",
+    });
+  } else {
+    console.warn("Clause heading not found in document:", targetText);
+  }
+}, [activeClauseReference]);
