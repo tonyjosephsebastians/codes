@@ -1,0 +1,266 @@
+import React, { useEffect, useRef, useState } from "react";
+
+interface WordDocumentPreviewProps {
+  file?: File;
+  fileUrl?: string;
+  fileName?: string;
+  arrayBuffer?: ArrayBuffer;
+  baselineArrayBuffer?: ArrayBuffer;
+  showDiff?: boolean;
+
+  /** 🔑 Supplier redline text used for scrolling */
+  activeSupplierRedline?: string;
+
+  /** Optional sync scrolling */
+  onScroll?: (top: number, left: number) => void;
+  scrollTop?: number;
+  scrollLeft?: number;
+  syncScroll?: boolean;
+}
+
+const WordDocumentPreview: React.FC<WordDocumentPreviewProps> = ({
+  file,
+  fileUrl,
+  fileName,
+  arrayBuffer,
+  baselineArrayBuffer,
+  showDiff = false,
+  activeSupplierRedline,
+  onScroll,
+  scrollTop = 0,
+  scrollLeft = 0,
+  syncScroll = false,
+}) => {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const isRenderingRef = useRef(false);
+  const isScrollingFromSync = useRef(false);
+
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  /* ============================================================
+     Render DOCX
+  ============================================================ */
+  useEffect(() => {
+    let mounted = true;
+
+    const renderDocument = async () => {
+      if (
+        (!file && !fileUrl && !arrayBuffer) ||
+        !containerRef.current ||
+        isRenderingRef.current
+      ) {
+        return;
+      }
+
+      try {
+        isRenderingRef.current = true;
+        setLoading(true);
+        setError(null);
+
+        const docxPreview = await import("docx-preview");
+
+        let data: ArrayBuffer;
+
+        if (arrayBuffer) {
+          data = arrayBuffer;
+        } else if (file instanceof File) {
+          data = await file.arrayBuffer();
+        } else if (fileUrl) {
+          const res = await fetch(fileUrl);
+          if (!res.ok) {
+            throw new Error("Failed to fetch document");
+          }
+          data = await res.arrayBuffer();
+        } else {
+          throw new Error("No document data available");
+        }
+
+        if (!data || data.byteLength === 0) {
+          throw new Error("The document is empty");
+        }
+
+        // Clear previous content
+        containerRef.current.innerHTML = "";
+
+        const wrapper = document.createElement("div");
+        wrapper.className = "docx-wrapper";
+        containerRef.current.appendChild(wrapper);
+
+        await docxPreview.renderAsync(data, wrapper, undefined, {
+          inWrapper: true,
+          ignoreWidth: false,
+          ignoreHeight: false,
+          breakPages: true,
+          renderHeaders: true,
+          renderFooters: true,
+          renderFootnotes: true,
+          renderEndnotes: true,
+        });
+
+        /* ============================================================
+           🔑 STEP: Tag every paragraph with its text
+           (THIS IS WHAT MAKES SCROLLING WORK)
+        ============================================================ */
+        const paragraphs = containerRef.current.querySelectorAll("p");
+        paragraphs.forEach((p) => {
+          const text = p.textContent
+            ?.replace(/\s+/g, " ")
+            .trim()
+            .toLowerCase();
+
+          if (text && text.length > 20) {
+            p.setAttribute("data-paragraph-text", text);
+          }
+        });
+
+        /* ============================================================
+           Inject Word-like redline styles
+        ============================================================ */
+        const style = document.createElement("style");
+        style.textContent = `
+          .docx-wrapper {
+            font-family: Calibri, sans-serif;
+            font-size: 10pt;
+            line-height: 1.5;
+            background: white;
+          }
+
+          .word-insert {
+            color: rgb(69, 205, 69);
+            font-weight: 600;
+          }
+
+          .word-delete {
+            color: rgb(227, 13, 16);
+            text-decoration: line-through;
+          }
+
+          .supplier-anchor {
+            background: rgba(255, 235, 59, 0.35);
+          }
+        `;
+        containerRef.current.appendChild(style);
+
+        setLoading(false);
+      } catch (err: any) {
+        console.error("DOCX render error:", err);
+        setError(err.message || "Failed to render document");
+        setLoading(false);
+      } finally {
+        isRenderingRef.current = false;
+      }
+    };
+
+    renderDocument();
+
+    return () => {
+      mounted = false;
+      if (containerRef.current) {
+        containerRef.current.innerHTML = "";
+      }
+    };
+  }, [file, fileUrl, arrayBuffer, baselineArrayBuffer, showDiff]);
+
+  /* ============================================================
+     🔑 SUPPLIER REDLINE TEXT SCROLLING (MAIN FIX)
+  ============================================================ */
+  useEffect(() => {
+    if (!activeSupplierRedline || !containerRef.current) return;
+
+    const anchor = activeSupplierRedline
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 120)
+      .toLowerCase();
+
+    const paragraphs = containerRef.current.querySelectorAll("p");
+
+    for (const p of paragraphs) {
+      const paraText = p.getAttribute("data-paragraph-text");
+      if (!paraText) continue;
+
+      if (paraText.includes(anchor)) {
+        p.scrollIntoView({
+          behavior: "smooth",
+          block: "center",
+        });
+
+        // Highlight briefly (debug / UX)
+        p.classList.add("supplier-anchor");
+        setTimeout(() => p.classList.remove("supplier-anchor"), 2000);
+
+        break;
+      }
+    }
+  }, [activeSupplierRedline]);
+
+  /* ============================================================
+     Optional synchronized scrolling
+  ============================================================ */
+  useEffect(() => {
+    if (
+      syncScroll &&
+      scrollContainerRef.current &&
+      !isScrollingFromSync.current
+    ) {
+      isScrollingFromSync.current = true;
+
+      requestAnimationFrame(() => {
+        scrollContainerRef.current!.scrollTop = scrollTop;
+        scrollContainerRef.current!.scrollLeft = scrollLeft;
+
+        setTimeout(() => {
+          isScrollingFromSync.current = false;
+        }, 16);
+      });
+    }
+  }, [scrollTop, scrollLeft, syncScroll]);
+
+  const handleScroll = (e: React.UIEvent<HTMLDivElement>) => {
+    if (isScrollingFromSync.current || !onScroll) return;
+
+    const target = e.target as HTMLDivElement;
+    onScroll(target.scrollTop, target.scrollLeft);
+  };
+
+  /* ============================================================
+     Render
+  ============================================================ */
+  return (
+    <div className="flex flex-col h-full bg-white">
+      {file && (
+        <div className="p-2 text-sm text-gray-600 border-b bg-gray-50 text-center">
+          {fileName || file.name}
+        </div>
+      )}
+
+      {loading && (
+        <div className="flex items-center justify-center h-full">
+          Loading document…
+        </div>
+      )}
+
+      {error && (
+        <div className="flex items-center justify-center h-full text-red-600">
+          {error}
+        </div>
+      )}
+
+      <div
+        ref={scrollContainerRef}
+        className="flex-1 overflow-auto p-2 bg-gray-50"
+        onScroll={handleScroll}
+      >
+        <div
+          ref={containerRef}
+          className={`${loading || error ? "hidden" : ""}`}
+          style={{ minHeight: "100%", width: "100%" }}
+        />
+      </div>
+    </div>
+  );
+};
+
+export default WordDocumentPreview;
