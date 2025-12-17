@@ -1,0 +1,271 @@
+import React, { useEffect, useRef, useState } from "react";
+import { Loader2 } from "lucide-react";
+import { renderAsync as renderDocx } from "docx-preview";
+import { aiCompareApi } from "@/services/api";
+
+/* =========================
+   Props
+========================= */
+interface WordDocumentPreviewProps {
+  file?: File;
+  fileUrl?: string;
+  arrayBuffer?: ArrayBuffer;
+  baselineArrayBuffer?: ArrayBuffer | null;
+  fileName?: string;
+
+  onScroll?: (scrollTop: number, scrollLeft: number) => void;
+  scrollTop?: number;
+  scrollLeft?: number;
+  syncScroll?: boolean;
+
+  showDiff?: boolean;
+
+  /** Clause text coming from Risk Summary / Supplier Redlines */
+  activeClauseReference?: string | null;
+}
+
+/* =========================
+   Helpers
+========================= */
+const normalize = (text: string) =>
+  text
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[^\w\s.]/g, "")
+    .trim();
+
+const toBase64 = (buf: ArrayBuffer) =>
+  btoa(String.fromCharCode(...new Uint8Array(buf)));
+
+export default function WordDocumentPreview({
+  file,
+  fileUrl,
+  arrayBuffer,
+  baselineArrayBuffer,
+  fileName,
+
+  onScroll,
+  scrollTop = 0,
+  scrollLeft = 0,
+  syncScroll = false,
+
+  showDiff = false,
+  activeClauseReference = null,
+}: WordDocumentPreviewProps) {
+  /* =========================
+     Refs & State
+  ========================= */
+  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+
+  const isRenderingRef = useRef(false);
+  const renderCompleteRef = useRef(false);
+  const isScrollingFromSync = useRef(false);
+
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  /* =========================
+     AI Diff Fetch
+  ========================= */
+  async function fetchWordAIDiff(
+    baseline: ArrayBuffer,
+    revised: ArrayBuffer
+  ) {
+    const res = await aiCompareApi.compareDocuments(
+      toBase64(baseline),
+      toBase64(revised)
+    );
+
+    if (!res?.diff_docx_b64) {
+      throw new Error("Invalid diff response");
+    }
+
+    return Uint8Array.from(atob(res.diff_docx_b64), (c) =>
+      c.charCodeAt(0)
+    ).buffer;
+  }
+
+  /* =========================
+     Clause Indexing (SAFE)
+     - Does NOT touch spans
+  ========================= */
+  const indexClauses = () => {
+    if (!containerRef.current) return;
+
+    const paragraphs = containerRef.current.querySelectorAll("p");
+
+    paragraphs.forEach((p) => {
+      if (p.hasAttribute("data-clause")) return;
+
+      const text = p.textContent;
+      if (!text) return;
+
+      const match = text.match(/^(\d+)\.\s+[A-Za-z ]+/);
+      if (!match) return;
+
+      p.setAttribute("data-clause", normalize(match[0]));
+    });
+  };
+
+  /* =========================
+     Render DOCX
+  ========================= */
+  useEffect(() => {
+    let mounted = true;
+
+    const renderDocument = async () => {
+      if (!mounted || isRenderingRef.current || !containerRef.current) return;
+
+      try {
+        setLoading(true);
+        setError(null);
+        isRenderingRef.current = true;
+        renderCompleteRef.current = false;
+
+        let data: ArrayBuffer | undefined;
+
+        if (showDiff && arrayBuffer && baselineArrayBuffer) {
+          data = await fetchWordAIDiff(baselineArrayBuffer, arrayBuffer);
+        } else if (arrayBuffer) {
+          data = arrayBuffer;
+        } else if (file) {
+          data = await file.arrayBuffer();
+        } else if (fileUrl) {
+          const r = await fetch(fileUrl);
+          data = await r.arrayBuffer();
+        }
+
+        if (!data) throw new Error("No document data");
+
+        containerRef.current.innerHTML = "";
+
+        await renderDocx(data, containerRef.current, undefined, {
+          inWrapper: true,
+          breakPages: true,
+          renderHeaders: true,
+          renderFooters: true,
+          renderFootnotes: true,
+          experimental: true,
+        });
+
+        indexClauses();
+        renderCompleteRef.current = true;
+      } catch (e: any) {
+        console.error(e);
+        setError(e.message || "Failed to render document");
+      } finally {
+        isRenderingRef.current = false;
+        setLoading(false);
+      }
+    };
+
+    renderDocument();
+
+    return () => {
+      mounted = false;
+      if (containerRef.current) {
+        containerRef.current.innerHTML = "";
+      }
+    };
+  }, [arrayBuffer, baselineArrayBuffer, file, fileUrl, showDiff]);
+
+  /* =========================
+     Scroll to Clause (FIXED)
+  ========================= */
+  useEffect(() => {
+    if (
+      !activeClauseReference ||
+      !renderCompleteRef.current ||
+      !scrollContainerRef.current ||
+      !containerRef.current
+    ) {
+      return;
+    }
+
+    const key = normalize(activeClauseReference);
+    const target = containerRef.current.querySelector(
+      `[data-clause="${key}"]`
+    ) as HTMLElement | null;
+
+    if (!target) {
+      console.warn("Clause not found:", activeClauseReference);
+      return;
+    }
+
+    const scrollContainer = scrollContainerRef.current;
+
+    const offset =
+      target.getBoundingClientRect().top -
+      scrollContainer.getBoundingClientRect().top +
+      scrollContainer.scrollTop -
+      80;
+
+    scrollContainer.scrollTo({
+      top: offset,
+      behavior: "smooth",
+    });
+  }, [activeClauseReference]);
+
+  /* =========================
+     Sync Scroll (optional)
+  ========================= */
+  useEffect(() => {
+    if (
+      !syncScroll ||
+      !scrollContainerRef.current ||
+      isScrollingFromSync.current
+    ) {
+      return;
+    }
+
+    isScrollingFromSync.current = true;
+    scrollContainerRef.current.scrollTop = scrollTop;
+    scrollContainerRef.current.scrollLeft = scrollLeft;
+
+    setTimeout(() => {
+      isScrollingFromSync.current = false;
+    }, 16);
+  }, [scrollTop, scrollLeft, syncScroll]);
+
+  const handleScroll = (e: React.UIEvent<HTMLDivElement>) => {
+    if (isScrollingFromSync.current || !onScroll) return;
+    const el = e.currentTarget;
+    onScroll(el.scrollTop, el.scrollLeft);
+  };
+
+  /* =========================
+     UI
+  ========================= */
+  return (
+    <div className="flex flex-col h-full bg-white">
+      {fileName && (
+        <div className="p-2 text-xs text-gray-600 border-b">{fileName}</div>
+      )}
+
+      {loading && (
+        <div className="flex-1 flex items-center justify-center">
+          <Loader2 className="h-8 w-8 animate-spin text-[#007C41]" />
+        </div>
+      )}
+
+      {error && (
+        <div className="flex-1 flex items-center justify-center text-red-500">
+          {error}
+        </div>
+      )}
+
+      <div
+        ref={scrollContainerRef}
+        className="flex-1 overflow-auto bg-gray-50"
+        onScroll={handleScroll}
+      >
+        <div
+          ref={containerRef}
+          className="docx-container"
+          style={{ minHeight: "100%", width: "100%" }}
+        />
+      </div>
+    </div>
+  );
+}
