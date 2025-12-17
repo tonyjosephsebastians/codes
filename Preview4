@@ -1,0 +1,69 @@
+useEffect(() => {
+  if (
+    !activeClauseReference ||
+    !containerRef.current ||
+    !scrollContainerRef.current
+  ) {
+    return;
+  }
+
+  const normalize = (t: string) =>
+    t
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .replace(/[^\w\s().,-]/g, "")
+      .trim();
+
+  const target = normalize(activeClauseReference);
+
+  requestAnimationFrame(() => {
+    setTimeout(() => {
+      const container = containerRef.current!;
+      const outer = scrollContainerRef.current!;
+
+      const candidates = [
+        outer,
+        container,
+        container.querySelector("section.docx"),
+      ].filter(Boolean) as HTMLElement[];
+
+      // 🔍 find the actual scrollable element
+      const scrollHost =
+        candidates.find(
+          el => el.scrollHeight > el.clientHeight
+        ) || outer;
+
+      const nodes = Array.from(
+        container.querySelectorAll("p, li, td")
+      ) as HTMLElement[];
+
+      const match = nodes.find(n =>
+        normalize(n.textContent || "").includes(target)
+      );
+
+      if (!match) {
+        console.warn("Clause not found:", activeClauseReference);
+        return;
+      }
+
+      // highlight
+      container
+        .querySelectorAll(".active-clause")
+        .forEach(el => el.classList.remove("active-clause"));
+      match.classList.add("active-clause");
+
+      const top =
+        match.offsetTop -
+        scrollHost.offsetTop -
+        120;
+
+      console.log("Scrolling host:", scrollHost);
+      console.log("ScrollTop:", top);
+
+      scrollHost.scrollTo({
+        top,
+        behavior: "smooth",
+      });
+    }, 150);
+  });
+}, [activeClauseReference]);
