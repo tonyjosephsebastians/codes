@@ -1,0 +1,53 @@
+useEffect(() => {
+  if (
+    !activeClauseReference ||
+    !containerRef.current ||
+    !scrollContainerRef.current
+  ) {
+    return;
+  }
+
+  const normalize = (t: string) =>
+    t
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .replace(/[^\w\s().,-]/g, "")
+      .trim();
+
+  const target = normalize(activeClauseReference);
+
+  // 🔁 wait for DOCX layout to finish
+  requestAnimationFrame(() => {
+    setTimeout(() => {
+      const container = containerRef.current!;
+      const scrollContainer = scrollContainerRef.current!;
+
+      const nodes = Array.from(
+        container.querySelectorAll("p, li, td")
+      ) as HTMLElement[];
+
+      const match = nodes.find(n =>
+        normalize(n.textContent || "").includes(target)
+      );
+
+      if (!match) {
+        console.warn("Clause not found:", activeClauseReference);
+        return;
+      }
+
+      // remove previous highlights
+      container
+        .querySelectorAll(".active-clause")
+        .forEach(el => el.classList.remove("active-clause"));
+
+      // highlight
+      match.classList.add("active-clause");
+
+      // ✅ FINAL SCROLL (WORKING)
+      scrollContainer.scrollTo({
+        top: match.offsetTop - 120,
+        behavior: "smooth",
+      });
+    }, 120); // <-- CRITICAL delay
+  });
+}, [activeClauseReference]);
