@@ -1,0 +1,49 @@
+useEffect(() => {
+  if (!activeClauseReference || !containerRef.current) return;
+
+  const normalize = (t: string) =>
+    t.toLowerCase().replace(/\s+/g, " ").trim();
+
+  const target = normalize(activeClauseReference);
+
+  const nodes = Array.from(
+    containerRef.current.querySelectorAll("p, li, td")
+  ) as HTMLElement[];
+
+  const match = nodes.find(n =>
+    normalize(n.textContent || "").includes(target)
+  );
+
+  if (!match) {
+    console.warn("Clause not found:", activeClauseReference);
+    return;
+  }
+
+  // Clear previous highlights
+  containerRef.current
+    .querySelectorAll(".active-clause")
+    .forEach(el => el.classList.remove("active-clause"));
+
+  match.classList.add("active-clause");
+
+  /**
+   * 🔥 THIS IS THE KEY DIFFERENCE
+   * Uses DOM Range instead of scrollTop math
+   */
+  const range = document.createRange();
+  range.selectNodeContents(match);
+
+  const sel = window.getSelection();
+  sel?.removeAllRanges();
+  sel?.addRange(range);
+
+  // Force browser-native scroll (same as Ctrl+F)
+  match.scrollIntoView({
+    behavior: "smooth",
+    block: "center",
+    inline: "nearest",
+  });
+
+  // Optional: clear selection after scroll
+  setTimeout(() => sel?.removeAllRanges(), 300);
+}, [activeClauseReference]);
