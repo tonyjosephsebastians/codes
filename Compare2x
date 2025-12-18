@@ -1,0 +1,120 @@
+const clauseScrollLock = useRef(false);
+const pauseSyncScroll = useRef(false);
+
+
+useEffect(() => {
+  if (!activeClauseReference || !containerRef.current) return;
+
+  const normalize = (t: string) =>
+    t.toLowerCase().replace(/\s+/g, " ").replace(/[^\w\s]/g, "").trim();
+
+  const target = normalize(activeClauseReference);
+
+  const nodes = Array.from(
+    containerRef.current.querySelectorAll("p, li, td")
+  ) as HTMLElement[];
+
+  let match: HTMLElement | undefined;
+
+  for (const node of nodes) {
+    const clone = node.cloneNode(true) as HTMLElement;
+
+    // 🔥 Diff-safe: ignore deleted text
+    clone.querySelectorAll(".word-delete").forEach(el => el.remove());
+
+    const cleanText = normalize(clone.innerText || "");
+    if (cleanText.includes(target.slice(0, 30))) {
+      match = node;
+      break;
+    }
+  }
+
+  if (!match) {
+    console.warn("Clause not found:", activeClauseReference);
+    return;
+  }
+
+  // 🔒 LOCK sync scroll
+  clauseScrollLock.current = true;
+  pauseSyncScroll.current = true;
+  isSyncingRef.current = true;
+
+  // 🔶 Highlight
+  containerRef.current
+    .querySelectorAll(".active-clause")
+    .forEach(el => el.classList.remove("active-clause"));
+
+  match.classList.add("active-clause");
+
+  // ✅ Browser-native scroll (most stable)
+  match.scrollIntoView({
+    behavior: "smooth",
+    block: "center",
+    inline: "nearest",
+  });
+
+  // 🔓 RELEASE locks after scroll settles
+  const settleTime = 800;
+  setTimeout(() => {
+    isSyncingRef.current = false;
+    clauseScrollLock.current = false;
+    pauseSyncScroll.current = false;
+
+    // propagate final position for sync
+    onScroll?.(
+      scrollContainerRef.current!.scrollTop,
+      scrollContainerRef.current!.scrollLeft
+    );
+  }, settleTime);
+}, [activeClauseReference, showDiff]);
+
+
+
+useEffect(() => {
+  if (
+    !syncScroll ||
+    pauseSyncScroll.current ||
+    clauseScrollLock.current ||
+    !scrollContainerRef.current ||
+    isSyncingRef.current
+  )
+    return;
+
+  isSyncingRef.current = true;
+
+  requestAnimationFrame(() => {
+    scrollContainerRef.current!.scrollTop = scrollTop;
+    scrollContainerRef.current!.scrollLeft = scrollLeft;
+
+    setTimeout(() => {
+      isSyncingRef.current = false;
+    }, 16);
+  });
+}, [scrollTop, scrollLeft, syncScroll]);
+
+
+
+
+const handleScroll = (e: React.UIEvent<HTMLDivElement>) => {
+  if (
+    isSyncingRef.current ||
+    pauseSyncScroll.current ||
+    clauseScrollLock.current ||
+    !onScroll
+  )
+    return;
+
+  const t = e.currentTarget;
+  onScroll(t.scrollTop, t.scrollLeft);
+};
+
+
+.active-clause {
+  background: rgba(255, 235, 59, 0.45);
+  transition: background 0.4s ease;
+}
+
+
+
+
+
