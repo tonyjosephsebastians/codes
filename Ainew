@@ -1,0 +1,73 @@
+/* ===================== CLAUSE SCROLL (FINAL – DIFF SAFE) ===================== */
+
+useEffect(() => {
+  if (!activeClauseReference || !containerRef.current) return;
+
+  const normalize = (t: string) =>
+    t
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .replace(/[^\w\s().,-]/g, "")
+      .trim();
+
+  const target = normalize(activeClauseReference);
+
+  const nodes = Array.from(
+    containerRef.current.querySelectorAll("p, li, td")
+  ) as HTMLElement[];
+
+  let match: HTMLElement | null = null;
+
+  for (const node of nodes) {
+    // Clone node to safely clean diff markup
+    const clone = node.cloneNode(true) as HTMLElement;
+
+    // ❌ Remove deleted text
+    clone
+      .querySelectorAll(".word-delete, del")
+      .forEach(el => el.remove());
+
+    // ✅ Keep inserted text
+    const cleanText = normalize(clone.innerText || "");
+
+    if (
+      cleanText.includes(target.slice(0, 40)) || // primary
+      cleanText.includes(target.slice(0, 20))    // fallback
+    ) {
+      match = node;
+      break;
+    }
+  }
+
+  if (!match) {
+    console.warn("Clause not found (diff-safe):", activeClauseReference);
+    return;
+  }
+
+  /* ---------- Highlight ---------- */
+  containerRef.current
+    .querySelectorAll(".active-clause")
+    .forEach(el => el.classList.remove("active-clause"));
+
+  match.classList.add("active-clause");
+
+  /* ---------- FORCE BROWSER NATIVE SCROLL (KEY FIX) ---------- */
+  const range = document.createRange();
+  range.selectNodeContents(match);
+
+  const sel = window.getSelection();
+  sel?.removeAllRanges();
+  sel?.addRange(range);
+
+  // This behaves EXACTLY like Ctrl+F
+  match.scrollIntoView({
+    behavior: "smooth",
+    block: "center",
+    inline: "nearest",
+  });
+
+  // Optional: clear selection after scroll
+  setTimeout(() => {
+    sel?.removeAllRanges();
+  }, 800);
+}, [activeClauseReference, showDiff]);
