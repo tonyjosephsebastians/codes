@@ -1,0 +1,68 @@
+useEffect(() => {
+  if (
+    !activeClauseReference ||
+    !containerRef.current ||
+    !scrollContainerRef.current
+  ) return;
+
+  const normalize = (t: string) =>
+    t
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .replace(/[^\w\s]/g, "")
+      .trim();
+
+  const target = normalize(activeClauseReference);
+
+  const paragraphs = Array.from(
+    containerRef.current.querySelectorAll("p")
+  ) as HTMLParagraphElement[];
+
+  let match: HTMLParagraphElement | null = null;
+
+  for (const p of paragraphs) {
+    // 🔹 Build clean paragraph text (ignore deleted spans)
+    const clone = p.cloneNode(true) as HTMLElement;
+
+    clone
+      .querySelectorAll(".word-delete")
+      .forEach(el => el.remove());
+
+    const cleanText = normalize(clone.innerText || "");
+
+    // 🔹 Primary search (diff-safe)
+    if (cleanText.includes(target.slice(0, 30))) {
+      match = p;
+      break;
+    }
+
+    // 🔹 Fallback: paragraph contains diff markers
+    if (
+      p.querySelector(".word-insert, .word-delete") &&
+      cleanText.includes(target.slice(0, 15))
+    ) {
+      match = p;
+      break;
+    }
+  }
+
+  if (!match) {
+    console.warn("Clause not found (diff-safe search):", activeClauseReference);
+    return;
+  }
+
+  // 🟡 Highlight paragraph
+  containerRef.current
+    .querySelectorAll(".active-clause")
+    .forEach(el => el.classList.remove("active-clause"));
+
+  match.classList.add("active-clause");
+
+  // 🟢 Scroll
+  const scrollHost = scrollContainerRef.current;
+
+  scrollHost.scrollTo({
+    top: match.offsetTop - scrollHost.offsetTop - 120,
+    behavior: "smooth",
+  });
+}, [activeClauseReference, showDiff]);
