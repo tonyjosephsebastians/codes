@@ -1,0 +1,284 @@
+async def _match_clauses_between_documents(
+    self,
+    baseline_clauses: list[dict],
+    supplier_clauses: list[dict],
+) -> tuple[list[tuple[dict, dict]], list[dict], list[dict]]:
+    """
+    Fixes mis-pairing when a section/subsection is deleted and the rest "shift" (e.g., supplier (9) deleted so supplier (10)
+    gets incorrectly paired to baseline (9) if you rely on section_number).
+
+    Strategy:
+    1) Bucket by (main_clause_number, clause_type) so we only compare comparable items.
+    2) Within each bucket, do ORDER-PRESERVING alignment using embedding cosine similarity (dynamic programming).
+       This naturally handles deletions (gaps) without shifting all subsequent matches incorrectly.
+    3) Keep strict matching by exact section_number ONLY if the text similarity is also high (guards against reorder bugs).
+    """
+
+    import math
+
+    def _norm(s: str | None) -> str:
+        return (s or "").strip()
+
+    def _to_int_like(x: str) -> int | None:
+        """Extract int from '(9)' or '9' or 'Section 9' etc."""
+        if not x:
+            return None
+        t = _norm(x)
+        t = t.replace("Section", "").replace("section", "").replace("(", "").replace(")", "").strip()
+        # handle things like "9.1" -> 9 (still preserves ordering reasonably)
+        parts = t.split(".")
+        try:
+            return int(parts[0])
+        except Exception:
+            return None
+
+    def _sort_key(cl: dict) -> tuple:
+        """Stable sort: by numeric section_number if possible, else raw string."""
+        sec = _norm(cl.get("section_number"))
+        n = _to_int_like(sec)
+        # Put numeric first; non-numeric later but stable
+        if n is not None:
+            return (0, n, sec)
+        return (1, sec)
+
+    def _cos_sim(a, b) -> float:
+        try:
+            return float(self.processor._cosine_similarity(a, b))
+        except Exception:
+            return 0.0
+
+    def _has_emb(cl: dict) -> bool:
+        emb = cl.get("embedding", None)
+        return emb is not None and isinstance(emb, (list, tuple)) and len(emb) > 0
+
+    def _bucket_key(cl: dict) -> tuple[str, str]:
+        # Use BOTH fields you said you have: main_section_number + clause_type
+        main_clause = _norm(cl.get("main_clause_number"))
+        ctype = _norm(cl.get("clause_type")) or _norm(cl.get("section_title"))
+        return (main_clause, ctype)
+
+    # --- Prep / stable ordering ---
+    baseline_sorted = sorted(baseline_clauses, key=_sort_key)
+    supplier_sorted = sorted(supplier_clauses, key=_sort_key)
+
+    matches: list[tuple[dict, dict]] = []
+    used_supplier_ids: set[int] = set()
+    used_baseline_ids: set[int] = set()
+
+    # --- Phase 0: Optional "safe exact section_number match" (only if similarity is high) ---
+    # This keeps perfect pairs fast, but avoids the old bug where (9) pairs to shifted (10).
+    EXACT_SIM_THRESHOLD = 0.75  # must be pretty high to trust exact numbering
+    supplier_index_by_sig: dict[tuple[str, str, str], list[tuple[int, dict]]] = {}
+
+    for j, sc in enumerate(supplier_sorted):
+        sig = (_norm(sc.get("main_clause_number")), _norm(sc.get("clause_type")) or _norm(sc.get("section_title")), _norm(sc.get("section_number")))
+        supplier_index_by_sig.setdefault(sig, []).append((j, sc))
+
+    for i, bc in enumerate(baseline_sorted):
+        sig = (_norm(bc.get("main_clause_number")), _norm(bc.get("clause_type")) or _norm(bc.get("section_title")), _norm(bc.get("section_number")))
+        if sig not in supplier_index_by_sig:
+            continue
+        if not _has_emb(bc):
+            continue
+
+        # pick first unused exact candidate with strong similarity
+        for (j, sc) in supplier_index_by_sig[sig]:
+            if j in used_supplier_ids:
+                continue
+            if not _has_emb(sc):
+                continue
+            sim = _cos_sim(bc["embedding"], sc["embedding"])
+            if sim >= EXACT_SIM_THRESHOLD:
+                matches.append((bc, sc))
+                used_baseline_ids.add(id(bc))
+                used_supplier_ids.add(j)
+                logger.info(
+                    f"Phase 0 exact-safe match: main={sig[0]} type={sig[1]} section={sig[2]} sim={sim:.3f}"
+                )
+                break
+
+    # Build remaining lists after Phase 0
+    remaining_baseline = [bc for bc in baseline_sorted if id(bc) not in used_baseline_ids]
+    remaining_supplier = [(j, sc) for j, sc in enumerate(supplier_sorted) if j not in used_supplier_ids]
+
+    # --- Phase 1: Bucketed, order-preserving alignment (the real fix) ---
+    # Group remaining by (main_clause_number, clause_type)
+    b_buckets: dict[tuple[str, str], list[dict]] = {}
+    s_buckets: dict[tuple[str, str], list[tuple[int, dict]]] = {}
+
+    for bc in remaining_baseline:
+        b_buckets.setdefault(_bucket_key(bc), []).append(bc)
+    for j, sc in remaining_supplier:
+        s_buckets.setdefault(_bucket_key(sc), []).append((j, sc))
+
+    # Alignment hyperparams
+    MATCH_MIN_SIM = 0.60     # accept as a valid match
+    GAP_PENALTY = 0.15       # allow deletions but don’t over-skip
+    # NOTE: if your embeddings are very strong, you can increase MATCH_MIN_SIM to 0.65+
+
+    def _align_bucket(b_list: list[dict], s_list: list[tuple[int, dict]]) -> tuple[list[tuple[dict, dict]], set[int], set[int]]:
+        """
+        Needleman–Wunsch style alignment:
+        - Maximizes total similarity - gap penalties
+        - Preserves order
+        - Naturally handles one side having a deleted/missing section without shifting subsequent pairs incorrectly
+        """
+        # Ensure stable order inside the bucket
+        b_list = sorted(b_list, key=_sort_key)
+        s_list = sorted(s_list, key=lambda x: _sort_key(x[1]))
+
+        n = len(b_list)
+        m = len(s_list)
+
+        # If embeddings missing, fallback to greedy by section_number equality only (still bucketed)
+        if n == 0 or m == 0:
+            return [], set(), set()
+
+        # Build similarity matrix
+        sim = [[0.0 for _ in range(m)] for __ in range(n)]
+        for i in range(n):
+            bi = b_list[i]
+            for j in range(m):
+                sj = s_list[j][1]
+                if _has_emb(bi) and _has_emb(sj):
+                    sim[i][j] = _cos_sim(bi["embedding"], sj["embedding"])
+                else:
+                    # very weak fallback: section_number proximity (still helps preserve order)
+                    bsec = _to_int_like(_norm(bi.get("section_number")))
+                    ssec = _to_int_like(_norm(sj.get("section_number")))
+                    if bsec is not None and ssec is not None:
+                        dist = abs(bsec - ssec)
+                        sim[i][j] = max(0.0, 1.0 - (dist / 10.0))  # crude
+                    else:
+                        sim[i][j] = 0.0
+
+        # DP tables
+        dp = [[0.0 for _ in range(m + 1)] for __ in range(n + 1)]
+        bt = [[None for _ in range(m + 1)] for __ in range(n + 1)]  # 'M', 'B', 'S' (match, skip baseline, skip supplier)
+
+        # init gaps
+        for i in range(1, n + 1):
+            dp[i][0] = dp[i - 1][0] - GAP_PENALTY
+            bt[i][0] = "B"
+        for j in range(1, m + 1):
+            dp[0][j] = dp[0][j - 1] - GAP_PENALTY
+            bt[0][j] = "S"
+
+        # fill
+        for i in range(1, n + 1):
+            for j in range(1, m + 1):
+                match_score = dp[i - 1][j - 1] + sim[i - 1][j - 1]
+                skip_b = dp[i - 1][j] - GAP_PENALTY
+                skip_s = dp[i][j - 1] - GAP_PENALTY
+
+                best = match_score
+                best_bt = "M"
+                if skip_b > best:
+                    best = skip_b
+                    best_bt = "B"
+                if skip_s > best:
+                    best = skip_s
+                    best_bt = "S"
+
+                dp[i][j] = best
+                bt[i][j] = best_bt
+
+        # backtrack
+        i, j = n, m
+        bucket_matches: list[tuple[dict, dict]] = []
+        used_s_idx: set[int] = set()
+        used_b_idx: set[int] = set()
+
+        while i > 0 or j > 0:
+            step = bt[i][j]
+            if step == "M":
+                bi = b_list[i - 1]
+                sj_global_index, sj = s_list[j - 1]
+                s_val = sim[i - 1][j - 1]
+
+                # Accept only if similarity is good; otherwise treat as "no match" (skip the worse side)
+                if s_val >= MATCH_MIN_SIM:
+                    bucket_matches.append((bi, sj))
+                    used_b_idx.add(id(bi))
+                    used_s_idx.add(sj_global_index)
+                else:
+                    # if similarity is too low, don’t force match; prefer skip that keeps order
+                    # choose skip based on which gives higher dp
+                    # (we can safely move diagonally but without pairing)
+                    pass
+
+                i -= 1
+                j -= 1
+            elif step == "B":
+                i -= 1
+            elif step == "S":
+                j -= 1
+            else:
+                # safety
+                if i > 0:
+                    i -= 1
+                elif j > 0:
+                    j -= 1
+
+        bucket_matches.reverse()
+        return bucket_matches, used_b_idx, used_s_idx
+
+    # Run alignment per bucket
+    for key in sorted(set(list(b_buckets.keys()) + list(s_buckets.keys()))):
+        b_list = b_buckets.get(key, [])
+        s_list = s_buckets.get(key, [])
+        if not b_list or not s_list:
+            continue
+
+        bucket_matches, used_b_ids, used_s_global = _align_bucket(b_list, s_list)
+
+        for bc, sc in bucket_matches:
+            matches.append((bc, sc))
+            used_baseline_ids.add(id(bc))
+        for sj in used_s_global:
+            used_supplier_ids.add(sj)
+
+        # Helpful debugging for your “section 9 deleted -> shift” case:
+        # Compare counts and gaps in section numbers within this bucket.
+        try:
+            b_secs = [_to_int_like(_norm(x.get("section_number"))) for x in b_list]
+            s_secs = [_to_int_like(_norm(x[1].get("section_number"))) for x in s_list]
+            b_secs = [x for x in b_secs if x is not None]
+            s_secs = [x for x in s_secs if x is not None]
+            if b_secs and s_secs and (len(b_secs) != len(s_secs)):
+                logger.info(
+                    f"Bucket count mismatch (possible deletion/insert): main={key[0]} type={key[1]} "
+                    f"baseline_count={len(b_secs)} supplier_count={len(s_secs)} "
+                    f"baseline_secs={b_secs} supplier_secs={s_secs}"
+                )
+        except Exception:
+            pass
+
+    # --- Final unmatched ---
+    matched_baseline_ids = {id(m[0]) for m in matches}
+    matched_supplier_ids = {id(m[1]) for m in matches}
+
+    unmatched_baseline = [bc for bc in baseline_sorted if id(bc) not in matched_baseline_ids]
+    unmatched_supplier = [sc for sc in supplier_sorted if id(sc) not in matched_supplier_ids]
+
+    logger.info(
+        f"Final matching: {len(matches)} matches, {len(unmatched_baseline)} unmatched baseline, {len(unmatched_supplier)} unmatched supplier"
+    )
+
+    # (Optional) write debug file
+    try:
+        with open("clause_matches.txt", "w", encoding="utf-8") as f:
+            for bc, sc in matches:
+                f.write(
+                    f"BASE(main={bc.get('main_clause_number')}, type={bc.get('clause_type')}, sec={bc.get('section_number')}): "
+                    f"{(bc.get('text') or '')[:200].replace('\\n',' ')}\n"
+                )
+                f.write(
+                    f"SUPP(main={sc.get('main_clause_number')}, type={sc.get('clause_type')}, sec={sc.get('section_number')}): "
+                    f"{(sc.get('text') or '')[:200].replace('\\n',' ')}\n"
+                )
+                f.write("-" * 80 + "\n")
+    except Exception as e:
+        logger.warning(f"Could not write clause_matches.txt: {e}")
+
+    return matches, unmatched_baseline, unmatched_supplier
