@@ -1,0 +1,162 @@
+async def _match_clauses_between_documents(
+    self,
+    baseline_clauses: List[Dict[str, Any]],
+    supplier_clauses: List[Dict[str, Any]],
+) -> Tuple[List[Tuple[Dict, Dict]], List[Dict], List[Dict]]:
+
+    matches = []
+    used_supplier_indices = set()
+
+    def norm(x):
+        return str(x).strip().strip("()")
+
+    def has_text(c):
+        t = (c.get("text") or "").strip()
+        return t and t.lower() not in {"n/a", "na", "none", "reserved"}
+
+    # ---- Group clauses by main clause ----
+    def group_by_main(clauses):
+        out = {}
+        for c in clauses:
+            m = norm(c.get("main_clause_number"))
+            out.setdefault(m, []).append(c)
+        return out
+
+    baseline_by_main = group_by_main(baseline_clauses)
+    supplier_by_main = group_by_main(supplier_clauses)
+
+    # ============================================================
+    # PHASE 1: Exact match ONLY if section exists on both sides
+    # ============================================================
+    logger.info("Phase 1: Exact safe matching")
+
+    for b in baseline_clauses:
+        b_main = norm(b.get("main_clause_number"))
+        b_sec = norm(b.get("section_number"))
+
+        if not b_main or not b_sec:
+            continue
+
+        supplier_secs = {
+            norm(s.get("section_number"))
+            for s in supplier_by_main.get(b_main, [])
+            if has_text(s)
+        }
+
+        if b_sec not in supplier_secs:
+            continue  # deleted or shifted → DO NOT MATCH HERE
+
+        for i, s in enumerate(supplier_clauses):
+            if i in used_supplier_indices:
+                continue
+
+            if (
+                norm(s.get("main_clause_number")) == b_main
+                and norm(s.get("section_number")) == b_sec
+            ):
+                matches.append((b, s))
+                used_supplier_indices.add(i)
+                break
+
+    # ============================================================
+    # PHASE 2: Index-window matching within main clause
+    # ============================================================
+    logger.info("Phase 2: Windowed position matching")
+
+    matched_baseline_ids = {id(m[0]) for m in matches}
+
+    for main_clause, b_list in baseline_by_main.items():
+        s_list = supplier_by_main.get(main_clause, [])
+
+        b_remaining = [b for b in b_list if id(b) not in matched_baseline_ids]
+        s_remaining = [
+            (i, s)
+            for i, s in enumerate(supplier_clauses)
+            if i not in used_supplier_indices
+            and norm(s.get("main_clause_number")) == main_clause
+            and has_text(s)
+        ]
+
+        for b_idx, b in enumerate(b_remaining):
+            best = None
+            best_i = None
+            best_score = 0.0
+
+            for offset in (-2, -1, 0, 1, 2):
+                s_pos = b_idx + offset
+                if 0 <= s_pos < len(s_remaining):
+                    i, s = s_remaining[s_pos]
+                    if "embedding" in b and "embedding" in s:
+                        score = self.processor._cosine_similarity(
+                            b["embedding"], s["embedding"]
+                        )
+                        if score > best_score:
+                            best = s
+                            best_i = i
+                            best_score = score
+
+            if best and best_score >= 0.70:
+                matches.append((b, best))
+                used_supplier_indices.add(best_i)
+
+    # ============================================================
+    # PHASE 3: Embedding fallback (same main clause only)
+    # ============================================================
+    logger.info("Phase 3: Embedding fallback")
+
+    matched_baseline_ids = {id(m[0]) for m in matches}
+
+    for b in baseline_clauses:
+        if id(b) in matched_baseline_ids:
+            continue
+        if "embedding" not in b:
+            continue
+
+        b_main = norm(b.get("main_clause_number"))
+
+        best = None
+        best_i = None
+        best_score = 0.0
+
+        for i, s in enumerate(supplier_clauses):
+            if i in used_supplier_indices:
+                continue
+            if norm(s.get("main_clause_number")) != b_main:
+                continue
+            if not has_text(s):
+                continue
+            if "embedding" not in s:
+                continue
+
+            score = self.processor._cosine_similarity(
+                b["embedding"], s["embedding"]
+            )
+            if score > best_score:
+                best = s
+                best_i = i
+                best_score = score
+
+        if best and best_score >= 0.80:
+            matches.append((b, best))
+            used_supplier_indices.add(best_i)
+
+    # ============================================================
+    # Final unmatched
+    # ============================================================
+    matched_baseline_ids = {id(m[0]) for m in matches}
+    matched_supplier_ids = {id(m[1]) for m in matches}
+
+    unmatched_baseline = [
+        c for c in baseline_clauses if id(c) not in matched_baseline_ids
+    ]
+    unmatched_supplier = [
+        c for c in supplier_clauses if id(c) not in matched_supplier_ids
+    ]
+
+    logger.info(
+        f"Final: {len(matches)} matches, "
+        f"{len(unmatched_baseline)} baseline-only, "
+        f"{len(unmatched_supplier)} supplier-only"
+    )
+
+    return matches, unmatched_baseline, unmatched_supplier
