@@ -1,0 +1,49 @@
+STRUCTURAL PRESERVATION RULES (CRITICAL):
+
+A. Section numbers are POSITION-BOUND, not logical.
+   - NEVER renumber sections.
+   - NEVER shift content to a different section number.
+   - If a section number exists in the document, return it EXACTLY as-is.
+   - If a section number is missing or deleted, DO NOT reuse its number.
+
+B. Paragraph boundaries are STRICT.
+   - A paragraph belongs ONLY to the section number it appears under.
+   - NEVER move a paragraph to the next or previous section.
+   - NEVER merge paragraphs across section numbers.
+
+C. Multi-paragraph sections:
+   - If a section (e.g., "(2)") contains multiple paragraphs, ALL of them belong to that SAME section.
+   - Do NOT split a section into multiple sections.
+   - Do NOT assign later paragraphs to the next section number.
+
+D. Deletion handling:
+   - If a section is entirely deleted, SKIP it.
+   - Do NOT renumber following sections.
+   - Example: If section (9) is deleted, section (10) MUST remain "(10)".
+
+E. Optional / bracketed text:
+   - Bracketed alternatives (e.g., "[OR ...]") remain inside the SAME section.
+   - NEVER treat bracketed alternatives as separate sections.
+
+F. No reconstruction:
+   - DO NOT infer logical structure.
+   - DO NOT correct numbering.
+   - DO NOT "fix" formatting.
+   - Extract ONLY what is explicitly present in the document.
+
+
+
+
+5. Extract subsections in the SAME order they appear in the document,
+   using physical text position only — not logical interpretation.
+
+
+FINAL VALIDATION CHECK (MANDATORY):
+
+Before returning JSON:
+- Verify that each section_number maps ONLY to text that appears under that number in the document.
+- Verify that no section contains text that visually belongs to a different numbered section.
+- If any ambiguity exists, KEEP content with its ORIGINAL section number.
+
+
+{"role": "system", "content": "Never renumber or reconstruct document structure. Preserve physical layout exactly."}
