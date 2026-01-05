@@ -1,0 +1,451 @@
+import re
+import json
+from typing import List, Dict, Any, Optional, Tuple
+
+async def identify_and_enhance_clauses_hybrid(
+    self,
+    raw_text: str,
+    clause_library_df,           # pandas DataFrame
+    document_type: str = "Original",
+    use_llm_fallback: bool = True,
+) -> List[Dict[str, Any]]:
+    """
+    ONE drop-in function:
+      - normalize text (fix collapsed PDF text)
+      - identify clauses (rule-based)
+      - fallback to LLM if identify looks failed
+      - enhance using clause_library_df (multiplier + baseline risk)
+      - return enhanced clauses in your existing JSON structure
+
+    Returns:
+      enhanced_clauses: List[Dict[str, Any]]
+    """
+
+    # ----------------------------
+    # Helpers
+    # ----------------------------
+    def _safe_excerpt(text: str, n: int = 400) -> str:
+        t = (text or "").strip()
+        return (t[:n] + "...") if len(t) > n else t
+
+    def _normalize_extracted_text_for_nda(raw: str) -> str:
+        if not raw:
+            return ""
+        t = raw.replace("\r\n", "\n").replace("\r", "\n")
+        t = re.sub(r"[ \t]+", " ", t)
+
+        # Add newline before: "1. Confidentiality" (avoid decimals)
+        t = re.sub(r"(?<!\d)(?<!\n)\s+(\d{1,3})\.\s+([A-Z][A-Za-z].{2,80})", r"\n\1. \2", t)
+
+        # Add newline before Recitals A./B./C.
+        t = re.sub(r"(?<!\n)\s+([A-C])\.\s+([A-Z][A-Za-z].{2,120})", r"\n\1. \2", t)
+
+        # Add newline before (1) (2) (a) (b) (i) (ii)
+        t = re.sub(r"(?<!\n)\s+(\(\d{1,3}\))\s+", r"\n\1 ", t)
+        t = re.sub(r"(?<!\n)\s+(\([a-z]\))\s+", r"\n\1 ", t)
+        t = re.sub(r"(?<!\n)\s+(\((?:ix|iv|v?i{1,3}|x{1,3})\))\s+", r"\n\1 ", t, flags=re.IGNORECASE)
+
+        t = re.sub(r"\n{3,}", "\n\n", t).strip()
+        return t
+
+    def _looks_like_section_heading(line: str) -> Optional[Tuple[str, str]]:
+        m = re.match(r"^\s*(\d+)\.\s+(.+?)\s*$", line)
+        if m:
+            num = m.group(1).strip()
+            title = m.group(2).strip()
+            if len(title) >= 2:
+                return num, title
+        return None
+
+    def _looks_like_recital_heading(line: str) -> Optional[str]:
+        m = re.match(r"^\s*([A-C])\.\s+(.+?)\s*$", line)
+        if m:
+            return m.group(1).strip()
+        return None
+
+    def _looks_like_marker(line: str) -> Optional[Tuple[str, str]]:
+        s = line.strip()
+        m = re.match(r"^\((\d{1,3})\)\s+", s)
+        if m:
+            return ("num", m.group(1))
+        m = re.match(r"^\(([a-z])\)\s+", s)
+        if m:
+            return ("alpha", m.group(1))
+        m = re.match(r"^\(((?:ix|iv|v?i{1,3}|x{1,3}))\)\s+", s, flags=re.IGNORECASE)
+        if m:
+            return ("roman", m.group(1).lower())
+        return None
+
+    def _strip_marker(line: str) -> str:
+        return re.sub(
+            r"^\s*\((?:\d{1,3}|[a-z]|(?:ix|iv|v?i{1,3}|x{1,3}))\)\s+",
+            "",
+            line.strip(),
+            flags=re.IGNORECASE
+        )
+
+    def _identify_failed(clauses: List[Dict[str, Any]]) -> bool:
+        if not clauses:
+            return True
+        if len(clauses) < 3:
+            return True
+        lengths = sorted([len((c.get("text") or "").strip()) for c in clauses], reverse=True)
+        total = sum(lengths) or 1
+        if lengths and (lengths[0] / total) > 0.7:
+            return True
+        return False
+
+    def _identify_rule_based(normalized_text: str) -> List[Dict[str, Any]]:
+        lines = [ln.rstrip() for ln in normalized_text.split("\n")]
+        n = len(lines)
+
+        first_sec_i = None
+        for i, ln in enumerate(lines):
+            if _looks_like_section_heading(ln):
+                first_sec_i = i
+                break
+
+        intro_lines = lines[:first_sec_i] if first_sec_i is not None else lines
+        sec_lines = lines[first_sec_i:] if first_sec_i is not None else []
+
+        clauses: List[Dict[str, Any]] = []
+
+        # Recitals
+        recitals = []
+        current = None
+        buf: List[str] = []
+
+        def flush_rec():
+            nonlocal current, buf
+            if current and any(x.strip() for x in buf):
+                recitals.append((current, "\n".join([x for x in buf if x.strip()]).strip()))
+            current = None
+            buf = []
+
+        for ln in intro_lines:
+            r = _looks_like_recital_heading(ln)
+            if r:
+                flush_rec()
+                current = r
+                buf = [ln.strip()]
+            else:
+                if current:
+                    buf.append(ln)
+        flush_rec()
+
+        intro_blob = "\n".join([x for x in intro_lines if x.strip()]).strip()
+        if recitals:
+            for letter, txt in recitals:
+                clauses.append({
+                    "section_number": letter,
+                    "section_title": "Recital",
+                    "clause_type": "Recital",
+                    "main_clause_number": "Intro",
+                    "text": txt,
+                    "confidence": 0.9
+                })
+        elif intro_blob:
+            clauses.append({
+                "section_number": "Intro",
+                "section_title": "Recital",
+                "clause_type": "Recital",
+                "main_clause_number": "Intro",
+                "text": intro_blob,
+                "confidence": 0.75
+            })
+
+        # Split numeric sections
+        sections: List[Tuple[str, str, List[str]]] = []
+        cur_num = None
+        cur_title = None
+        cur_body: List[str] = []
+
+        def flush_sec():
+            nonlocal cur_num, cur_title, cur_body
+            if cur_num is not None:
+                sections.append((cur_num, cur_title or "", cur_body))
+            cur_num = None
+            cur_title = None
+            cur_body = []
+
+        for ln in sec_lines:
+            hit = _looks_like_section_heading(ln)
+            if hit:
+                flush_sec()
+                cur_num, cur_title = hit
+            else:
+                if cur_num is not None:
+                    cur_body.append(ln)
+        flush_sec()
+
+        # Build leaf clauses like 5(a), 5(b) etc
+        for sec_num, sec_title, body_lines in sections:
+            markers = []
+            for i, ln in enumerate(body_lines):
+                mk = _looks_like_marker(ln)
+                if mk:
+                    markers.append((i, mk[0], mk[1]))
+
+            has_alpha = any(t == "alpha" for _, t, _ in markers)
+            has_num = any(t == "num" for _, t, _ in markers)
+
+            def build_chunks(kind: str) -> List[Tuple[str, str]]:
+                pos = [(i, v) for i, t, v in markers if t == kind]
+                if not pos:
+                    return []
+                out = []
+                for k, (start_i, val) in enumerate(pos):
+                    end_i = pos[k + 1][0] if k + 1 < len(pos) else len(body_lines)
+                    block = body_lines[start_i:end_i]
+                    if block:
+                        block = [_strip_marker(block[0])] + block[1:]
+                    txt = "\n".join([x for x in block if x.strip()]).strip()
+                    if txt:
+                        out.append((val, txt))
+                return out
+
+            if has_alpha:
+                for a, txt in build_chunks("alpha"):
+                    clauses.append({
+                        "section_number": f"{sec_num}({a})",  # ✅ 5(a)
+                        "section_title": sec_title or f"Section {sec_num}",
+                        "clause_type": sec_title or f"Section {sec_num}",
+                        "main_clause_number": sec_num,
+                        "text": txt,
+                        "confidence": 0.9
+                    })
+            elif has_num:
+                for k, txt in build_chunks("num"):
+                    clauses.append({
+                        "section_number": f"{sec_num}({k})",
+                        "section_title": sec_title or f"Section {sec_num}",
+                        "clause_type": sec_title or f"Section {sec_num}",
+                        "main_clause_number": sec_num,
+                        "text": txt,
+                        "confidence": 0.85
+                    })
+            else:
+                full = "\n".join([x for x in body_lines if x.strip()]).strip()
+                if full:
+                    clauses.append({
+                        "section_number": sec_num,
+                        "section_title": sec_title or f"Section {sec_num}",
+                        "clause_type": sec_title or f"Section {sec_num}",
+                        "main_clause_number": sec_num,
+                        "text": full,
+                        "confidence": 0.8
+                    })
+
+        # ids
+        for i, c in enumerate(clauses):
+            c["id"] = f"{document_type}-clause-{i}"
+
+        return clauses
+
+    async def _identify_with_llm(normalized_text: str) -> List[Dict[str, Any]]:
+        prompt = f"""
+Return JSON ONLY.
+
+Output must be:
+{{
+  "clauses": [
+    {{
+      "section_number": "Intro" | "A" | "B" | "C" | "1" | "1(1)" | "1(a)" | "5(a)" | ...,
+      "section_title": "Recital" | "Confidentiality" | "Term and Termination" | "General" | ...,
+      "clause_type": same as section_title,
+      "main_clause_number": "Intro" | "1" | "5" | ...,
+      "text": "exact clause text as it appears",
+      "confidence": 0.0 to 1.0
+    }}
+  ]
+}}
+
+Rules:
+- Keep original order.
+- Recitals A/B/C => separate clauses, section_title="Recital", main_clause_number="Intro".
+- Numeric headings like "1. Confidentiality" => main section.
+- Prefer leaf clauses 5(a), 5(b), 5(c) for alpha lists.
+- Do NOT create new sections from placeholders like [date], [NAME OF SUPPLIER], [legal paragraph].
+- Preserve numbering exactly.
+
+TEXT:
+\"\"\"{normalized_text}\"\"\"
+""".strip()
+
+        response = self.client.chat.completions.create(
+            model=self.deployment_name,
+            messages=[
+                {"role": "system", "content": "Return JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+
+        result = json.loads(response.choices[0].message.content)
+        clauses = result.get("clauses", []) if isinstance(result, dict) else []
+
+        out: List[Dict[str, Any]] = []
+        for i, c in enumerate(clauses):
+            if not isinstance(c, dict):
+                continue
+            txt = (c.get("text") or "").strip()
+            if not txt:
+                continue
+            out.append({
+                "id": f"{document_type}-clause-{i}",
+                "section_number": str(c.get("section_number", "")).strip(),
+                "section_title": str(c.get("section_title", "")).strip() or "Unknown",
+                "clause_type": str(c.get("clause_type", "")).strip() or (str(c.get("section_title", "")).strip() or "Unknown"),
+                "main_clause_number": str(c.get("main_clause_number", "")).strip() or "Unknown",
+                "text": txt,
+                "confidence": float(c.get("confidence", 0.85)),
+            })
+        return out
+
+    # Clause library match (simple but strong)
+    def _normalize_ref(s: str) -> str:
+        s = (s or "").strip().lower()
+        s = re.sub(r"\s+", " ", s)
+        return s
+
+    def _extract_main_and_leaf(section_number: str) -> Tuple[str, str]:
+        """
+        "5(a)" -> ("5", "5(a)")
+        "5"    -> ("5", "5")
+        "Intro"-> ("Intro","Intro")
+        """
+        sec = (section_number or "").strip()
+        m = re.match(r"^(\d+)\s*(\([a-z0-9ivx]+\))?$", sec, flags=re.IGNORECASE)
+        if m:
+            main = m.group(1)
+            leaf = sec
+            return main, leaf
+        return sec, sec
+
+    def _find_library_entry(clause: Dict[str, Any]):
+        """
+        Match priority:
+          1) exact section_number hit in Clause Reference
+          2) main number hit
+          3) clause title keyword hit
+        """
+        if clause_library_df is None or getattr(clause_library_df, "empty", True):
+            return None
+
+        sec_num = clause.get("section_number", "")
+        main_num, leaf = _extract_main_and_leaf(sec_num)
+        title = clause.get("section_title", "") or clause.get("clause_type", "")
+
+        leaf_n = _normalize_ref(leaf)
+        main_n = _normalize_ref(main_num)
+        title_n = _normalize_ref(title)
+
+        best = None
+
+        # Try exact leaf (5(a))
+        for _, row in clause_library_df.iterrows():
+            ref = _normalize_ref(str(row.get("Clause Reference", "")))
+            if leaf_n and leaf_n in ref:
+                return row
+
+        # Try main (5)
+        for _, row in clause_library_df.iterrows():
+            ref = _normalize_ref(str(row.get("Clause Reference", "")))
+            if main_n and re.search(rf"\b{re.escape(main_n)}\b", ref):
+                best = row
+                break
+
+        # Try title fallback
+        if best is None and title_n:
+            for _, row in clause_library_df.iterrows():
+                ref = _normalize_ref(str(row.get("Clause Reference", "")))
+                if title_n and title_n in ref:
+                    best = row
+                    break
+
+        return best
+
+    # ----------------------------
+    # 1) Normalize
+    # ----------------------------
+    normalized = _normalize_extracted_text_for_nda(raw_text)
+
+    # ----------------------------
+    # 2) Identify (rule-based)
+    # ----------------------------
+    identified = _identify_rule_based(normalized)
+
+    # ----------------------------
+    # 3) LLM fallback if needed
+    # ----------------------------
+    if use_llm_fallback and _identify_failed(identified):
+        try:
+            llm_identified = await _identify_with_llm(normalized)
+            if llm_identified and not _identify_failed(llm_identified):
+                identified = llm_identified
+        except Exception as e:
+            try:
+                self.logger.warning(f"LLM identify fallback failed: {e}")
+            except Exception:
+                pass
+
+    # ----------------------------
+    # 4) Enhance using library (KEEP your JSON structure)
+    # ----------------------------
+    enhanced_clauses: List[Dict[str, Any]] = []
+
+    for idx, clause in enumerate(identified):
+        if clause is None:
+            continue
+
+        clause_type = clause.get("section_title", "") or clause.get("clause_type", "Unknown")
+        main_section_number = clause.get("main_clause_number", "") or clause.get("section_number", f"{idx+1}")
+        section_number = clause.get("section_number", f"{idx+1}")
+        full_text = clause.get("text", "") or ""
+
+        lib_entry = _find_library_entry(clause)
+
+        multiplier = 1.0
+        baseline_risk = 3
+        if lib_entry is not None:
+            try:
+                mult_val = lib_entry.get("Multiplier", 1.0)
+                if mult_val is not None and str(mult_val).strip() != "":
+                    multiplier = float(mult_val)
+            except Exception:
+                multiplier = 1.0
+
+            try:
+                risk_val = lib_entry.get("Clause Risk Level (Baseline) Score", 3)
+                if risk_val is not None and str(risk_val).strip() != "":
+                    baseline_risk = int(float(risk_val))
+            except Exception:
+                baseline_risk = 3
+
+        enhanced_clauses.append({
+            "id": f"{document_type}-clause-{idx}",
+            "clause_type": clause_type,
+            "main_clause_number": str(main_section_number),
+            "section_number": str(section_number),  # ✅ keeps 5(a), 5(b) etc
+            "section_title": clause.get("section_title", clause_type),
+            "text": full_text,
+            "text_excerpt": _safe_excerpt(full_text, 400),
+            "confidence": float(clause.get("confidence", 0.85)),
+            "multiplier": multiplier,
+            "baseline_risk": baseline_risk,
+            "location": {
+                "start": 0,
+                "end": len(full_text),
+                "dom_id": f"clause-{document_type}-{idx}"
+            }
+        })
+
+    try:
+        self.logger.info(f"Enhanced {len(enhanced_clauses)} clauses for {document_type} document.")
+    except Exception:
+        pass
+
+    return enhanced_clauses
+
+
