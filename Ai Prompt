@@ -1,0 +1,25 @@
+SUBSECTION BOUNDARY RULES (CRITICAL — FOLLOW EXACTLY):
+
+1) A subsection starts ONLY when you see an explicit subsection label at line-start, e.g.:
+   - "(1)" "(2)" "(3)" ... OR "(a)" "(b)" ... OR "a." "b." (if used in the document)
+   Do NOT create new subsections from bracketed text like "[...]" or parenthetical phrases.
+
+2) For each numeric subsection "(N)", the subsection_text MUST include ALL content that appears
+   under "(N)" UNTIL the next numeric subsection label "(N+1)" at the same indentation level.
+   This includes:
+   - multiple paragraphs
+   - blank lines
+   - bracketed optional blocks like "[For all legal proceedings ...]"
+   - inline options like "OR [ ... ]"
+   - any continuation lines after a bracket block
+
+3) Bracket blocks "[...]" are NOT subsection labels.
+   They are ALWAYS part of the CURRENT subsection (usually continuing subsection (2)).
+
+4) Paragraph order is POSITION-BOUND:
+   - Do NOT move any paragraph from subsection (2) into subsection (3).
+   - If subsection (2) contains multiple paragraphs, keep them in the same subsection_text
+     in the same order (including blank lines).
+
+5) When unsure whether a line belongs to (2) or (3), use the NEXT explicit label rule:
+   - If the next explicit label "(3)" has not appeared yet, KEEP the text inside (2).
