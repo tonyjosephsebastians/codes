@@ -1,0 +1,225 @@
+# Paste these helpers somewhere in your ai_utils.py (top-level in the class or module)
+import re
+from typing import Any, Dict, List
+
+def _normalize_text(s: str) -> str:
+    s = (s or "").replace("\u00a0", " ")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+def _make_child_id(base_sub_id: str, marker: str, checkbox_idx: int) -> str:
+    marker = marker.strip()
+    if marker in ("[x]", "[ ]"):
+        return f"{marker}{checkbox_idx}"
+    if marker.startswith("(") and marker.endswith(")"):
+        marker = marker[1:-1].strip()
+    return f"{base_sub_id}{marker}"
+
+def _split_nested_subsections(base_sub_id: str, raw_text: str) -> List[Dict[str, str]]:
+    """
+    Explode subsection like "(5)" into children:
+      "(5)a", "(5)b", "(5)i", "[x]1", "[x]2", ...
+    Keeps text clean per child.
+    """
+    raw_text = _normalize_text(raw_text)
+    if not raw_text:
+        return []
+
+    # only explode numeric base like "(5)"
+    if not re.fullmatch(r"\(\d+\)", (base_sub_id or "").strip()):
+        return [{"subsection_id": base_sub_id, "subsection_text": raw_text}]
+
+    # detect nested markers
+    if not re.search(r"(\(\s*[a-z]\s*\)|\(\s*[ivxlcdm]+\s*\)|\(\s*\d+\s*\)|\[\s*[xX ]\s*\))", raw_text):
+        return [{"subsection_id": base_sub_id, "subsection_text": raw_text}]
+
+    text = raw_text
+    text = re.sub(r"\[\s*[xX]\s*\]", "[x]", text)
+    text = re.sub(r"\[\s*\]", "[ ]", text)
+
+    marker_pat = r"(\(\s*[a-z]\s*\)|\(\s*[ivxlcdm]+\s*\)|\(\s*\d+\s*\)|\[x\]|\[\ \])"
+    # split before a marker if it looks like a list break
+    split_re = re.compile(rf"(?:(?:\n)|(?:;\s+)|(?::\s+)|(?:-\s+)|(?:\.\s+))(?={marker_pat})")
+
+    parts = split_re.split(text)
+
+    rebuilt: List[str] = []
+    i = 0
+    while i < len(parts):
+        p = (parts[i] or "").strip()
+        if re.fullmatch(marker_pat, p):
+            nxt = (parts[i + 1] if i + 1 < len(parts) else "").strip()
+            rebuilt.append((p + " " + nxt).strip())
+            i += 2
+        else:
+            rebuilt.append(p)
+            i += 1
+
+    preface = ""
+    children: List[Dict[str, str]] = []
+    checkbox_count = 0
+
+    for seg in rebuilt:
+        seg = (seg or "").strip()
+        if not seg:
+            continue
+
+        m = re.match(rf"^(?P<mk>{marker_pat})\s*(?P<body>.+)$", seg, flags=re.IGNORECASE)
+        if not m:
+            preface = (preface + " " + seg).strip() if preface else seg
+            continue
+
+        mk = m.group("mk").strip().lower()
+        body = m.group("body").strip()
+
+        if mk in ("[x]", "[ ]"):
+            checkbox_count += 1
+            child_id = _make_child_id(base_sub_id, mk, checkbox_count)
+        else:
+            child_id = _make_child_id(base_sub_id, mk, checkbox_count)
+
+        children.append({"subsection_id": child_id, "subsection_text": body})
+
+    # If you DON'T want to keep the preface as "(5)", comment next 2 lines:
+    if preface:
+        children.insert(0, {"subsection_id": base_sub_id, "subsection_text": preface})
+
+    return children if children else [{"subsection_id": base_sub_id, "subsection_text": raw_text}]
+
+
+# NOW: paste this logic INSIDE your loop right where you currently do:
+# subsection_id = subsection.get("subsection_id"...)
+# subsection_text = subsection.get("subsection_text"...)
+# enhanced_clauses.append({...})
+
+# Existing loop:
+for sub_idx, subsection in enumerate(subsections):
+    subsection_id = subsection.get("subsection_id", f"({sub_idx + 1})")
+    subsection_text = subsection.get("subsection_text", "")
+
+    # ✅ ADD THIS BLOCK (nested subsection expansion)
+    exploded = _split_nested_subsections(subsection_id, subsection_text)
+
+    for child_idx, child in enumerate(exploded):
+        child_sub_id = child["subsection_id"]
+        child_sub_text = child["subsection_text"]
+
+        print(
+            f"Main subsection - {main_section_number} "
+            f"Subsection - {child_sub_id} Text: {child_sub_text}"
+        )
+
+        # (optional debug you had)
+        if main_section_number == "1" and subsection_id == "(5)":
+            print(
+                f"Found specific subsection - {main_section_number} {subsection_id} "
+                f"Text: {subsection_text}"
+            )
+
+        # ✅ IMPORTANT: use child_sub_id / child_sub_text in the enhanced_clauses
+        enhanced_clauses.append({
+            "id": f"{document_type}-clause-{idx}-sub-{sub_idx}-{child_idx}",
+            "clause_type": clause_type,
+            "main_clause_number": main_section_number,
+            "section_number": child_sub_id,                 # <--- changed
+            "section_title": clause.get("section_title", clause_type),
+            "text": child_sub_text,                         # <--- changed
+            "full_clause_text": full_text,
+            "text_excerpt": (child_sub_text[:400] + "...") if len(child_sub_text) > 400 else child_sub_text,
+            "confidence": 0.9,
+            "multiplier": 1.0,
+            "baseline_risk": baseline_risk,
+            "location": {
+                "start": 0,
+                "end": len(child_sub_text),
+                "dom_id": f"clause-{document_type}-{idx}-sub-{sub_idx}-{child_idx}"
+            }
+        })
+
+
+import re
+from typing import Dict, List
+
+def _split_nested_subsections(base_sub_id: str, raw_text: str) -> List[Dict[str, str]]:
+    """
+    Explode subsection like "(5)" into children:
+      "(5)a", "(5)b", "(5)c", "(5)i", "(5)1", "[x]1", "[x]2", ...
+    Handles:
+      - markers at line start: "(a) ...", "(b) ..."
+      - markers after dash: " ... - (c) ..."
+      - checkbox bullets: "[x] ..." or "[ ] ..."
+    """
+    raw_text = _normalize_text(raw_text)
+    if not raw_text:
+        return []
+
+    # Only explode numeric base like "(5)"
+    if not re.fullmatch(r"\(\d+\)", (base_sub_id or "").strip()):
+        return [{"subsection_id": base_sub_id, "subsection_text": raw_text}]
+
+    text = raw_text
+
+    # normalize checkbox styles
+    text = re.sub(r"\[\s*[xX]\s*\]", "[x]", text)
+    text = re.sub(r"\[\s*\]", "[ ]", text)
+
+    # markers we want to create child subsections from
+    marker_pat = r"(\(\s*[a-z]\s*\)|\(\s*[ivxlcdm]+\s*\)|\(\s*\d+\s*\)|\[x\]|\[\ \])"
+
+    # We treat markers as "real" only if they are:
+    #   - start of line (after optional spaces), OR
+    #   - after a dash " - " (common for "- (c)" inside checkbox line), OR
+    #   - after semicolon or colon (less common but safe)
+    trigger_pat = rf"(?:(?<=\n)\s*|(?<=\-\s)|(?<=:\s)|(?<=;\s))(?P<mk>{marker_pat})\s*"
+
+    # Find marker positions
+    matches = list(re.finditer(trigger_pat, text, flags=re.IGNORECASE))
+    if not matches:
+        return [{"subsection_id": base_sub_id, "subsection_text": text}]
+
+    # Build segments: preface (before first marker) + each marker segment until next marker
+    segments: List[tuple] = []
+    preface = text[:matches[0].start()].strip()
+    if preface:
+        segments.append(("PREFACE", preface))
+
+    for i, m in enumerate(matches):
+        start = m.start("mk")  # start at marker itself
+        end = matches[i + 1].start("mk") if i + 1 < len(matches) else len(text)
+        seg = text[start:end].strip()
+        if seg:
+            segments.append(("MARKED", seg))
+
+    children: List[Dict[str, str]] = []
+    checkbox_count = 0
+
+    for kind, seg in segments:
+        if kind == "PREFACE":
+            # keep as "(5)" preface. If you don't want this, remove this append.
+            children.append({"subsection_id": base_sub_id, "subsection_text": seg})
+            continue
+
+        m = re.match(rf"^(?P<mk>{marker_pat})\s*(?P<body>.+)$", seg, flags=re.IGNORECASE | re.DOTALL)
+        if not m:
+            # fallback: keep under base
+            children.append({"subsection_id": base_sub_id, "subsection_text": seg})
+            continue
+
+        mk = m.group("mk").strip().lower()
+        body = _normalize_text(m.group("body"))
+
+        if mk in ("[x]", "[ ]"):
+            checkbox_count += 1
+            child_id = _make_child_id(base_sub_id, mk, checkbox_count)  # => [x]1, [x]2...
+        else:
+            child_id = _make_child_id(base_sub_id, mk, checkbox_count)  # => (5)a, (5)b, (5)c...
+
+        children.append({"subsection_id": child_id, "subsection_text": body})
+
+    return children if children else [{"subsection_id": base_sub_id, "subsection_text": text}]
+
+
+
+
+
