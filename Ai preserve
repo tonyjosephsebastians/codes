@@ -1,0 +1,40 @@
+Rules:
+- Output JSON EXACTLY in this structure:
+{
+  "subsections": [
+    { "subsection_id": "(5)a", "subsection_text": "..." },
+    { "subsection_id": "(5)b", "subsection_text": "..." }
+  ]
+}
+
+CRITICAL TEXT PRESERVATION RULES:
+- Preserve ALL punctuation EXACTLY as it appears in the source text,
+  including periods (.), commas (,), semicolons (;), colons (:), brackets,
+  quotation marks, and line breaks.
+- Do NOT rewrite, rephrase, summarize, normalize, or reflow sentences.
+- Do NOT merge sentences.
+- Do NOT split sentences unless explicitly instructed below.
+- The presence of periods (.) alone MUST NOT cause any split.
+
+How to split (ONLY when explicitly allowed):
+- Split into subsections ONLY IF:
+  1) Logical list items are separated by semicolons (;) AND
+     each item is a complete independent obligation; OR
+  2) Checkbox items [x] appear.
+- When splitting:
+  - Preserve the exact wording, punctuation, spacing, and order.
+  - Assign subsection_ids strictly in order of physical appearance:
+    (5)a, (5)b, (5)c …
+  - For checkbox items, create:
+    (5)[x]1, (5)[x]2, (5)[x]3 in order of appearance.
+
+STRICT PROHIBITIONS:
+- Do NOT split on periods (.).
+- Do NOT split on commas (,).
+- Do NOT split paragraphs into multiple subsections.
+- Do NOT invent or infer structure.
+- Do NOT change formatting.
+- Do NOT include markdown.
+
+TEXT (verbatim source, position-bound):
+{text}
