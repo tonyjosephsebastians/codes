@@ -1,0 +1,703 @@
+import re
+import json
+import math
+import difflib
+from typing import Any, Dict, List, Tuple, Optional
+
+
+def _norm_space(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+
+def _looks_like_heading(line: str) -> bool:
+    l = line.strip()
+    if not l:
+        return False
+    # All caps headings or Title-like single-line headings
+    if len(l) >= 6 and l.upper() == l and any(c.isalpha() for c in l):
+        return True
+    # Common NDA heading patterns
+    if l.lower() in {"confidentiality", "term and termination", "general", "privacy", "security"}:
+        return True
+    return False
+
+
+def _normalize_wrapped_lines(raw_text: str) -> List[str]:
+    """
+    Re-join PDF-wrapped lines while preserving headings and list items.
+    Returns a list of logical lines.
+    """
+    lines = [ln.rstrip() for ln in (raw_text or "").splitlines()]
+    # drop line numbers if present at start: "23  Confidentiality"
+    cleaned = []
+    for ln in lines:
+        ln = re.sub(r"^\s*\d+\s{1,3}(?=\S)", "", ln)
+        cleaned.append(ln)
+
+    out: List[str] = []
+    buf = ""
+
+    def flush():
+        nonlocal buf
+        if buf.strip():
+            out.append(buf.strip())
+        buf = ""
+
+    for ln in cleaned:
+        s = ln.strip()
+        if not s:
+            flush()
+            continue
+
+        # If it's a strong boundary marker, flush buffer
+        if _looks_like_heading(s):
+            flush()
+            out.append(s)
+            continue
+
+        # section header like "5. Term and Termination" or "1. Confidentiality"
+        if re.match(r"^\s*\d+\.\s+\S+", s):
+            flush()
+            out.append(s)
+            continue
+
+        # subsection starters "(1)" "(2)" "(a)" "[c]"
+        if re.match(r"^\(?\d+\)\s+", s) or re.match(r"^\([a-z]\)\s+", s) or re.match(r"^\[[a-z]\]\s+", s):
+            flush()
+            out.append(s)
+            continue
+
+        # join wrapped lines:
+        # if buffer ends with hyphen, join without space; else join with space.
+        if not buf:
+            buf = s
+        else:
+            if buf.endswith("-") and not buf.endswith("--"):
+                buf = buf[:-1] + s
+            else:
+                # If previous looks like sentence continues, join; if previous ends with ":" keep join too
+                buf = buf + " " + s
+
+    flush()
+    return out
+
+
+def _extract_title_after_number(line: str) -> Tuple[str, str]:
+    """
+    "5. Term and Termination" -> ("5", "Term and Termination")
+    """
+    m = re.match(r"^\s*(\d+)\.\s+(.*)$", line.strip())
+    if not m:
+        return ("", "")
+    return (m.group(1), m.group(2).strip())
+
+
+def _split_into_sections(logical_lines: List[str]) -> List[Dict[str, Any]]:
+    """
+    Produces a tree:
+    [
+      {section_number:"1", section_title:"Confidentiality", blocks:[...]}
+    ]
+    where blocks are strings including subsections markers.
+    """
+    sections: List[Dict[str, Any]] = []
+    current: Optional[Dict[str, Any]] = None
+
+    # Allow preamble/recitals before "1."
+    preamble_blocks: List[str] = []
+
+    for ln in logical_lines:
+        if re.match(r"^\s*\d+\.\s+\S+", ln):
+            sec_no, sec_title = _extract_title_after_number(ln)
+            # push previous
+            if current is not None:
+                sections.append(current)
+            else:
+                # attach preamble as pseudo-section "Intro" if exists
+                if preamble_blocks:
+                    sections.append({
+                        "section_number": "Intro",
+                        "section_title": "Recital",
+                        "blocks": preamble_blocks[:]
+                    })
+                    preamble_blocks = []
+
+            current = {
+                "section_number": sec_no,
+                "section_title": sec_title or f"Section {sec_no}",
+                "blocks": []
+            }
+            continue
+
+        if current is None:
+            preamble_blocks.append(ln)
+        else:
+            current["blocks"].append(ln)
+
+    if current is not None:
+        sections.append(current)
+    elif preamble_blocks:
+        sections.append({
+            "section_number": "Intro",
+            "section_title": "Recital",
+            "blocks": preamble_blocks[:]
+        })
+
+    return sections
+
+
+def _parse_subsections(blocks: List[str]) -> Tuple[str, List[Dict[str, Any]]]:
+    """
+    From a section's blocks, build:
+      - section_text (full)
+      - subsections list with nested letter items extracted
+    Supports:
+      (1) ...
+      (a) ... / [c] ...
+    """
+    full_text = "\n".join(blocks).strip()
+
+    # Collect subsection chunks keyed by "(1)", "(2)", ...
+    subsections: List[Dict[str, Any]] = []
+    current_id: Optional[str] = None
+    current_lines: List[str] = []
+    prefix_text_lines: List[str] = []
+
+    def flush_sub():
+        nonlocal current_id, current_lines
+        if current_id is None:
+            return
+        txt = _norm_space(" ".join(current_lines))
+        subsections.append({
+            "subsection_id": current_id,
+            "subsection_text": txt,
+            "nested": _extract_nested_letters(txt)
+        })
+        current_id = None
+        current_lines = []
+
+    for ln in blocks:
+        m_num = re.match(r"^\(?(\d+)\)\s+(.*)$", ln.strip())
+        if m_num:
+            # new numeric subsection
+            flush_sub()
+            current_id = f"({m_num.group(1)})"
+            current_lines = [m_num.group(2)]
+            continue
+
+        if current_id is None:
+            prefix_text_lines.append(ln)
+        else:
+            current_lines.append(ln)
+
+    flush_sub()
+
+    # If we found no "(1)" style subsections, still try nested letters at section level
+    prefix_text = _norm_space(" ".join(prefix_text_lines))
+    if not subsections:
+        # Extract lettered items inside whole section
+        nested = _extract_nested_letters(_norm_space(full_text))
+        if nested:
+            # Treat each nested letter as its own "subsection" so you still get 5(a), 5(b)...
+            for n in nested:
+                subsections.append({
+                    "subsection_id": n["id"],  # "(a)" etc
+                    "subsection_text": n["text"],
+                    "nested": []  # already leaf
+                })
+
+    # Full section text = prefix + all subsections text (for rendering)
+    if prefix_text:
+        section_text = prefix_text + "\n" + _norm_space(" ".join([s["subsection_text"] for s in subsections]))
+    else:
+        section_text = _norm_space(" ".join([s["subsection_text"] for s in subsections])) or _norm_space(full_text)
+
+    return section_text.strip(), subsections
+
+
+def _extract_nested_letters(text: str) -> List[Dict[str, str]]:
+    """
+    Extract (a) (b) (c) and [a] [b] patterns from a block of text.
+    Returns list like [{"id":"(a)","text":"..."}, ...]
+    """
+    if not text:
+        return []
+
+    # Normalize [c] -> (c) for consistent handling
+    t = re.sub(r"\[([a-z])\]", r"(\1)", text)
+
+    # Split on letter markers
+    parts = re.split(r"(\([a-z]\))", t)
+    # parts like: ["prefix", "(a)", "text a", "(b)", "text b", ...]
+    nested: List[Dict[str, str]] = []
+    i = 0
+    while i < len(parts):
+        token = parts[i]
+        if re.fullmatch(r"\([a-z]\)", token or ""):
+            letter = token
+            body = (parts[i + 1] if i + 1 < len(parts) else "").strip()
+            # stop body at next marker already handled by split
+            body = _norm_space(body)
+            if body:
+                nested.append({"id": letter, "text": body})
+            i += 2
+        else:
+            i += 1
+
+    # Only consider it “real nested” if we got at least 2 letters
+    if len(nested) >= 2:
+        return nested
+    return []
+
+
+def _best_library_match(clause_library_df, section_number: str, section_title: str) -> Optional[Dict[str, Any]]:
+    """
+    Clause library validation logic (flexible).
+    Expects library columns like:
+      - 'Clause Reference'
+      - 'Multiplier'
+      - 'Clause Risk Level (Baseline) Score'
+    """
+    if clause_library_df is None:
+        return None
+
+    sec = (section_number or "").strip()
+    title = (section_title or "").strip().lower()
+
+    # Normalize: "Section 5" -> "5"
+    sec_clean = re.sub(r"(?i)\bsection\b", "", sec).strip()
+    sec_clean = sec_clean.strip("().")
+
+    best = None
+    best_score = -1.0
+
+    for _, row in clause_library_df.iterrows():
+        ref = str(row.get("Clause Reference", "")).strip().lower()
+        if not ref:
+            continue
+
+        score = 0.0
+
+        # strong match on section number
+        if sec_clean and (sec_clean in ref or ref.startswith(sec_clean)):
+            score += 3.0
+
+        # match on title tokens
+        if title:
+            title_tokens = [t for t in re.split(r"[^a-z0-9]+", title) if t and len(t) > 2]
+            hit = 0
+            for tok in title_tokens[:6]:
+                if tok in ref:
+                    hit += 1
+            score += min(2.0, 0.4 * hit)
+
+        if score > best_score:
+            best_score = score
+            best = row
+
+    # require some confidence
+    if best is not None and best_score >= 1.6:
+        return {
+            "Multiplier": float(best.get("Multiplier", 1.0)) if str(best.get("Multiplier", "")).strip() else 1.0,
+            "BaselineRisk": int(best.get("Clause Risk Level (Baseline) Score", 3)) if str(best.get("Clause Risk Level (Baseline) Score", "")).strip() else 3,
+            "LibraryRef": str(best.get("Clause Reference", ""))[:200]
+        }
+    return None
+
+
+def _make_dom_id(document_type: str, clause_idx: int, sub_idx: Optional[int] = None, nested_idx: Optional[int] = None) -> str:
+    base = f"clause-{document_type}-{clause_idx}"
+    if sub_idx is not None:
+        base += f"-sub-{sub_idx}"
+    if nested_idx is not None:
+        base += f"-nested-{nested_idx}"
+    return base
+
+
+async def identify_and_enhance_clauses_hybrid(
+    self,
+    raw_text: str,
+    document_type: str,
+    clause_library_df=None,
+    force_llm: bool = False,
+) -> List[Dict[str, Any]]:
+    """
+    DROP-IN function.
+
+    Input: raw_text (your baseline_text.txt content)
+    Output: enhanced_clauses list in SAME structure you already use:
+      [
+        {
+          "id": "Baseline-clause-0" ...
+          "clause_type": "...",
+          "main_clause_number": "...",
+          "section_number": "...",      # supports nested like "5(a)"
+          "section_title": "...",
+          "text": "...",
+          "text_excerpt": "...",
+          "confidence": 0.9,
+          "multiplier": 1.0,
+          "baseline_risk": 3,
+          "location": {"start":0,"end":N,"dom_id":"..."}
+        }
+      ]
+    """
+
+    def build_enhanced_from_tree(sections_tree: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        enhanced: List[Dict[str, Any]] = []
+        clause_idx = 0
+
+        for sec in sections_tree:
+            sec_no = str(sec.get("section_number", "")).strip() or f"{clause_idx + 1}"
+            sec_title = str(sec.get("section_title", "")).strip() or f"Section {sec_no}"
+            blocks = sec.get("blocks", []) or []
+            section_text, subs = _parse_subsections(blocks)
+
+            # Determine clause_type: use section_title for now (your UI shows Recital/Confidentiality etc)
+            clause_type = sec_title
+
+            # Library validation (risk/multiplier)
+            lib = _best_library_match(clause_library_df, sec_no, sec_title)
+            multiplier = float(lib["Multiplier"]) if lib else 1.0
+            baseline_risk = int(lib["BaselineRisk"]) if lib else 3
+
+            # If we have numeric subsections, create entries per subsection; else single section entry.
+            if subs:
+                for sub_idx, sub in enumerate(subs):
+                    sub_id = str(sub.get("subsection_id", "")).strip()
+                    sub_text = str(sub.get("subsection_text", "")).strip()
+
+                    # Nested letters become their own entries: "5(a)" "5(b)"...
+                    nested = sub.get("nested", []) or []
+                    if nested:
+                        for n_idx, n in enumerate(nested):
+                            letter_id = n["id"]  # "(a)"
+                            letter_text = n["text"]
+
+                            sec_num_nested = f"{sec_no}{letter_id}"  # "5(a)"
+                            full_txt = letter_text.strip()
+
+                            enhanced.append({
+                                "id": f"{document_type}-clause-{clause_idx}-sub-{sub_idx}-nested-{n_idx}",
+                                "clause_type": clause_type,
+                                "main_clause_number": sec_no,
+                                "section_number": sec_num_nested,
+                                "section_title": sec_title,
+                                "text": full_txt,
+                                "text_excerpt": (full_txt[:400] + "...") if len(full_txt) > 400 else full_txt,
+                                "confidence": 0.92,
+                                "multiplier": multiplier,
+                                "baseline_risk": baseline_risk,
+                                "location": {
+                                    "start": 0,
+                                    "end": len(full_txt),
+                                    "dom_id": _make_dom_id(document_type, clause_idx, sub_idx=sub_idx, nested_idx=n_idx),
+                                }
+                            })
+                    else:
+                        # plain numeric subsection entry: "1(1)" optional; but keep your style as "1(1)" for uniqueness
+                        sec_num = f"{sec_no}{sub_id}" if sub_id else sec_no
+                        full_txt = sub_text.strip() or section_text.strip()
+
+                        enhanced.append({
+                            "id": f"{document_type}-clause-{clause_idx}-sub-{sub_idx}",
+                            "clause_type": clause_type,
+                            "main_clause_number": sec_no,
+                            "section_number": sec_num,
+                            "section_title": sec_title,
+                            "text": full_txt,
+                            "text_excerpt": (full_txt[:400] + "...") if len(full_txt) > 400 else full_txt,
+                            "confidence": 0.9,
+                            "multiplier": multiplier,
+                            "baseline_risk": baseline_risk,
+                            "location": {
+                                "start": 0,
+                                "end": len(full_txt),
+                                "dom_id": _make_dom_id(document_type, clause_idx, sub_idx=sub_idx),
+                            }
+                        })
+            else:
+                full_txt = section_text.strip()
+                enhanced.append({
+                    "id": f"{document_type}-clause-{clause_idx}",
+                    "clause_type": clause_type,
+                    "main_clause_number": sec_no,
+                    "section_number": sec_no,
+                    "section_title": sec_title,
+                    "text": full_txt,
+                    "text_excerpt": (full_txt[:400] + "...") if len(full_txt) > 400 else full_txt,
+                    "confidence": 0.85,
+                    "multiplier": multiplier,
+                    "baseline_risk": baseline_risk,
+                    "location": {
+                        "start": 0,
+                        "end": len(full_txt),
+                        "dom_id": _make_dom_id(document_type, clause_idx),
+                    }
+                })
+
+            clause_idx += 1
+
+        return enhanced
+
+    def heuristic_parse(raw: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        logical_lines = _normalize_wrapped_lines(raw)
+        sections_tree = _split_into_sections(logical_lines)
+
+        # sanity
+        joined = _norm_space(raw)
+        diagnostics = {
+            "logical_lines": len(logical_lines),
+            "sections_found": len(sections_tree),
+            "raw_len": len(joined),
+        }
+        return sections_tree, diagnostics
+
+    async def llm_repair_parse(raw: str) -> List[Dict[str, Any]]:
+        """
+        LLM returns a structured "sections" tree (NOT the enhanced list)
+        so we can still build enhanced JSON exactly as you want.
+        """
+        prompt = f"""
+You are parsing a NON-DISCLOSURE AGREEMENT text that came from PDF extraction with broken line wrapping.
+
+TASK:
+Return a JSON object with EXACT shape:
+{{
+  "sections": [
+    {{
+      "section_number": "Intro" | "1" | "2" | "3" | ...,
+      "section_title": "Recital" | "Confidentiality" | "Term and Termination" | ...,
+      "blocks": [
+        "each block is a logical line. Keep numbering markers like (1), (2), (a), (b), [c] as they appear."
+      ]
+    }}
+  ]
+}}
+
+RULES:
+- Detect top-level sections like "1. Confidentiality", "5. Term and Termination", "6. General", etc.
+- Preserve subsection markers:
+  - Numeric: (1) (2) ...
+  - Letters: (a) (b) ... and also [c] [d]
+- Do NOT invent content. Use only provided text.
+- If there is preamble before section 1, put it under section_number="Intro", section_title="Recital".
+- Return JSON ONLY.
+
+TEXT:
+{raw}
+""".strip()
+
+        response = self.client.chat.completions.create(
+            model=self.deployment_name,
+            messages=[
+                {"role": "system", "content": "Return JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+        obj = json.loads(response.choices[0].message.content)
+        sections = obj.get("sections", [])
+        if not isinstance(sections, list):
+            return []
+        # Basic validation
+        cleaned: List[Dict[str, Any]] = []
+        for s in sections:
+            if not isinstance(s, dict):
+                continue
+            cleaned.append({
+                "section_number": str(s.get("section_number", "")).strip(),
+                "section_title": str(s.get("section_title", "")).strip(),
+                "blocks": [str(b).strip() for b in (s.get("blocks", []) or []) if str(b).strip()],
+            })
+        return cleaned
+
+    # 1) Heuristic parse first (unless force_llm)
+    sections_tree, diag = heuristic_parse(raw_text)
+
+    # failure pattern you reported: single clause with entire document
+    heuristic_failed = (
+        force_llm
+        or diag["sections_found"] <= 1
+        or (diag["sections_found"] == 2 and any(s.get("section_number") == "Intro" for s in sections_tree))
+    )
+
+    if heuristic_failed:
+        try:
+            llm_tree = await llm_repair_parse(raw_text)
+            # if LLM gives meaningful sections, use it; else fallback to heuristic
+            if len(llm_tree) >= 2:
+                sections_tree = llm_tree
+        except Exception:
+            # fallback to heuristic silently
+            pass
+
+    enhanced = build_enhanced_from_tree(sections_tree)
+
+    # last safety: if still only one huge clause, return a single "Recital" clause but do not crash
+    if len(enhanced) <= 1:
+        txt = _norm_space(raw_text)
+        enhanced = [{
+            "id": f"{document_type}-clause-0",
+            "clause_type": "Recital",
+            "main_clause_number": "Intro",
+            "section_number": "Intro",
+            "section_title": "Recital",
+            "text": txt,
+            "text_excerpt": (txt[:400] + "...") if len(txt) > 400 else txt,
+            "confidence": 0.5,
+            "multiplier": 1.0,
+            "baseline_risk": 3,
+            "location": {"start": 0, "end": len(txt), "dom_id": _make_dom_id(document_type, 0)}
+        }]
+
+    return enhanced
+
+
+
+
+
+def _cosine(a: List[float], b: List[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = 0.0
+    na = 0.0
+    nb = 0.0
+    for x, y in zip(a, b):
+        dot += x * y
+        na += x * x
+        nb += y * y
+    if na <= 0 or nb <= 0:
+        return 0.0
+    return dot / (math.sqrt(na) * math.sqrt(nb))
+
+
+def _lex_sim(a: str, b: str) -> float:
+    a = _norm_space(a).lower()
+    b = _norm_space(b).lower()
+    if not a or not b:
+        return 0.0
+    # difflib ratio works well for legal text overlap
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def _clause_key(c: Dict[str, Any]) -> str:
+    # Normalize section_number like "5(a)" "5 (a)" etc.
+    sn = str(c.get("section_number", "") or "").strip().lower()
+    sn = sn.replace(" ", "")
+    sn = sn.replace("section", "")
+    return sn
+
+
+def _clause_text_for_match(c: Dict[str, Any]) -> str:
+    return (c.get("text") or c.get("full_clause_text") or c.get("text_excerpt") or "").strip()
+
+
+async def match_clauses_between_documents_v2(
+    self,
+    baseline_clauses: List[Dict[str, Any]],
+    supplier_clauses: List[Dict[str, Any]],
+    min_score: float = 0.72,
+    prefer_embeddings: bool = True,
+) -> Tuple[List[Tuple[Dict[str, Any], Dict[str, Any]]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    DROP-IN function.
+
+    Returns:
+      matched_pairs: List[(baseline_clause, supplier_clause)]
+      unmatched_baseline: List[baseline_clause]
+      unmatched_supplier: List[supplier_clause]
+    """
+
+    baseline = [c for c in (baseline_clauses or []) if isinstance(c, dict) and _clause_text_for_match(c)]
+    supplier = [c for c in (supplier_clauses or []) if isinstance(c, dict) and _clause_text_for_match(c)]
+
+    matched_pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    used_s = set()
+
+    # 1) Hard match by section_number key (best for keeping numbering stable)
+    sup_by_key: Dict[str, List[int]] = {}
+    for j, sc in enumerate(supplier):
+        k = _clause_key(sc)
+        if k:
+            sup_by_key.setdefault(k, []).append(j)
+
+    baseline_unmatched_idx = set(range(len(baseline)))
+
+    for i, bc in enumerate(baseline):
+        k = _clause_key(bc)
+        if not k:
+            continue
+        cand = sup_by_key.get(k, [])
+        # choose first unused
+        pick = None
+        for j in cand:
+            if j not in used_s:
+                pick = j
+                break
+        if pick is not None:
+            matched_pairs.append((bc, supplier[pick]))
+            used_s.add(pick)
+            baseline_unmatched_idx.discard(i)
+
+    # 2) Soft match remaining (embedding cosine if present, else lexical)
+    remaining_b = [i for i in range(len(baseline)) if i in baseline_unmatched_idx]
+    remaining_s = [j for j in range(len(supplier)) if j not in used_s]
+
+    # Precompute text + embeddings
+    b_text = {i: _clause_text_for_match(baseline[i]) for i in remaining_b}
+    s_text = {j: _clause_text_for_match(supplier[j]) for j in remaining_s}
+
+    def score_pair(i: int, j: int) -> float:
+        bc = baseline[i]
+        sc = supplier[j]
+
+        # If both have embeddings and enabled
+        if prefer_embeddings:
+            be = bc.get("embedding")
+            se = sc.get("embedding")
+            if isinstance(be, list) and isinstance(se, list) and len(be) > 10 and len(be) == len(se):
+                cos = _cosine(be, se)
+                # blend with lexical for stability
+                lex = _lex_sim(b_text[i], s_text[j])
+                return 0.75 * cos + 0.25 * lex
+
+        # lexical fallback
+        return _lex_sim(b_text[i], s_text[j])
+
+    # Greedy best-first matching (works well for clause lists; faster than Hungarian)
+    candidates: List[Tuple[float, int, int]] = []
+    for i in remaining_b:
+        for j in remaining_s:
+            # small speed optimization: ignore if titles totally different and both exist
+            bt = str(baseline[i].get("section_title", "")).lower().strip()
+            st = str(supplier[j].get("section_title", "")).lower().strip()
+            if bt and st:
+                # If neither token overlaps, still allow but lower priority by early prune on very long docs
+                pass
+            sc = score_pair(i, j)
+            if sc >= (min_score - 0.08):  # allow near-threshold; final filter later
+                candidates.append((sc, i, j))
+
+    candidates.sort(reverse=True, key=lambda x: x[0])
+
+    used_b2 = set()
+    for sc, i, j in candidates:
+        if i in used_b2:
+            continue
+        if j in used_s:
+            continue
+        if sc < min_score:
+            continue
+        matched_pairs.append((baseline[i], supplier[j]))
+        used_b2.add(i)
+        used_s.add(j)
+        baseline_unmatched_idx.discard(i)
+
+    unmatched_baseline = [baseline[i] for i in range(len(baseline)) if i in baseline_unmatched_idx]
+    unmatched_supplier = [supplier[j] for j in range(len(supplier)) if j not in used_s]
+
+    return matched_pairs, unmatched_baseline, unmatched_supplier
+
+
