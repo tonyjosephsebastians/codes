@@ -1,0 +1,287 @@
+async def match_clauses_between_documents(
+    self,
+    baseline_clauses: list[dict],
+    supplier_clauses: list[dict],
+) -> tuple[list[tuple[dict, dict]], list[dict], list[dict]]:
+    """
+    Robust matching WITHOUT changing any JSON structure or clause dict keys.
+
+    Fixes:
+      - Empty/garbage clauses causing index shift
+      - Same section split into multiple clause items (merges internally for matching)
+      - Mis-numbered section assignments (uses inferred section number from text start for ordering only)
+    """
+    import re
+    import math
+    from difflib import SequenceMatcher
+
+    # ----------------------------
+    # Helpers (do NOT mutate originals)
+    # ----------------------------
+    def _norm(s: str | None) -> str:
+        return (s or "").strip()
+
+    def _ws(s: str) -> str:
+        return re.sub(r"\s+", " ", (s or "")).strip()
+
+    _ONLY_PUNCT_RE = re.compile(r'^[\W_]+$')
+    _LEADING_SEC_RE = re.compile(r'^\s*(?:\((\d{1,4})\)|(\d{1,4})[.)])\s+')
+
+    def _infer_sec_int_from_text(text: str) -> int | None:
+        t = text or ""
+        m = _LEADING_SEC_RE.match(t)
+        if not m:
+            return None
+        try:
+            return int(m.group(1) or m.group(2))
+        except Exception:
+            return None
+
+    def _sec_int_from_field(sec: str | None) -> int | None:
+        t = _norm(sec)
+        if not t:
+            return None
+        # "(9)a" -> 9, "9.1" -> 9
+        m = re.search(r"(\d{1,4})", t)
+        if not m:
+            return None
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+
+    def _text_for_match(c: dict) -> str:
+        # prefer "text", fallback to "full_clause_text"
+        return _norm(c.get("text")) or _norm(c.get("full_clause_text"))
+
+    def _is_noise_clause(c: dict) -> bool:
+        txt = _ws(_text_for_match(c))
+        if not txt:
+            return True
+        if len(txt) < 20:
+            # common junk tokens you mentioned
+            if txt.lower() in {"mr", "mrs", "ms", "dr", "na", "n/a"}:
+                return True
+            # mostly punctuation
+            if _ONLY_PUNCT_RE.match(txt):
+                return True
+            return True
+        # mostly punctuation or too few letters
+        letters = sum(ch.isalpha() for ch in txt)
+        if letters < 10:
+            return True
+        return False
+
+    def _bucket_key(c: dict) -> tuple[str, str]:
+        main = _norm(c.get("main_clause_number") or c.get("main_section_number") or "")
+        ctype = _norm(c.get("clause_type") or c.get("section_title") or "")
+        return (main, ctype)
+
+    def _has_emb(c: dict) -> bool:
+        emb = c.get("embedding", None)
+        return emb is not None and isinstance(emb, (list, tuple)) and len(emb) > 0
+
+    def _cos_sim(a: list, b: list) -> float:
+        try:
+            dot = 0.0
+            na = 0.0
+            nb = 0.0
+            for x, y in zip(a, b):
+                fx = float(x)
+                fy = float(y)
+                dot += fx * fy
+                na += fx * fx
+                nb += fy * fy
+            if na <= 0.0 or nb <= 0.0:
+                return 0.0
+            return dot / (math.sqrt(na) * math.sqrt(nb))
+        except Exception:
+            return 0.0
+
+    def _lex_sim(a: str, b: str) -> float:
+        aa = _ws(a)
+        bb = _ws(b)
+        if not aa or not bb:
+            return 0.0
+        return float(SequenceMatcher(None, aa.lower(), bb.lower()).ratio())
+
+    def _similarity(bc: dict, sc: dict) -> float:
+        # embeddings if available, else lexical
+        if _has_emb(bc) and _has_emb(sc):
+            s = _cos_sim(bc["embedding"], sc["embedding"])
+            # if embeddings fail/0, fallback lexical
+            if s > 0.0:
+                return s
+        return _lex_sim(_text_for_match(bc), _text_for_match(sc))
+
+    # ----------------------------
+    # Internal wrapper (keeps pointer to original dict)
+    # ----------------------------
+    class _Item:
+        __slots__ = ("orig", "pos", "bucket", "sec_int", "text")
+        def __init__(self, orig: dict, pos: int):
+            self.orig = orig
+            self.pos = pos
+            self.bucket = _bucket_key(orig)
+            txt = _text_for_match(orig)
+            self.text = txt
+            # effective sec for ordering/matching: infer from text start first, else section_number field
+            self.sec_int = _infer_sec_int_from_text(txt) or _sec_int_from_field(orig.get("section_number"))
+
+    def _preprocess(items: list[dict]) -> tuple[list[_Item], list[dict]]:
+        """
+        Returns (clean_items, noise_unmatched)
+        Also merges consecutive split sections internally (same bucket + same sec_int).
+        """
+        noise: list[dict] = []
+        keep: list[_Item] = []
+
+        for i, c in enumerate(items or []):
+            if not isinstance(c, dict):
+                continue
+            if _is_noise_clause(c):
+                noise.append(c)
+            else:
+                keep.append(_Item(c, i))
+
+        # sort by original order first (we want stability)
+        keep.sort(key=lambda it: it.pos)
+
+        # merge consecutive items that represent the same section (split paragraphs issue)
+        merged: list[_Item] = []
+        for it in keep:
+            if not merged:
+                merged.append(it)
+                continue
+            prev = merged[-1]
+            if prev.bucket == it.bucket and prev.sec_int is not None and prev.sec_int == it.sec_int:
+                # merge TEXT only for similarity scoring; DO NOT mutate orig dicts
+                prev.text = (prev.text.rstrip() + "\n\n" + it.text.lstrip()).strip()
+                continue
+            merged.append(it)
+
+        return merged, noise
+
+    # ----------------------------
+    # Preprocess both sides (NO schema change)
+    # ----------------------------
+    b_items, b_noise = _preprocess(baseline_clauses)
+    s_items, s_noise = _preprocess(supplier_clauses)
+
+    # group by bucket
+    b_buckets: dict[tuple[str, str], list[_Item]] = {}
+    s_buckets: dict[tuple[str, str], list[_Item]] = {}
+
+    for it in b_items:
+        b_buckets.setdefault(it.bucket, []).append(it)
+    for it in s_items:
+        s_buckets.setdefault(it.bucket, []).append(it)
+
+    all_keys = sorted(set(list(b_buckets.keys()) + list(s_buckets.keys())))
+
+    # ----------------------------
+    # DP alignment per bucket (order-preserving)
+    # ----------------------------
+    MATCH_MIN_SIM = 0.62
+    GAP_PENALTY = 0.18
+    SEC_MISMATCH_PENALTY = 0.06  # discourages base(9)<->supp(10) unless similarity truly strong
+
+    matched_b: set[int] = set()  # id(orig)
+    matched_s: set[int] = set()
+
+    matches: list[tuple[dict, dict]] = []
+
+    def _dp_align(b_list: list[_Item], s_list: list[_Item]) -> list[tuple[_Item, _Item]]:
+        n = len(b_list)
+        m = len(s_list)
+        if n == 0 or m == 0:
+            return []
+
+        # dp tables
+        dp = [[0.0] * (m + 1) for _ in range(n + 1)]
+        bt = [[""] * (m + 1) for _ in range(n + 1)]
+
+        for i in range(1, n + 1):
+            dp[i][0] = dp[i - 1][0] - GAP_PENALTY
+            bt[i][0] = "B"
+        for j in range(1, m + 1):
+            dp[0][j] = dp[0][j - 1] - GAP_PENALTY
+            bt[0][j] = "S"
+
+        # fill
+        for i in range(1, n + 1):
+            bi = b_list[i - 1]
+            for j in range(1, m + 1):
+                sj = s_list[j - 1]
+
+                sim = _similarity(bi.orig, sj.orig)
+
+                # section-number mismatch discouragement
+                if bi.sec_int is not None and sj.sec_int is not None and bi.sec_int != sj.sec_int:
+                    sim -= SEC_MISMATCH_PENALTY
+
+                match_score = dp[i - 1][j - 1] + sim
+                skip_b = dp[i - 1][j] - GAP_PENALTY
+                skip_s = dp[i][j - 1] - GAP_PENALTY
+
+                best = match_score
+                step = "M"
+                if skip_b > best:
+                    best = skip_b
+                    step = "B"
+                if skip_s > best:
+                    best = skip_s
+                    step = "S"
+
+                dp[i][j] = best
+                bt[i][j] = step
+
+        # backtrack
+        out: list[tuple[_Item, _Item]] = []
+        i, j = n, m
+        while i > 0 or j > 0:
+            step = bt[i][j]
+            if step == "M":
+                bi = b_list[i - 1]
+                sj = s_list[j - 1]
+                # accept only if *raw* sim is good enough
+                raw_sim = _similarity(bi.orig, sj.orig)
+                if raw_sim >= MATCH_MIN_SIM:
+                    out.append((bi, sj))
+                i -= 1
+                j -= 1
+            elif step == "B":
+                i -= 1
+            elif step == "S":
+                j -= 1
+            else:
+                if i > 0:
+                    i -= 1
+                elif j > 0:
+                    j -= 1
+
+        out.reverse()
+        return out
+
+    for key in all_keys:
+        b_list = [x for x in b_buckets.get(key, []) if id(x.orig) not in matched_b]
+        s_list = [x for x in s_buckets.get(key, []) if id(x.orig) not in matched_s]
+        if not b_list or not s_list:
+            continue
+
+        pairs = _dp_align(b_list, s_list)
+        for bi, sj in pairs:
+            if id(bi.orig) in matched_b or id(sj.orig) in matched_s:
+                continue
+            matches.append((bi.orig, sj.orig))
+            matched_b.add(id(bi.orig))
+            matched_s.add(id(sj.orig))
+
+    # ----------------------------
+    # Unmatched = anything not matched + noise
+    # (Noise is returned unmatched so you can see them, but it does not shift matching)
+    # ----------------------------
+    unmatched_baseline = [c for c in baseline_clauses if isinstance(c, dict) and id(c) not in matched_b] + b_noise
+    unmatched_supplier = [c for c in supplier_clauses if isinstance(c, dict) and id(c) not in matched_s] + s_noise
+
+    return matches, unmatched_baseline, unmatched_supplier
