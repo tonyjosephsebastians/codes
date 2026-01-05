@@ -1,0 +1,100 @@
+async def split_section_5_with_llm(self, text: str) -> List[Dict[str, str]]:
+    """
+    Uses LLM to split merged Section (5) text into (5)a, (5)b, (5)c, (5)[x]1...
+    Returns list of {subsection_id, subsection_text}
+    """
+
+    prompt = f"""
+Return ONLY valid JSON.
+
+Split the following merged legal clause text into logical subsections.
+
+Rules:
+- Output JSON exactly like:
+  {{
+    "subsections": [
+      {{ "subsection_id": "(5)a", "subsection_text": "..." }},
+      {{ "subsection_id": "(5)b", "subsection_text": "..." }}
+    ]
+  }}
+
+How to split:
+- If logical list items are separated by semicolons (;), split them into (5)a, (5)b, (5)c...
+- If checkbox items [x] appear, create:
+  (5)[x]1, (5)[x]2, (5)[x]3 in order of appearance
+- Preserve wording exactly
+- Do NOT invent content
+- Do NOT include markdown
+
+TEXT:
+{text}
+"""
+
+    response = self.client.chat.completions.create(
+        model=self.deployment_name,
+        messages=[
+            {"role": "system", "content": "Return JSON only."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0,
+        response_format={"type": "json_object"}
+    )
+
+    result = json.loads(response.choices[0].message.content)
+    return result.get("subsections", [])
+
+
+
+for sub_idx, subsection in enumerate(subsections):
+    subsection_id = subsection.get("subsection_id")
+    subsection_text = subsection.get("subsection_text", "")
+
+
+
+for sub_idx, subsection in enumerate(subsections):
+    subsection_id = subsection.get("subsection_id")
+    subsection_text = (subsection.get("subsection_text") or "").strip()
+
+    # --- SPECIAL FIX: Clause 1, Section (5) merged content ---
+    if (
+        main_section_number == "1"
+        and subsection_id == "(5)"
+        and (";" in subsection_text or "[x]" in subsection_text.lower())
+        and "(a)" not in subsection_text.lower()
+        and "(b)" not in subsection_text.lower()
+    ):
+        logger.info("Detected merged Section (5). Calling secondary LLM split.")
+
+        nested_subsections = await self.split_section_5_with_llm(subsection_text)
+
+        if nested_subsections:
+            for nested_idx, nested in enumerate(nested_subsections):
+                final_id = nested["subsection_id"]
+                final_text = nested["subsection_text"]
+
+                enhanced_clauses.append({
+                    "id": f"{document_type}-clause-{idx}-sub-{sub_idx}-nested-{nested_idx}",
+                    "clause_type": clause_type,
+                    "main_clause_number": main_section_number,
+                    "section_number": final_id,   # (5)a, (5)b, (5)[x]1
+                    "section_title": clause.get("section_title", clause_type),
+                    "text": final_text,
+                    "full_clause_text": full_text,
+                    "text_excerpt": (final_text[:400] + "...") if len(final_text) > 400 else final_text,
+                    "confidence": 0.9,
+                    "multiplier": 1.0,
+                    "baseline_risk": baseline_risk,
+                    "location": {
+                        "start": 0,
+                        "end": len(final_text),
+                        "dom_id": f"clause-{document_type}-{idx}-sub-{sub_idx}-nested-{nested_idx}",
+                    }
+                })
+
+            continue  # ⛔ VERY IMPORTANT: do NOT add original "(5)"
+
+
+
+
+
+
