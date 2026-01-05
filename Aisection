@@ -1,0 +1,18 @@
+NESTED SUBSECTION SPLITTING (KEEP SAME JSON STRUCTURE):
+- If a subsection contains nested labels like "(a)", "(b)", "(c)" inside it, you MUST split them into separate items inside "subsections".
+- Keep the SAME keys for each item:
+  { "subsection_id": "...", "parent_clause_number": "...", "subsection_text": "..." }
+
+HOW TO FORM subsection_id FOR NESTED ITEMS:
+- Parent subsection "(5)" with nested "(a)" becomes subsection_id "(5)a"
+- Parent subsection "(5)" with nested "(b)" becomes subsection_id "(5)b"
+- Parent subsection "(5)" with nested "(c)" becomes subsection_id "(5)c"
+
+CHECKBOX ITEMS:
+- If you see checkbox markers like "[x]" or "[ ]", treat EACH checkbox line/item as a separate nested subsection.
+- subsection_id must include the checkbox marker plus a running index in appearance order:
+  Examples under parent "(5)":
+  - "(5)[x]1"
+  - "(5)[x]2"
+  - "(5)[ ]3"
+- Do NOT merge multiple [x] items into one.
