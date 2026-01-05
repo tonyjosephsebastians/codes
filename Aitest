@@ -1,0 +1,910 @@
+import re
+import json
+from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    import pandas as pd
+except Exception:  # pragma: no cover
+    pd = None
+
+
+class AIUtils:
+    """
+    Drop-in replacement for LLM-based clause identification.
+    - Deterministic parsing of sections + nested subsections
+    - Returns EXACT JSON structure you showed
+    - Includes clause-library validation logic for multiplier/baseline risk
+    """
+
+    # -----------------------------
+    # Public API #1 (REPLACES LLM)
+    # -----------------------------
+    async def identify_clauses(
+        self,
+        document_text: str,
+        clause_library,  # pd.DataFrame in your system; kept for compatibility
+        document_type: str = "comparison",
+    ) -> List[Dict[str, Any]]:
+        """
+        Returns list of clauses in EXACT shape:
+
+        [
+          {
+            "section_number": "1" | "A" | "Intro",
+            "section_title": "...",
+            "clause_type": "1. Confidentiality" | "Recital",
+            "text": "full clause text including all subsections",
+            "subsections": [
+              {
+                "subsection_id": "(2)(a)",
+                "parent_clause_number": "1",
+                "subsection_text": "(a) ...text..."
+              }
+            ]
+          }
+        ]
+        """
+
+        if not document_text or not document_text.strip():
+            return []
+
+        # -----------------------------
+        # Normalize lines for stable parsing
+        # -----------------------------
+        raw_lines = document_text.splitlines()
+        lines: List[str] = []
+        for ln in raw_lines:
+            ln2 = re.sub(r"[ \t]+", " ", ln).strip()
+            if ln2:
+                lines.append(ln2)
+        if not lines:
+            return []
+
+        # -----------------------------
+        # Heading detectors
+        # -----------------------------
+        # Lettered recital: "A." / "A)" / "A -" etc
+        lettered_pat = re.compile(r"^([A-Z])\s*(?:[.)]|-)\s*(.*)$")
+
+        # Numbered clause: "1." / "1)" / "1 -" OR "Section 1: Title"
+        numbered_pat_1 = re.compile(r"^(\d{1,3})\s*(?:[.)]|-)\s*(.*)$")
+        numbered_pat_2 = re.compile(r"^(?:SECTION|Section)\s+(\d{1,3})\s*(?:[:.\-])?\s*(.*)$")
+
+        # Subsection marker at line start: "(1)" "(a)" "(i)"
+        subsection_pat = re.compile(r"^\(([^\)]+)\)\s*(.*)$")
+
+        roman_pat = re.compile(r"^(?=[ivxlcdmIVXLCDM]+$)[ivxlcdmIVXLCDM]+$")
+
+        def is_numbered_heading(s: str) -> Optional[Tuple[str, str]]:
+            m = numbered_pat_1.match(s)
+            if m:
+                return m.group(1), (m.group(2) or "").strip()
+            m = numbered_pat_2.match(s)
+            if m:
+                return m.group(1), (m.group(2) or "").strip()
+            return None
+
+        def is_lettered_heading(s: str) -> Optional[Tuple[str, str]]:
+            m = lettered_pat.match(s)
+            if not m:
+                return None
+            return m.group(1), (m.group(2) or "").strip()
+
+        # IMPORTANT: Do NOT treat bracket paragraphs like "[date]" or "[for legal]" as headings
+        def looks_like_heading(s: str) -> bool:
+            if s.startswith("["):
+                return False
+            return bool(is_numbered_heading(s) or is_lettered_heading(s))
+
+        # -----------------------------
+        # Locate first numbered clause => split preamble (Intro/Recitals)
+        # -----------------------------
+        first_numbered_idx = None
+        for i, ln in enumerate(lines):
+            if is_numbered_heading(ln):
+                first_numbered_idx = i
+                break
+
+        pre = lines[:first_numbered_idx] if first_numbered_idx is not None else lines
+        post = lines[first_numbered_idx:] if first_numbered_idx is not None else []
+
+        clauses: List[Dict[str, Any]] = []
+
+        # -----------------------------
+        # 1) Intro + lettered recitals (A, B, C...)
+        # -----------------------------
+        intro_lines: List[str] = []
+        recital_blocks: List[Tuple[str, List[str]]] = []
+
+        current_letter: Optional[str] = None
+        current_block: List[str] = []
+
+        for ln in pre:
+            lh = is_lettered_heading(ln)
+            if lh:
+                if current_letter is not None:
+                    recital_blocks.append((current_letter, current_block))
+                current_letter = lh[0]
+                current_block = [ln]
+            else:
+                if current_letter is None:
+                    intro_lines.append(ln)
+                else:
+                    current_block.append(ln)
+
+        if current_letter is not None:
+            recital_blocks.append((current_letter, current_block))
+
+        intro_text = "\n".join(intro_lines).strip()
+        if intro_text:
+            clauses.append(
+                {
+                    "section_number": "Intro",
+                    "section_title": "Recital",
+                    "clause_type": "Recital",
+                    "text": intro_text,
+                    "subsections": [],
+                }
+            )
+
+        for letter, block_lines in recital_blocks:
+            title = "Recital"
+            lh = is_lettered_heading(block_lines[0]) if block_lines else None
+            if lh and lh[1]:
+                title = lh[1]
+            clauses.append(
+                {
+                    "section_number": letter,
+                    "section_title": title if title else "Recital",
+                    "clause_type": "Recital",
+                    "text": "\n".join(block_lines).strip(),
+                    "subsections": [],
+                }
+            )
+
+        # -----------------------------
+        # 2) Nested subsection extraction => leaf ids like (5)(a), (2)(d)(i)
+        # -----------------------------
+        def marker_level(token: str) -> int:
+            t = token.strip()
+            if t.isdigit():
+                return 1
+            if len(t) == 1 and t.isalpha():
+                return 2
+            if roman_pat.match(t):
+                return 3
+            return 4
+
+        def is_valid_marker(token: str) -> bool:
+            t = token.strip()
+            return (
+                t.isdigit()
+                or (len(t) == 1 and t.isalpha())
+                or bool(roman_pat.match(t))
+            )
+
+        def extract_leaf_subsections(full_clause_text: str, parent_clause: str) -> List[Dict[str, Any]]:
+            lns = [re.sub(r"[ \t]+", " ", x).strip() for x in full_clause_text.splitlines() if x.strip()]
+
+            out: List[Dict[str, Any]] = []
+
+            # hierarchical path by level, ex: {1:"(2)", 2:"(d)", 3:"(i)"}
+            path: Dict[int, str] = {}
+
+            current_leaf_id: Optional[str] = None
+            current_leaf_lines: List[str] = []
+
+            def flush_leaf():
+                nonlocal current_leaf_id, current_leaf_lines
+                if current_leaf_id is None:
+                    return
+                out.append(
+                    {
+                        "subsection_id": current_leaf_id,
+                        "parent_clause_number": str(parent_clause),
+                        "subsection_text": "\n".join(current_leaf_lines).strip(),
+                    }
+                )
+                current_leaf_id = None
+                current_leaf_lines = []
+
+            for ln in lns:
+                m = subsection_pat.match(ln)
+                if not m:
+                    if current_leaf_id is not None:
+                        current_leaf_lines.append(ln)
+                    continue
+
+                token = m.group(1).strip()
+                remainder = (m.group(2) or "").strip()
+
+                # Prevent false splits on "(date)" or "(for legal)" etc.
+                if not is_valid_marker(token):
+                    if current_leaf_id is not None:
+                        current_leaf_lines.append(ln)
+                    continue
+
+                # Start a new leaf subsection
+                flush_leaf()
+
+                lvl = marker_level(token)
+                path[lvl] = f"({token})"
+                # clear deeper
+                for k in list(path.keys()):
+                    if k > lvl:
+                        del path[k]
+
+                leaf_id = "".join(path[k] for k in sorted(path.keys()))
+                current_leaf_id = leaf_id
+
+                # Keep marker + remainder on first line
+                first_line = f"{path[lvl]} {remainder}".strip() if remainder else path[lvl]
+                current_leaf_lines = [first_line]
+
+            flush_leaf()
+
+            # Optional: hide top-level numeric-only leafs if deeper exists (keeps UI cleaner)
+            # Example: if (2)(a) exists, hide (2) leaf.
+            out = self._hide_parent_leafs_when_children_exist(out)
+
+            return out
+
+        # -----------------------------
+        # 3) Parse numbered clauses
+        # -----------------------------
+        current_num: Optional[str] = None
+        current_title: str = ""
+        current_lines: List[str] = []
+
+        def flush_numbered():
+            nonlocal current_num, current_title, current_lines
+            if current_num is None:
+                return
+
+            full_text = "\n".join(current_lines).strip()
+            title = current_title.strip() if current_title.strip() else "Untitled"
+            clause_type = f"{current_num}. {title}".strip()
+
+            subsections = extract_leaf_subsections(full_text, parent_clause=current_num)
+
+            clauses.append(
+                {
+                    "section_number": str(current_num),
+                    "section_title": title,
+                    "clause_type": clause_type,
+                    "text": full_text,
+                    "subsections": subsections,
+                }
+            )
+
+            current_num = None
+            current_title = ""
+            current_lines = []
+
+        for ln in post:
+            nh = is_numbered_heading(ln)
+            if nh:
+                flush_numbered()
+                current_num = nh[0]
+                current_title = nh[1]
+                current_lines = [ln]
+            else:
+                if current_num is not None:
+                    current_lines.append(ln)
+
+        flush_numbered()
+        return clauses
+
+    # -----------------------------
+    # Public API #2 (Final JSON like your "enhanced_clauses")
+    # -----------------------------
+    def build_enhanced_clauses(
+        self,
+        identified_clauses: List[Dict[str, Any]],
+        clause_library,  # pd.DataFrame
+        document_type: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        Builds final clause JSON that matches your screenshot keys:
+
+        [
+          {
+            "id": "Original-clause-0-sub-0",
+            "clause_type": "...",
+            "main_clause_number": "1",
+            "section_number": "(2)(a)",
+            "section_title": "...",
+            "text": "...",
+            "full_clause_text": "...",
+            "text_excerpt": "...",
+            "confidence": 0.9,
+            "multiplier": 1.0,
+            "baseline_risk": 3,
+            "location": {"start":0,"end":123,"dom_id":"clause-Original-0-sub-0"}
+          }
+        ]
+        """
+        enhanced: List[Dict[str, Any]] = []
+        if not identified_clauses:
+            return enhanced
+
+        for idx, clause in enumerate(identified_clauses):
+            if clause is None:
+                continue
+
+            clause_type = str(clause.get("section_title", "") or clause.get("clause_type", "Unknown"))
+            main_section_number = str(clause.get("section_number", f"{idx + 1}"))
+            full_text = str(clause.get("text", ""))
+            section_title = str(clause.get("section_title", clause_type))
+            subsections = clause.get("subsections", []) or []
+
+            # Clause library validation logic (like screenshot)
+            multiplier, baseline_risk = self._lookup_multiplier_and_risk(
+                clause_library=clause_library,
+                section_number=main_section_number,
+                section_title=section_title,
+                clause_type=str(clause.get("clause_type", clause_type)),
+            )
+
+            if subsections:
+                for sub_idx, sub in enumerate(subsections):
+                    subsection_id = str(sub.get("subsection_id", f"({sub_idx + 1})"))
+                    subsection_text = str(sub.get("subsection_text", ""))
+
+                    enhanced.append(
+                        {
+                            "id": f"{document_type}-clause-{idx}-sub-{sub_idx}",
+                            "clause_type": clause_type,
+                            "main_clause_number": main_section_number,
+                            "section_number": subsection_id,  # e.g., "(5)(a)"
+                            "section_title": section_title,
+                            "text": subsection_text,
+                            "full_clause_text": full_text,
+                            "text_excerpt": (subsection_text[:400] + "...") if len(subsection_text) > 400 else subsection_text,
+                            "confidence": 0.9,
+                            "multiplier": multiplier,
+                            "baseline_risk": baseline_risk,
+                            "location": {
+                                "start": 0,
+                                "end": len(subsection_text),
+                                "dom_id": f"clause-{document_type}-{idx}-sub-{sub_idx}",
+                            },
+                        }
+                    )
+            else:
+                enhanced.append(
+                    {
+                        "id": f"{document_type}-clause-{idx}",
+                        "clause_type": clause_type,
+                        "main_clause_number": main_section_number,
+                        "section_number": main_section_number,
+                        "section_title": section_title,
+                        "text": full_text,
+                        "full_clause_text": full_text,
+                        "text_excerpt": (full_text[:400] + "...") if len(full_text) > 400 else full_text,
+                        "confidence": 0.9,
+                        "multiplier": multiplier,
+                        "baseline_risk": baseline_risk,
+                        "location": {
+                            "start": 0,
+                            "end": len(full_text),
+                            "dom_id": f"clause-{document_type}-{idx}",
+                        },
+                    }
+                )
+
+        return enhanced
+
+    # -----------------------------
+    # Internals
+    # -----------------------------
+    def _hide_parent_leafs_when_children_exist(self, subs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        If (2)(a) exists, hide (2) leaf.
+        If (5)(a) exists, hide (5) leaf.
+        Keeps output cleaner for nested structures.
+        """
+        if not subs:
+            return subs
+
+        ids = [s.get("subsection_id", "") for s in subs]
+        id_set = set(ids)
+
+        def is_parent_of_any(child_id: str) -> bool:
+            # parent is a strict prefix of child id
+            for other in id_set:
+                if other != child_id and other.startswith(child_id) and len(other) > len(child_id):
+                    return True
+            return False
+
+        filtered: List[Dict[str, Any]] = []
+        for s in subs:
+            sid = s.get("subsection_id", "")
+            if sid and is_parent_of_any(sid):
+                # drop parents if they have children
+                continue
+            filtered.append(s)
+        return filtered
+
+    def _normalize_ref(self, s: str) -> str:
+        s = (s or "").lower()
+        s = re.sub(r"\s+", " ", s)
+        s = s.replace("section", "").strip()
+        s = re.sub(r"[^a-z0-9(). ]+", "", s)
+        return s.strip()
+
+    def _best_library_match(
+        self,
+        clause_library,
+        section_number: str,
+        section_title: str,
+        clause_type: str,
+    ):
+        """
+        Flexible match similar to your screenshot:
+        - compares against "Clause Reference"
+        - uses section number + title tokens + clause_type
+        """
+        if clause_library is None:
+            return None
+        if pd is None:
+            return None
+        if getattr(clause_library, "empty", False):
+            return None
+
+        sec = self._normalize_ref(str(section_number))
+        title = self._normalize_ref(str(section_title))
+        ctype = self._normalize_ref(str(clause_type))
+
+        title_tokens = {t for t in re.split(r"[\s]+", title) if len(t) >= 4}
+
+        best_score = 0
+        best_row = None
+
+        for _, row in clause_library.iterrows():
+            ref = self._normalize_ref(str(row.get("Clause Reference", "")))
+            if not ref:
+                continue
+
+            score = 0
+            if sec and sec in ref:
+                score += 5
+            if ctype and ctype in ref:
+                score += 3
+            if title_tokens:
+                overlap = sum(1 for t in title_tokens if t in ref)
+                score += min(overlap, 4)
+
+            if score > best_score:
+                best_score = score
+                best_row = row
+
+        # require a minimum signal
+        return best_row if best_score >= 3 else None
+
+    def _lookup_multiplier_and_risk(
+        self,
+        clause_library,
+        section_number: str,
+        section_title: str,
+        clause_type: str,
+    ) -> Tuple[float, int]:
+        """
+        Reads these columns exactly like your screenshot:
+        - "Multiplier"
+        - "Clause Risk Level (Baseline) Score"
+        """
+        multiplier = 1.0
+        baseline_risk = 3
+
+        row = self._best_library_match(
+            clause_library=clause_library,
+            section_number=section_number,
+            section_title=section_title,
+            clause_type=clause_type,
+        )
+        if row is None:
+            return multiplier, baseline_risk
+
+        try:
+            mul = row.get("Multiplier", 1.0)
+            if pd.notna(mul):
+                multiplier = float(mul)
+        except Exception:
+            multiplier = 1.0
+
+        try:
+            br = row.get("Clause Risk Level (Baseline) Score", 3)
+            if pd.notna(br):
+                baseline_risk = int(br)
+        except Exception:
+            baseline_risk = 3
+
+        return multiplier, baseline_risk
+
+
+baseline_clauses = await ai_utils.identify_clauses(baseline_text, self.clause_library.library_data, "Original")
+enhanced_baseline = ai_utils.build_enhanced_clauses(
+    identified_clauses=baseline_clauses,
+    clause_library=self.clause_library.library_data,
+    document_type="Original"
+)
+
+supplier_clauses = await ai_utils.identify_clauses(supplier_text, self.clause_library.library_data, "Comparison")
+
+enhanced_supplier = ai_utils.build_enhanced_clauses(
+    identified_clauses=supplier_clauses,
+    clause_library=self.clause_library.library_data,
+    document_type="Comparison"
+)
+
+
+
+
+
+
+import re
+import math
+from typing import Any, Dict, List, Tuple, Optional
+from difflib import SequenceMatcher
+
+
+def _norm(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def _clean_section_id(s: str) -> str:
+    """
+    "(2)(a)" -> "2a"
+    "(5)" -> "5"
+    "1" -> "1"
+    """
+    s = (s or "").strip()
+    s = s.replace("(", "").replace(")", "")
+    s = re.sub(r"[^0-9a-zA-Z]+", "", s)
+    return s.lower()
+
+
+def _token_set(s: str) -> set:
+    s = _norm(s)
+    # keep words + numbers
+    toks = re.findall(r"[a-z0-9]+", s)
+    return set(toks)
+
+
+def _jaccard(a: set, b: set) -> float:
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    uni = len(a | b)
+    return inter / uni if uni else 0.0
+
+
+def _seq_ratio(a: str, b: str) -> float:
+    a = _norm(a)
+    b = _norm(b)
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def _cosine(u: List[float], v: List[float]) -> float:
+    if not u or not v or len(u) != len(v):
+        return 0.0
+    dot = 0.0
+    nu = 0.0
+    nv = 0.0
+    for i in range(len(u)):
+        dot += float(u[i]) * float(v[i])
+        nu += float(u[i]) * float(u[i])
+        nv += float(v[i]) * float(v[i])
+    if nu <= 0.0 or nv <= 0.0:
+        return 0.0
+    return dot / (math.sqrt(nu) * math.sqrt(nv))
+
+
+def _is_effectively_empty_clause(clause: Dict[str, Any]) -> bool:
+    txt = (clause.get("text") or "").strip()
+    # Treat very short as empty/noise
+    return len(txt) < 15
+
+
+def _match_key(clause: Dict[str, Any]) -> str:
+    """
+    Strong key that preserves numbering:
+    main_clause_number + section_number
+    Examples:
+      main=1 section=(2)(a) => "1|(2)(a)"
+      main=1 section=1      => "1|1"
+    """
+    main = str(clause.get("main_clause_number") or clause.get("section_number") or "").strip()
+    sec = str(clause.get("section_number") or "").strip()
+    return f"{main}|{sec}"
+
+
+def _match_key_relaxed(clause: Dict[str, Any]) -> str:
+    """
+    Relaxed key for minor formatting differences:
+      "1|(2)(a)" -> "1|2a"
+    """
+    main = str(clause.get("main_clause_number") or clause.get("section_number") or "").strip()
+    sec = _clean_section_id(str(clause.get("section_number") or ""))
+    return f"{main}|{sec}"
+
+
+def _safe_title(clause: Dict[str, Any]) -> str:
+    # In your enhanced json, clause_type often holds title-ish
+    return (clause.get("section_title") or clause.get("clause_type") or "").strip()
+
+
+def _similarity_score(a: Dict[str, Any], b: Dict[str, Any]) -> float:
+    """
+    Combine:
+      - embedding cosine (if exists)
+      - token jaccard
+      - sequence ratio
+    Output 0..1
+    """
+    a_text = (a.get("text") or "")
+    b_text = (b.get("text") or "")
+
+    # Embedding similarity if available
+    sim_emb = 0.0
+    ea = a.get("embedding")
+    eb = b.get("embedding")
+    if isinstance(ea, list) and isinstance(eb, list) and ea and eb:
+        sim_emb = _cosine(ea, eb)
+
+    # Text similarity fallback
+    ta = _token_set(a_text)
+    tb = _token_set(b_text)
+    sim_j = _jaccard(ta, tb)
+    sim_s = _seq_ratio(a_text[:2000], b_text[:2000])  # cap for speed
+
+    # Weighted blend
+    # If embeddings exist, give them more weight; else use text mix.
+    if sim_emb > 0.0:
+        return (0.70 * sim_emb) + (0.20 * sim_j) + (0.10 * sim_s)
+    return (0.55 * sim_j) + (0.45 * sim_s)
+
+
+async def _match_clauses_between_documents(
+    self,
+    baseline_clauses: List[Dict[str, Any]],
+    supplier_clauses: List[Dict[str, Any]],
+    *,
+    min_similarity: float = 0.62,
+    allow_cross_section_semantic_match: bool = True,
+) -> Tuple[
+    List[Tuple[Dict[str, Any], Dict[str, Any]]],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+]:
+    """
+    Returns:
+      matched_pairs: [(baseline_clause, supplier_clause), ...]
+      unmatched_baseline: [baseline_clause, ...]
+      unmatched_supplier: [supplier_clause, ...]
+
+    Works with your ENHANCED clause structure:
+      - main_clause_number
+      - section_number (could be "(2)(a)")
+      - text
+      - optional embedding
+    """
+
+    baseline = [c for c in (baseline_clauses or []) if c]
+    supplier = [c for c in (supplier_clauses or []) if c]
+
+    # 0) Pre-filter: keep empties but don't force-match them
+    # We'll mark them unmatched unless exact key match exists.
+    matched_pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+
+    # 1) Exact match by strong key (main|section_number)
+    s_by_key = {}
+    for s in supplier:
+        s_by_key.setdefault(_match_key(s), []).append(s)
+
+    used_supplier_ids = set()
+
+    def _sid(obj: Dict[str, Any]) -> str:
+        # Stable unique-ish id; your enhanced has "id"
+        return str(obj.get("id") or _match_key(obj))
+
+    baseline_remaining: List[Dict[str, Any]] = []
+    supplier_remaining: List[Dict[str, Any]] = supplier[:]
+
+    for b in baseline:
+        key = _match_key(b)
+        candidates = s_by_key.get(key, [])
+        picked = None
+        for cand in candidates:
+            if _sid(cand) not in used_supplier_ids:
+                picked = cand
+                break
+
+        if picked is not None:
+            matched_pairs.append((b, picked))
+            used_supplier_ids.add(_sid(picked))
+        else:
+            baseline_remaining.append(b)
+
+    supplier_remaining = [s for s in supplier_remaining if _sid(s) not in used_supplier_ids]
+
+    # 2) Relaxed numeric match (handles "(2)(a)" vs "2a" formatting)
+    s_by_relaxed = {}
+    for s in supplier_remaining:
+        s_by_relaxed.setdefault(_match_key_relaxed(s), []).append(s)
+
+    baseline_remaining_2: List[Dict[str, Any]] = []
+    for b in baseline_remaining:
+        rkey = _match_key_relaxed(b)
+        candidates = s_by_relaxed.get(rkey, [])
+        picked = None
+        for cand in candidates:
+            if _sid(cand) not in used_supplier_ids:
+                picked = cand
+                break
+
+        if picked is not None:
+            matched_pairs.append((b, picked))
+            used_supplier_ids.add(_sid(picked))
+        else:
+            baseline_remaining_2.append(b)
+
+    baseline_remaining = baseline_remaining_2
+    supplier_remaining = [s for s in supplier_remaining if _sid(s) not in used_supplier_ids]
+
+    # 3) Within same main clause: semantic/text match among remaining
+    # Group supplier remaining by main_clause_number to keep numbering sane.
+    supp_by_main = {}
+    for s in supplier_remaining:
+        main = str(s.get("main_clause_number") or s.get("section_number") or "").strip()
+        supp_by_main.setdefault(main, []).append(s)
+
+    baseline_remaining_3: List[Dict[str, Any]] = []
+    for b in baseline_remaining:
+        b_main = str(b.get("main_clause_number") or b.get("section_number") or "").strip()
+        cand_list = supp_by_main.get(b_main, [])
+
+        # If clause is empty, do NOT semantic match; only exact key matches above apply.
+        if _is_effectively_empty_clause(b):
+            baseline_remaining_3.append(b)
+            continue
+
+        best = None
+        best_score = 0.0
+        for s in cand_list:
+            if _sid(s) in used_supplier_ids:
+                continue
+            if _is_effectively_empty_clause(s):
+                continue
+            score = _similarity_score(b, s)
+            if score > best_score:
+                best_score = score
+                best = s
+
+        if best is not None and best_score >= min_similarity:
+            matched_pairs.append((b, best))
+            used_supplier_ids.add(_sid(best))
+        else:
+            baseline_remaining_3.append(b)
+
+    baseline_remaining = baseline_remaining_3
+    supplier_remaining = [s for s in supplier_remaining if _sid(s) not in used_supplier_ids]
+
+    # 4) Optional cross-section semantic match (for moved/renumbered clauses)
+    # This is useful for “replaced/shifted” documents where numbering is inconsistent.
+    if allow_cross_section_semantic_match and baseline_remaining and supplier_remaining:
+        baseline_remaining_4: List[Dict[str, Any]] = []
+
+        for b in baseline_remaining:
+            if _is_effectively_empty_clause(b):
+                baseline_remaining_4.append(b)
+                continue
+
+            best = None
+            best_score = 0.0
+            for s in supplier_remaining:
+                if _sid(s) in used_supplier_ids:
+                    continue
+                if _is_effectively_empty_clause(s):
+                    continue
+                score = _similarity_score(b, s)
+                if score > best_score:
+                    best_score = score
+                    best = s
+
+            if best is not None and best_score >= max(min_similarity + 0.06, 0.70):
+                # cross-section match only when clearly strong
+                matched_pairs.append((b, best))
+                used_supplier_ids.add(_sid(best))
+            else:
+                baseline_remaining_4.append(b)
+
+        baseline_remaining = baseline_remaining_4
+        supplier_remaining = [s for s in supplier_remaining if _sid(s) not in used_supplier_ids]
+
+    # Final unmatched
+    unmatched_baseline = baseline_remaining
+    unmatched_supplier = supplier_remaining
+
+    return matched_pairs, unmatched_baseline, unmatched_supplier
+
+
+
+
+matched_pairs, unmatched_baseline, unmatched_supplier = await self._match_clauses_between_documents(
+    baseline_clauses,
+    supplier_clauses
+)
+
+
+def _build_text_for_embedding(clause: dict) -> str:
+    # Prefer the exact unit we match (subsection text)
+    txt = (clause.get("text") or "").strip()
+
+    # Fallback: full clause context helps when subsection is tiny
+    if not txt:
+        txt = (clause.get("full_clause_text") or "").strip()
+
+    # Fallback: metadata-only
+    if not txt:
+        txt = f"{clause.get('clause_type','')} {clause.get('section_title','')} {clause.get('section_number','')}".strip()
+
+    # Optional: add numbering context to stabilize embeddings
+    main = str(clause.get("main_clause_number") or "").strip()
+    sec = str(clause.get("section_number") or "").strip()
+    if main or sec:
+        txt = f"[{main} {sec}] {txt}"
+
+    return txt
+
+
+def _safe_embed(self, text_for_embedding: str) -> Optional[list]:
+    try:
+        emb = self.processor.embeddings.embed_query(text_for_embedding)
+        # Basic sanity check
+        if isinstance(emb, list) and len(emb) > 10:
+            return emb
+        return None
+    except Exception:
+        return None
+
+
+# --- Generate embeddings for baseline clauses ---
+logger.info("Generating embeddings for baseline clauses...")
+for i, clause in enumerate(baseline_clauses or []):
+    if not clause:
+        logger.warning(f"Baseline clause {i} is None/empty, skipping embedding.")
+        continue
+
+    text_for_embedding = _build_text_for_embedding(clause)
+    clause["embedding"] = _safe_embed(self, text_for_embedding)
+
+    if clause["embedding"] is None:
+        logger.warning(f"Embedding missing for baseline clause {i} ({clause.get('id')}), will fallback to text similarity.")
+
+
+# --- Generate embeddings for supplier clauses ---
+logger.info("Generating embeddings for supplier clauses...")
+for i, clause in enumerate(supplier_clauses or []):
+    if not clause:
+        logger.warning(f"Supplier clause {i} is None/empty, skipping embedding.")
+        continue
+
+    text_for_embedding = _build_text_for_embedding(clause)
+    clause["embedding"] = _safe_embed(self, text_for_embedding)
+
+    if clause["embedding"] is None:
+        logger.warning(f"Embedding missing for supplier clause {i} ({clause.get('id')}), will fallback to text similarity.")
+
+
+
+
