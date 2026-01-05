@@ -1,0 +1,22 @@
+SUBSECTION CREATION RULES (MANDATORY):
+
+• A new subsection may ONLY be created if the text EXPLICITLY begins with a subsection identifier 
+  such as "(1)", "(2)", "(a)", "(b)", "(i)", etc., as visibly written in the document.
+
+• DO NOT create a new subsection based on:
+  - Square brackets [ ]
+  - Drafting notes
+  - Optional language
+  - Paragraph breaks
+  - Introductory phrases (e.g., "For all legal proceedings...")
+  - Capitalization or formatting changes
+
+• Any paragraph, sentence, or block of text that does NOT begin with an explicit subsection marker 
+  MUST be treated as a CONTINUATION of the immediately preceding subsection.
+
+• Bracketed or optional paragraphs (e.g., text starting with "[" and ending with "]") 
+  MUST remain within the SAME subsection they appear under and MUST NOT be promoted 
+  to a new subsection or section number.
+
+• The subsection identifier sequence must match the document exactly.
+  DO NOT infer, renumber, normalize, or auto-increment subsection numbers.
