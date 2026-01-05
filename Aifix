@@ -1,0 +1,132 @@
+import re
+from typing import List, Tuple, Dict, Any, Optional
+
+_SUBSECTION_LABEL_RE = re.compile(r'(?m)^\s*\((\d+)\)\s+')          # (1) (2) ...
+_NESTED_ALPHA_RE     = re.compile(r'(?m)^\s*\(([a-z])\)\s+')        # (a) (b) ...
+_CHECKBOX_RE         = re.compile(r'(?m)^\s*\[x\]\s*', re.IGNORECASE)  # [x] items
+
+def _normalize_ws(s: str) -> str:
+    return re.sub(r'\s+', ' ', (s or '')).strip()
+
+def split_nested_subsections(parent_id: str, text: str) -> List[Tuple[str, str]]:
+    """
+    Splits a subsection's text into nested pieces if it contains:
+      - (a) (b) (c) ...  -> (5)a, (5)b, ...
+      - [x] ... [x] ...  -> (5)[x]1, (5)[x]2, ...
+    Returns list of (new_subsection_id, new_subsection_text) in original order.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return [(parent_id, raw)]
+
+    # 1) Split checkbox blocks first (common in NDA templates)
+    # We'll detect multiple [x] blocks even if not on new lines.
+    checkbox_positions = [m.start() for m in _CHECKBOX_RE.finditer(raw)]
+    if len(checkbox_positions) >= 2:
+        parts = []
+        for i, start in enumerate(checkbox_positions):
+            end = checkbox_positions[i + 1] if i + 1 < len(checkbox_positions) else len(raw)
+            chunk = raw[start:end].strip()
+            parts.append((f"{parent_id}[x]{i+1}", chunk))
+        return parts
+
+    # 2) Split (a)(b)(c) blocks if present
+    alpha_matches = list(_NESTED_ALPHA_RE.finditer(raw))
+    if len(alpha_matches) >= 2:
+        parts = []
+        for i, m in enumerate(alpha_matches):
+            start = m.start()
+            end = alpha_matches[i + 1].start() if i + 1 < len(alpha_matches) else len(raw)
+            letter = m.group(1)
+            chunk = raw[start:end].strip()
+            parts.append((f"{parent_id}{letter}", chunk))
+        return parts
+
+    # no nested structure detected
+    return [(parent_id, raw)]
+
+def compute_anchor_pos(document_text: str, anchor: str) -> int:
+    """
+    Finds anchor position in document_text for ordering. Returns large number if not found.
+    """
+    if not document_text or not anchor:
+        return 10**12
+    idx = document_text.find(anchor)
+    if idx != -1:
+        return idx
+    # fallback: try normalized search
+    dt = _normalize_ws(document_text)
+    ak = _normalize_ws(anchor)
+    idx2 = dt.find(ak)
+    return idx2 if idx2 != -1 else 10**12
+
+def sort_subsections_by_anchor(document_text: str, subsections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Stable sort by anchor position to undo LLM reordering.
+    """
+    def keyfn(s: Dict[str, Any]) -> int:
+        return compute_anchor_pos(document_text, s.get("anchor", ""))
+
+    return sorted(subsections, key=keyfn)
+
+
+
+# OPTIONAL: if you have full document text here, use it to undo LLM reorder.
+# Make sure you have document_text in scope (the same one you sent to the LLM).
+subsections_sorted = sort_subsections_by_anchor(document_text, subsections) if 'document_text' in locals() else subsections
+
+for sub_idx, subsection in enumerate(subsections_sorted):
+    parent_sub_id = subsection.get("subsection_id", f"({sub_idx + 1})")
+    parent_text = subsection.get("subsection_text", "") or ""
+    parent_anchor = subsection.get("anchor", "")
+
+    # Debug
+    print(f"Main section - {main_section_number} Subsection - {parent_sub_id} AnchorPos={compute_anchor_pos(document_text, parent_anchor) if 'document_text' in locals() else 'NA'}")
+
+    # --- NEW: split nested content inside this subsection ---
+    split_parts = split_nested_subsections(parent_sub_id, parent_text)
+
+    for nested_idx, (final_sub_id, final_text) in enumerate(split_parts):
+        final_text = final_text.strip()
+
+        # If you want: ensure we never accidentally swallow next numeric subsection label like (3)
+        # (This is just a safety clamp if the LLM merged content.)
+        # If final_sub_id is "(2)" and final_text contains "\n(3) " at line start, cut before it.
+        # Works for numeric subsections:
+        m = _SUBSECTION_LABEL_RE.search(final_text)
+        if final_sub_id.startswith("(") and m:
+            # If the text itself begins with a numeric subsection label, OK.
+            pass
+        else:
+            # clamp: if a later numeric label appears on a new line, cut before it
+            m2 = _SUBSECTION_LABEL_RE.search(final_text)
+            # NOTE: only clamp if it is NOT the same label as this subsection
+            if m2 and f"({m2.group(1)})" != final_sub_id:
+                final_text = final_text[:m2.start()].rstrip()
+
+        # Build a new anchor for nested items (so UI scroll/order stays correct)
+        nested_anchor = final_text[:40]
+
+        # Debug
+        print(f"  -> nested subsection {final_sub_id} len={len(final_text)}")
+
+        enhanced_clauses.append({
+            "id": f"{document_type}-clause-{idx}-sub-{sub_idx}-nested-{nested_idx}",
+            "clause_type": clause_type,
+            "main_clause_number": main_section_number,
+            "section_number": final_sub_id,  # <--- (5)a, (5)b, (5)[x]1 etc
+            "section_title": clause.get("section_title", clause_type),
+            "text": final_text,
+            "full_clause_text": full_text,
+            "text_excerpt": (final_text[:400] + "...") if len(final_text) > 400 else final_text,
+            "confidence": 0.9,
+            "multiplier": 1.0,
+            "baseline_risk": baseline_risk,
+            "location": {
+                "start": 0,
+                "end": len(final_text),
+                "dom_id": f"clause-{document_type}-{idx}-sub-{sub_idx}-nested-{nested_idx}",
+            },
+            # keep anything else you already include...
+            "anchor": nested_anchor,
+        })
