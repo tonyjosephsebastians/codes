@@ -1,0 +1,602 @@
+import re
+import json
+import math
+from typing import Any, Dict, List, Tuple, Optional
+
+
+class AIUtils:
+    async def identify_clauses(
+        self,
+        document_text: str,
+        clause_library=None,  # keep signature compatible (if you pass DF, it won't break)
+        document_type: str = "comparison",
+    ) -> List[Dict[str, Any]]:
+        """
+        Drop-in replacement.
+        - Uses LLM to extract clauses (like your current approach)
+        - Adds deterministic fallback parser if LLM fails / returns partial / wrong nesting
+        - Repairs / normalizes numbering, preserves order, and extracts nested subsections
+        - Returns a flat list of "enhanced clauses" entries (one per clause or subsection)
+          compatible with your downstream code.
+
+        Output fields per item:
+          {
+            "id": str,
+            "clause_type": str,
+            "main_clause_number": str,     # "1", "A", "Intro", etc.
+            "section_number": str,         # "1" or "(1)" or "(a)" or "(i)" etc.
+            "section_title": str,
+            "text": str,                   # text for this node
+            "full_clause_text": str,        # full parent clause text
+            "text_excerpt": str,
+            "confidence": float,
+            "location": {"start": int, "end": int, "dom_id": str},
+          }
+        """
+        # -------------------------
+        # Helpers (local, no deps)
+        # -------------------------
+        def _safe_str(x: Any) -> str:
+            return "" if x is None else str(x)
+
+        def _norm_ws_keep_lines(t: str) -> str:
+            # Keep line structure, but normalize weird whitespace
+            t = t.replace("\r\n", "\n").replace("\r", "\n")
+            # Remove trailing spaces
+            t = "\n".join([ln.rstrip() for ln in t.split("\n")])
+            # Collapse 3+ blank lines to 2 (preserve paragraph intent)
+            t = re.sub(r"\n{3,}", "\n\n", t)
+            return t.strip()
+
+        # Clause headings commonly seen in NDAs
+        # - numbered: "1. Confidentiality" or "5. Term and Termination"
+        # - lettered recitals: "A. In connection with..."
+        # - also handle "Confidentiality" alone (title-only lines) carefully
+        CLAUSE_HEADING_RE = re.compile(
+            r"^(?P<num>\d{1,3})\.\s+(?P<title>.+?)\s*$"
+        )
+        LETTER_HEADING_RE = re.compile(
+            r"^(?P<let>[A-Z])\.\s+(?P<title>.+?)\s*$"
+        )
+
+        # Subsection markers at start of line (nested allowed)
+        # (1) , (a) , (i) , (A) , [a] , [d]
+        SUB_MARK_RE = re.compile(
+            r"^\s*(?P<mark>\(\d{1,3}\)|\([a-z]\)|\([ivxlcdm]+\)|\([A-Z]\)|\[[a-zA-Z]\])\s+(?P<rest>.*)$",
+            re.IGNORECASE
+        )
+
+        def _is_title_like(line: str) -> bool:
+            # A standalone title line (e.g., "Confidentiality") is often short, mostly words.
+            # We only treat it as a title if it's not too long and not ending with punctuation-heavy text.
+            s = line.strip()
+            if not s:
+                return False
+            if len(s) > 80:
+                return False
+            # Avoid treating sentences as titles
+            if s.endswith((".", ";", ":", ",")):
+                return False
+            # Avoid all-caps long paragraphs
+            words = s.split()
+            if len(words) > 8:
+                return False
+            # looks title-ish
+            return True
+
+        def _split_into_clause_blocks(text: str) -> List[Dict[str, Any]]:
+            """
+            Deterministic splitter:
+            Produces blocks with:
+              - main_clause_number: "Intro" or "A" or "1" etc.
+              - section_title
+              - block_text
+              - start/end offsets
+            """
+            t = _norm_ws_keep_lines(text)
+            lines = t.split("\n")
+
+            blocks: List[Dict[str, Any]] = []
+            cur = {
+                "main_clause_number": "Intro",
+                "section_title": "Recital" if "NON-DISCLOSURE" in t[:200].upper() else "Intro",
+                "start_line": 0,
+                "start_char": 0,
+                "lines": []
+            }
+
+            # precompute char offsets per line
+            offsets = []
+            pos = 0
+            for ln in lines:
+                offsets.append(pos)
+                pos += len(ln) + 1  # + newline
+
+            def _flush(end_line_idx: int):
+                nonlocal cur
+                if not cur["lines"]:
+                    return
+                block_text = "\n".join(cur["lines"]).strip()
+                if not block_text:
+                    return
+                start_char = cur["start_char"]
+                end_char = offsets[end_line_idx] if end_line_idx < len(offsets) else len(t)
+                blocks.append({
+                    "main_clause_number": cur["main_clause_number"],
+                    "section_title": cur["section_title"],
+                    "text": block_text,
+                    "start": start_char,
+                    "end": min(end_char, len(t)),
+                })
+
+            for i, raw in enumerate(lines):
+                line = raw.strip()
+
+                m_num = CLAUSE_HEADING_RE.match(line)
+                m_let = LETTER_HEADING_RE.match(line)
+
+                # Some docs have lettered recitals BEFORE clause 1.
+                if m_let and (cur["main_clause_number"] in ("Intro",) or cur["main_clause_number"].isalpha()):
+                    # new lettered block
+                    _flush(i)
+                    cur = {
+                        "main_clause_number": m_let.group("let"),
+                        "section_title": m_let.group("title").strip(),
+                        "start_line": i,
+                        "start_char": offsets[i],
+                        "lines": [raw],
+                    }
+                    continue
+
+                if m_num:
+                    _flush(i)
+                    cur = {
+                        "main_clause_number": m_num.group("num"),
+                        "section_title": m_num.group("title").strip(),
+                        "start_line": i,
+                        "start_char": offsets[i],
+                        "lines": [raw],
+                    }
+                    continue
+
+                # Title-only lines inside the document (e.g., "Privacy", "Security", "Term")
+                # We only promote to a new clause title if it is title-like AND surrounded by blank lines.
+                if _is_title_like(line):
+                    prev_blank = (i > 0 and not lines[i - 1].strip())
+                    next_blank = (i + 1 < len(lines) and not lines[i + 1].strip())
+                    if prev_blank and next_blank:
+                        # treat as a "soft" new clause under same numbering style when numbering is missing
+                        _flush(i)
+                        cur = {
+                            "main_clause_number": line,      # e.g., "Privacy"
+                            "section_title": line,
+                            "start_line": i,
+                            "start_char": offsets[i],
+                            "lines": [raw],
+                        }
+                        continue
+
+                cur["lines"].append(raw)
+
+            _flush(len(lines))
+            return blocks
+
+        def _parse_subsections(block_text: str) -> List[Dict[str, Any]]:
+            """
+            Deterministic nested subsection parser.
+            Returns a list of nodes in appearance order:
+              { "sub_id": "(1)" or "(a)"..., "level": int, "text": "...", "path": "(1)(a)" }
+            """
+            t = _norm_ws_keep_lines(block_text)
+            lines = t.split("\n")
+
+            nodes: List[Dict[str, Any]] = []
+            stack: List[Dict[str, Any]] = []  # each {mark, level, path, text_lines}
+
+            def _mark_level(mark: str) -> int:
+                # Rough hierarchy: (1) > (a) > (i)
+                mk = mark.lower()
+                if re.fullmatch(r"\(\d{1,3}\)", mk):
+                    return 1
+                if re.fullmatch(r"\([a-z]\)", mk):
+                    return 2
+                if re.fullmatch(r"\([ivxlcdm]+\)", mk):
+                    return 3
+                if re.fullmatch(r"\([A-Z]\)", mark):
+                    return 1
+                if re.fullmatch(r"\[[a-zA-Z]\]", mark):
+                    return 2
+                return 2
+
+            def _close_until(level: int):
+                nonlocal stack, nodes
+                while stack and stack[-1]["level"] >= level:
+                    top = stack.pop()
+                    txt = "\n".join(top["text_lines"]).strip()
+                    if txt:
+                        nodes.append({
+                            "sub_id": top["mark"],
+                            "level": top["level"],
+                            "path": top["path"],
+                            "text": txt,
+                        })
+
+            preamble_lines: List[str] = []
+
+            for raw in lines:
+                m = SUB_MARK_RE.match(raw)
+                if not m:
+                    if stack:
+                        stack[-1]["text_lines"].append(raw)
+                    else:
+                        preamble_lines.append(raw)
+                    continue
+
+                mark = m.group("mark").strip()
+                rest = m.group("rest").strip()
+                lvl = _mark_level(mark)
+
+                # open new node
+                _close_until(lvl)
+
+                parent_path = stack[-1]["path"] if stack else ""
+                path = f"{parent_path}{mark}"
+
+                stack.append({
+                    "mark": mark,
+                    "level": lvl,
+                    "path": path,
+                    "text_lines": [raw],  # keep original line with marker
+                })
+
+                # ensure rest isn't lost (already in raw line)
+
+            # close remaining
+            _close_until(0)
+
+            # If there was no subsection marker at all, return empty (caller treats as whole clause)
+            # If there *is* subsection structure, we also keep a preamble as "(0)" if non-empty.
+            has_any = len(nodes) > 0
+            if has_any:
+                pre = "\n".join(preamble_lines).strip()
+                if pre:
+                    nodes.insert(0, {"sub_id": "(0)", "level": 0, "path": "(0)", "text": pre})
+            return nodes
+
+        def _title_similarity(a: str, b: str) -> float:
+            # simple token overlap score
+            ta = [w for w in re.findall(r"[a-z0-9]+", a.lower()) if len(w) > 2]
+            tb = [w for w in re.findall(r"[a-z0-9]+", b.lower()) if len(w) > 2]
+            if not ta or not tb:
+                return 0.0
+            sa, sb = set(ta), set(tb)
+            return len(sa & sb) / max(1, len(sa | sb))
+
+        def _cosine(u: List[float], v: List[float]) -> float:
+            if not u or not v or len(u) != len(v):
+                return 0.0
+            du = sum(x * x for x in u)
+            dv = sum(x * x for x in v)
+            if du <= 0 or dv <= 0:
+                return 0.0
+            dot = sum(a * b for a, b in zip(u, v))
+            return dot / (math.sqrt(du) * math.sqrt(dv))
+
+        def _coerce_llm_clauses(obj: Any) -> List[Dict[str, Any]]:
+            # Make LLM output safe even if it returns None / wrong keys
+            if obj is None:
+                return []
+            if isinstance(obj, dict):
+                clauses = obj.get("clauses")
+                if isinstance(clauses, list):
+                    return [c for c in clauses if isinstance(c, dict)]
+                # sometimes you used "subsections" earlier
+                subs = obj.get("subsections")
+                if isinstance(subs, list):
+                    return [{"section_number": "1", "section_title": "Unknown", "clause_type": "Unknown", "text": document_text, "subsections": subs}]
+                return []
+            if isinstance(obj, list):
+                return [c for c in obj if isinstance(c, dict)]
+            return []
+
+        def _repair_and_enhance(llm_blocks: List[Dict[str, Any]], deterministic_blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            """
+            Best of both:
+            - Use LLM blocks if they look valid
+            - Otherwise fall back to deterministic blocks
+            - Always compute subsections deterministically (nested) and use LLM subsections only as extra hints
+            """
+            # If LLM missed or returned too few, use deterministic
+            use_det = (len(llm_blocks) < max(2, int(0.5 * len(deterministic_blocks))))
+            chosen = deterministic_blocks if use_det else llm_blocks
+
+            enhanced: List[Dict[str, Any]] = []
+            for idx, blk in enumerate(chosen):
+                main_no = _safe_str(blk.get("section_number") or blk.get("main_clause_number") or blk.get("section") or blk.get("number") or blk.get("id") or "")
+                if not main_no:
+                    main_no = _safe_str(deterministic_blocks[idx]["main_clause_number"]) if idx < len(deterministic_blocks) else str(idx + 1)
+
+                title = _safe_str(blk.get("section_title") or blk.get("title") or blk.get("clause_type") or "")
+                # backfill title from deterministic when LLM gives generic names
+                if (not title or title.lower() in ("unknown", "recital", "intro")) and idx < len(deterministic_blocks):
+                    det_title = deterministic_blocks[idx].get("section_title", "")
+                    if det_title and _title_similarity(title, det_title) < 0.2:
+                        title = det_title
+
+                full_text = _safe_str(blk.get("text") or blk.get("full_text") or "")
+                # if LLM text is empty, fall back to deterministic block text
+                if not full_text and idx < len(deterministic_blocks):
+                    full_text = deterministic_blocks[idx]["text"]
+
+                # always parse subsections deterministically to avoid “empty paragraph” reorder bugs
+                det_subs = _parse_subsections(full_text)
+
+                start = int(blk.get("start", 0) or 0)
+                end = int(blk.get("end", start + len(full_text)) or (start + len(full_text)))
+                if idx < len(deterministic_blocks):
+                    # deterministic offsets are more reliable
+                    start = int(deterministic_blocks[idx].get("start", start))
+                    end = int(deterministic_blocks[idx].get("end", end))
+
+                clause_id_base = f"{document_type}-clause-{idx}"
+
+                if det_subs:
+                    for sidx, node in enumerate(det_subs):
+                        sub_id = node["sub_id"]
+                        txt = node["text"]
+                        enhanced.append({
+                            "id": f"{clause_id_base}-sub-{sidx}",
+                            "clause_type": title or "Unknown",
+                            "main_clause_number": main_no,
+                            "section_number": sub_id,  # "(1)", "(a)", "(i)" etc.
+                            "section_title": title or "Unknown",
+                            "text": txt,
+                            "full_clause_text": full_text,
+                            "text_excerpt": (txt[:400] + "...") if len(txt) > 400 else txt,
+                            "confidence": 0.92 if not use_det else 0.85,
+                            "location": {
+                                "start": start,
+                                "end": end,
+                                "dom_id": f"clause-{document_type}-{idx}-sub-{sidx}",
+                            },
+                        })
+                else:
+                    enhanced.append({
+                        "id": clause_id_base,
+                        "clause_type": title or "Unknown",
+                        "main_clause_number": main_no,
+                        "section_number": main_no,
+                        "section_title": title or "Unknown",
+                        "text": full_text,
+                        "full_clause_text": full_text,
+                        "text_excerpt": (full_text[:400] + "...") if len(full_text) > 400 else full_text,
+                        "confidence": 0.9 if not use_det else 0.82,
+                        "location": {
+                            "start": start,
+                            "end": end,
+                            "dom_id": f"clause-{document_type}-{idx}",
+                        },
+                    })
+
+            return enhanced
+
+        # -------------------------
+        # Main logic
+        # -------------------------
+        cleaned_text = _norm_ws_keep_lines(_safe_str(document_text))
+        if not cleaned_text:
+            return []
+
+        deterministic_blocks = _split_into_clause_blocks(cleaned_text)
+
+        # LLM attempt (your existing approach) — but we guard everything.
+        llm_clause_blocks: List[Dict[str, Any]] = []
+        try:
+            prompt = f"""
+You are a legal contract analyst. Extract sections/clauses EXACTLY as they appear in THIS document.
+Rules:
+- Preserve order exactly.
+- Do NOT invent titles.
+- For each clause return: section_number, section_title, text.
+- Do NOT split a clause just because a paragraph starts with "[" or "(" unless it is a true subsection marker at the start of a line.
+Return JSON only in this schema:
+{{
+  "clauses": [
+    {{
+      "section_number": "A" | "1" | "Intro" | "...",
+      "section_title": "exact heading text",
+      "text": "full clause text exactly as in document"
+    }}
+  ]
+}}
+
+DOCUMENT:
+{cleaned_text}
+""".strip()
+
+            response = self.client.chat.completions.create(
+                model=self.deployment_name,
+                messages=[
+                    {"role": "system", "content": "Return JSON only."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0,
+                response_format={"type": "json_object"},
+            )
+            raw = response.choices[0].message.content
+            parsed = json.loads(raw)
+            llm_clause_blocks = _coerce_llm_clauses(parsed)
+        except Exception:
+            llm_clause_blocks = []
+
+        # Repair + enhance (this is the key fix for reorder/missing/empty paragraph issues)
+        enhanced = _repair_and_enhance(llm_clause_blocks, deterministic_blocks)
+
+        # Optional: compute embeddings here (if you already do it elsewhere, remove this)
+        # We keep it safe: if self.processor or embedding method isn't present, skip.
+        try:
+            if hasattr(self, "processor") and hasattr(self.processor, "get_embedding"):
+                for item in enhanced:
+                    txt = item.get("text", "")
+                    if txt and "embedding" not in item:
+                        item["embedding"] = await self.processor.get_embedding(txt)
+        except Exception:
+            pass
+
+        return enhanced
+
+
+class EnhancedComparisonService:
+    async def _match_clauses_between_documents(
+        self,
+        baseline_clauses: List[Dict[str, Any]],
+        supplier_clauses: List[Dict[str, Any]],
+    ) -> Tuple[List[Tuple[Dict[str, Any], Dict[str, Any]]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """
+        Drop-in replacement.
+        Fixes: clause removed/added/moved/empty paragraph -> reorder mismatch.
+
+        Strategy:
+          1) Hard match when (main_clause_number + section_number) matches exactly (fast, safe)
+          2) Soft match within same main clause using a score:
+                score = 0.55*embedding + 0.25*title_sim + 0.15*id_sim + 0.05*pos_prior
+             (works even when sections are inserted/removed)
+          3) If still unmatched, allow cross-main-clause match but with a penalty (for moved clauses)
+        """
+        def _safe_str(x: Any) -> str:
+            return "" if x is None else str(x)
+
+        def _norm_id(s: str) -> str:
+            return re.sub(r"\s+", "", _safe_str(s)).strip().lower()
+
+        def _title_similarity(a: str, b: str) -> float:
+            ta = [w for w in re.findall(r"[a-z0-9]+", _safe_str(a).lower()) if len(w) > 2]
+            tb = [w for w in re.findall(r"[a-z0-9]+", _safe_str(b).lower()) if len(w) > 2]
+            if not ta or not tb:
+                return 0.0
+            sa, sb = set(ta), set(tb)
+            return len(sa & sb) / max(1, len(sa | sb))
+
+        def _cosine(u: Any, v: Any) -> float:
+            if not isinstance(u, list) or not isinstance(v, list) or len(u) != len(v) or not u:
+                return 0.0
+            du = sum(x * x for x in u)
+            dv = sum(x * x for x in v)
+            if du <= 0 or dv <= 0:
+                return 0.0
+            dot = sum(a * b for a, b in zip(u, v))
+            return dot / (math.sqrt(du) * math.sqrt(dv))
+
+        # sanitize inputs (fix the NoneType not iterable crash)
+        baseline_clauses = [c for c in (baseline_clauses or []) if isinstance(c, dict)]
+        supplier_clauses = [c for c in (supplier_clauses or []) if isinstance(c, dict)]
+
+        matches: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+        used_supplier: set[int] = set()
+
+        # -------------------------
+        # Phase 1: exact key match
+        # -------------------------
+        supplier_index_by_key: Dict[str, List[int]] = {}
+        for i, sc in enumerate(supplier_clauses):
+            key = (
+                _norm_id(sc.get("main_clause_number")) + "|" +
+                _norm_id(sc.get("section_number"))
+            )
+            supplier_index_by_key.setdefault(key, []).append(i)
+
+        for bc in baseline_clauses:
+            bkey = _norm_id(bc.get("main_clause_number")) + "|" + _norm_id(bc.get("section_number"))
+            cand_list = supplier_index_by_key.get(bkey, [])
+            picked = None
+            for idx in cand_list:
+                if idx not in used_supplier:
+                    picked = idx
+                    break
+            if picked is not None:
+                used_supplier.add(picked)
+                matches.append((bc, supplier_clauses[picked]))
+
+        # gather remaining
+        matched_b_ids = {id(b) for b, _ in matches}
+        remaining_b = [b for b in baseline_clauses if id(b) not in matched_b_ids]
+        remaining_s_idx = [i for i in range(len(supplier_clauses)) if i not in used_supplier]
+
+        # -------------------------
+        # Phase 2: soft match within same main clause
+        # -------------------------
+        def _score(b: Dict[str, Any], s: Dict[str, Any], pos_b: int, pos_s: int, same_main: bool) -> float:
+            emb = _cosine(b.get("embedding"), s.get("embedding"))
+            title = _title_similarity(b.get("clause_type") or b.get("section_title"), s.get("clause_type") or s.get("section_title"))
+            id_sim = 1.0 if _norm_id(b.get("section_number")) == _norm_id(s.get("section_number")) else 0.0
+
+            # positional prior: closer indices slightly preferred (handles reorder gently)
+            pos_prior = 1.0 / (1.0 + abs(pos_b - pos_s))
+
+            score = 0.55 * emb + 0.25 * title + 0.15 * id_sim + 0.05 * pos_prior
+            if not same_main:
+                score -= 0.15  # penalty for cross-main-clause moves
+            return score
+
+        # build buckets by main clause
+        supplier_by_main: Dict[str, List[int]] = {}
+        for i in remaining_s_idx:
+            m = _norm_id(supplier_clauses[i].get("main_clause_number"))
+            supplier_by_main.setdefault(m, []).append(i)
+
+        # Greedy best-first matching (stable and fast; avoids count assumptions)
+        # Thresholds: tune if needed
+        SAME_MAIN_THRESHOLD = 0.62
+        CROSS_MAIN_THRESHOLD = 0.72
+
+        newly_matched = True
+        while newly_matched:
+            newly_matched = False
+            best_pair = None  # (score, b_index_in_remaining_b, s_idx)
+            for bi, bc in enumerate(remaining_b):
+                bmain = _norm_id(bc.get("main_clause_number"))
+                cand_idxs = supplier_by_main.get(bmain, [])
+                for sidx in cand_idxs:
+                    if sidx in used_supplier:
+                        continue
+                    sc = supplier_clauses[sidx]
+                    sc_score = _score(bc, sc, bi, sidx, same_main=True)
+                    if best_pair is None or sc_score > best_pair[0]:
+                        best_pair = (sc_score, bi, sidx)
+
+            if best_pair and best_pair[0] >= SAME_MAIN_THRESHOLD:
+                sc_score, bi, sidx = best_pair
+                used_supplier.add(sidx)
+                matches.append((remaining_b[bi], supplier_clauses[sidx]))
+                remaining_b.pop(bi)
+                newly_matched = True
+
+        # -------------------------
+        # Phase 3: allow cross-main clause match (moved clauses)
+        # -------------------------
+        remaining_s_idx = [i for i in range(len(supplier_clauses)) if i not in used_supplier]
+        for bi, bc in enumerate(list(remaining_b)):
+            best = None  # (score, sidx)
+            for sidx in remaining_s_idx:
+                sc = supplier_clauses[sidx]
+                sc_score = _score(bc, sc, bi, sidx, same_main=False)
+                if best is None or sc_score > best[0]:
+                    best = (sc_score, sidx)
+
+            if best and best[0] >= CROSS_MAIN_THRESHOLD:
+                _, sidx = best
+                used_supplier.add(sidx)
+                matches.append((bc, supplier_clauses[sidx]))
+                remaining_b.remove(bc)
+                remaining_s_idx = [i for i in remaining_s_idx if i != sidx]
+
+        # Unmatched lists
+        matched_supplier_ids = {id(s) for _, s in matches}
+        unmatched_supplier = [s for s in supplier_clauses if id(s) not in matched_supplier_ids]
+        unmatched_baseline = remaining_b
+
+        return matches, unmatched_baseline, unmatched_supplier
+
+
+
+                        
