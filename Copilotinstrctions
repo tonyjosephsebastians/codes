@@ -1,0 +1,93 @@
+# Engineering Standards (MANDATORY)
+
+## General code quality rules
+- Prefer readability + maintainability over shortcuts.
+- Follow SOLID principles where practical:
+  - Single responsibility per module/class/function
+  - Dependency injection (FastAPI Depends) for external resources
+- Keep functions small and testable. Avoid large route handlers.
+- Use meaningful names; avoid abbreviations unless already used in repo.
+- Add type hints everywhere (Python + TypeScript).
+- Handle errors explicitly and return consistent error responses.
+
+## Design patterns to follow
+- Layered architecture:
+  - Router/Controller layer: HTTP only (validation, status codes, calling service)
+  - Service layer: business logic (orchestration, rules)
+  - Repository/DAO layer: DB or storage access (if repo has this pattern)
+- Use DTOs:
+  - Backend: Pydantic request/response models
+  - Frontend: TypeScript types/interfaces matching backend DTOs
+- Prefer composition over inheritance.
+- Avoid introducing new frameworks/libraries unless asked.
+
+---
+
+# Backend (FastAPI) Output Requirements (MANDATORY)
+
+When the user asks to implement a backend feature, Copilot MUST produce:
+
+1) **Route**
+- Create or modify an endpoint using FastAPI best practices.
+- Route handlers must be thin: validate, call service, return response.
+- Use `Depends` for injected dependencies (db, auth, settings).
+
+2) **Pydantic schema**
+- Provide request model(s) and response model(s).
+- Response models must match the API contract used in this repo.
+- Do NOT return raw ORM/DB models.
+
+3) **Service logic**
+- Implement business logic in a service function/class if the repo already has a service layer.
+- If service pattern is not present, create a minimal `services/` module near existing patterns.
+- Service must be unit-testable (no direct request/response objects inside).
+
+### Backend best practices checklist
+- Proper status codes (200/201/204/400/401/403/404/409/422/500).
+- Input validation via Pydantic (including constrained types where needed).
+- Structured logging (no secrets).
+- Raise/translate domain errors to HTTP errors cleanly.
+- Add tests:
+  - Unit tests for service
+  - API tests for routes if existing testing infra exists
+
+---
+
+# Frontend (React + TypeScript) Output Requirements (MANDATORY)
+
+When the user asks to implement a frontend feature, Copilot MUST produce:
+
+1) **API client function**
+- Add a typed API function in the centralized API layer (e.g., `frontend/api/...`).
+- No direct `fetch/axios` calls inside React components (unless repo already does this).
+- API client must:
+  - handle base URL / auth headers according to repo
+  - normalize errors into a consistent shape
+
+2) **TypeScript types**
+- Add/extend types in `frontend/types/...`.
+- Avoid `any`. Use discriminated unions for success/error when helpful.
+- Types must match backend Pydantic schema exactly.
+
+3) **Component or hook**
+- Provide a React component or hook using the API client:
+  - Shows loading state
+  - Shows error state
+  - Renders data
+- Use existing state/data-fetching pattern (React Query / Redux / Context / plain hooks).
+
+### Frontend best practices checklist
+- Proper separation: UI components vs data-fetching hooks.
+- Accessibility: labels, aria where needed, keyboard-friendly.
+- No silent failures; user-visible error messaging.
+- Minimal re-renders; memoize only when necessary.
+- Add tests if repo has frontend testing setup.
+
+---
+
+# Output formatting rules (MANDATORY)
+- Whenever implementing a feature end-to-end, provide backend + frontend changes together:
+  - Backend: route + schema + service
+  - Frontend: api client + types + component/hook
+- Provide file paths for each code snippet (where it should live in the repo).
+- If repo patterns are unclear, search existing code first and match style.
