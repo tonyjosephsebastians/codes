@@ -1,0 +1,66 @@
+const [numPages, setNumPages] = useState(0);
+
+{pdfBlobUrl ? (
+  <PDFDocument
+    key={pdfBlobUrl}                    // ✅ forces clean remount when a new blob is loaded
+    file={pdfBlobUrl}
+    onLoadSuccess={({ numPages }) => setNumPages(numPages)}
+    onLoadError={(e) => console.error("PDF load error:", e)}
+    loading={<div>Loading PDF…</div>}
+  >
+    {Array.from({ length: numPages }, (_, i) => (
+      <PDFPage
+        key={`page_${i + 1}`}
+        pageNumber={i + 1}
+        width={800}
+        renderTextLayer={false}         // ✅ optional: avoids “weird overlay / mismatch”
+        renderAnnotationLayer={false}   // ✅ optional: cleaner rendering
+      />
+    ))}
+  </PDFDocument>
+) : (
+  <div className="text-stone-500">No PDF file available.</div>
+)}
+
+
+
+const containerRef = useRef<HTMLDivElement | null>(null);
+const [pageWidth, setPageWidth] = useState(800);
+
+useEffect(() => {
+  const el = containerRef.current;
+  if (!el) return;
+
+  const ro = new ResizeObserver(() => {
+    // leave some padding
+    setPageWidth(Math.min(1000, el.clientWidth - 32));
+  });
+
+  ro.observe(el);
+  return () => ro.disconnect();
+}, []);
+
+
+<div ref={containerRef}>
+  <PDFDocument
+    key={pdfBlobUrl}
+    file={pdfBlobUrl}
+    onLoadSuccess={({ numPages }) => setNumPages(numPages)}
+  >
+    {Array.from({ length: numPages }, (_, i) => (
+      <PDFPage
+        key={`page_${i + 1}`}
+        pageNumber={i + 1}
+        width={pageWidth}              // ✅ fits your layout exactly
+        renderTextLayer={false}
+        renderAnnotationLayer={false}
+      />
+    ))}
+  </PDFDocument>
+</div>
+
+
+setPdfBlobUrl((prev) => {
+  if (prev) URL.revokeObjectURL(prev);
+  return URL.createObjectURL(blob);
+});
