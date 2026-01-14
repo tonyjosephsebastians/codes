@@ -1,0 +1,31 @@
+import { Document as PDFDocument, Page as PDFPage, pdfjs } from "react-pdf";
+
+pdfjs.GlobalWorkerOptions.workerSrc = new URL(
+  "pdfjs-dist/build/pdf.worker.min.mjs",
+  import.meta.url
+).toString();
+
+
+
+
+const [numPages, setNumPages] = useState(0);
+
+<PDFDocument
+  file={pdfBlobUrl}
+  onLoadSuccess={({ numPages }) => setNumPages(numPages)}
+  onLoadError={(e) => console.error("PDF load error:", e)}
+>
+  {Array.from({ length: numPages || 1 }, (_, i) => (
+    <PDFPage key={`p_${i + 1}`} pageNumber={i + 1} width={800} />
+  ))}
+</PDFDocument>
+
+
+
+const blob = await documentsAPI.getPdf(docId); // must be Blob
+const url = URL.createObjectURL(blob);
+
+setPdfBlobUrl((prev) => {
+  if (prev) URL.revokeObjectURL(prev);
+  return url;
+});
