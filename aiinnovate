@@ -1,0 +1,498 @@
+import React, { useMemo, useState } from "react";
+import {
+  FileText,
+  Search,
+  ChevronDown,
+  CheckCircle2,
+  XCircle,
+  Table as TableIcon,
+  ListTree,
+} from "lucide-react";
+
+type EvidenceItem = {
+  id?: string;
+  page?: number;
+  snippet?: string;
+  page_markdown?: string;
+};
+
+type ExtractedElement = {
+  id?: string;
+  field_key?: string;
+  field_name?: string;
+  value?: any;
+  confidence?: number;
+  page?: number;
+  source_snippet?: string;
+  evidence?: EvidenceItem[];
+};
+
+type TableItem = {
+  id?: string;
+  table_id?: string;
+  table_type?: "merged" | "page";
+  source_page?: number;
+  title?: string;
+  columns?: string[];
+  rows?: any;
+  row_count?: number;
+  has_unreadable?: boolean;
+};
+
+type ExtractionResponse = {
+  extraction_run?: {
+    id?: string;
+    document_id?: string;
+    uploaded_by?: string;
+    standard?: string;
+    pipeline_version?: string;
+    status?: string;
+    created_at?: string;
+    completed_at?: string;
+  };
+  extracted_elements?: ExtractedElement[];
+  tables?: {
+    merged?: TableItem[];
+    page?: TableItem[];
+  };
+};
+
+function cn(...args: Array<string | false | null | undefined>) {
+  return args.filter(Boolean).join(" ");
+}
+
+function StatusPill({ status }: { status?: string }) {
+  const s = (status ?? "").toLowerCase();
+  const ok = s.includes("complete") || s.includes("success") || s === "done";
+  const fail = s.includes("fail") || s.includes("error");
+
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-xs font-medium border",
+        ok && "bg-emerald-50 text-emerald-800 border-emerald-200",
+        fail && "bg-red-50 text-red-800 border-red-200",
+        !ok && !fail && "bg-stone-50 text-stone-700 border-stone-200"
+      )}
+    >
+      {ok ? <CheckCircle2 className="h-3.5 w-3.5" /> : null}
+      {fail ? <XCircle className="h-3.5 w-3.5" /> : null}
+      {status ?? "unknown"}
+    </span>
+  );
+}
+
+function Badge({ children }: { children: React.ReactNode }) {
+  return (
+    <span className="inline-flex items-center rounded-full border border-stone-200 bg-white px-2 py-0.5 text-xs text-stone-600">
+      {children}
+    </span>
+  );
+}
+
+function SectionCard({
+  title,
+  icon,
+  right,
+  children,
+}: {
+  title: string;
+  icon?: React.ReactNode;
+  right?: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="bg-white rounded-xl border border-stone-200 shadow-sm overflow-hidden">
+      <div className="px-4 py-3 border-b border-stone-200 bg-gradient-to-b from-white to-stone-50 flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2 min-w-0">
+          {icon ? (
+            <span className="inline-flex h-7 w-7 items-center justify-center rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-700">
+              {icon}
+            </span>
+          ) : null}
+          <div className="text-sm font-semibold text-stone-900 truncate">{title}</div>
+        </div>
+        <div className="shrink-0">{right}</div>
+      </div>
+      <div className="p-4">{children}</div>
+    </div>
+  );
+}
+
+/** Markdown-ish cleanup so UI doesn't look like raw markdown */
+function normalizeText(input: string): string {
+  let s = input ?? "";
+  // remove fenced code blocks
+  s = s.replace(/```[\s\S]*?```/g, (m) => m.replace(/```/g, "").trim());
+  // inline code
+  s = s.replace(/`([^`]+)`/g, "$1");
+  // headings
+  s = s.replace(/^#{1,6}\s+/gm, "");
+  // bold/italic
+  s = s.replace(/\*\*([^*]+)\*\*/g, "$1");
+  s = s.replace(/\*([^*]+)\*/g, "$1");
+  s = s.replace(/__([^_]+)__/g, "$1");
+  s = s.replace(/_([^_]+)_/g, "$1");
+  // links [text](url) -> text
+  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1");
+  // bullets
+  s = s.replace(/^\s*[-*+]\s+/gm, "• ");
+  // blockquotes
+  s = s.replace(/^\s*>\s?/gm, "");
+  // collapse too many blank lines
+  s = s.replace(/\n{3,}/g, "\n\n");
+  return s.trim();
+}
+
+function prettyValue(v: any) {
+  if (v === null || v === undefined) return "";
+  if (typeof v === "string") return normalizeText(v);
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  try {
+    return JSON.stringify(v, null, 2);
+  } catch {
+    return String(v);
+  }
+}
+
+function renderCell(v: any) {
+  if (v === null || v === undefined) return "";
+  if (typeof v === "string") return normalizeText(v);
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  // If object, keep compact
+  try {
+    const s = JSON.stringify(v);
+    return s.length > 120 ? JSON.stringify(v, null, 2) : s;
+  } catch {
+    return String(v);
+  }
+}
+
+function ConfidenceBar({ value }: { value?: number }) {
+  const pct = Math.max(0, Math.min(1, value ?? 0)) * 100;
+  return (
+    <div className="flex items-center gap-2">
+      <div className="h-2 w-24 bg-stone-200 rounded-full overflow-hidden">
+        <div className="h-2 bg-emerald-600" style={{ width: `${pct}%` }} />
+      </div>
+      <span className="text-xs text-stone-600">{Math.round(pct)}%</span>
+    </div>
+  );
+}
+
+/** Accordion using <details> (better styling + icon) */
+function AccordionItem({
+  title,
+  meta,
+  children,
+  defaultOpen = false,
+}: {
+  title: React.ReactNode;
+  meta?: React.ReactNode;
+  children: React.ReactNode;
+  defaultOpen?: boolean;
+}) {
+  return (
+    <details className="group rounded-lg border border-stone-200 bg-white" open={defaultOpen}>
+      <summary className="cursor-pointer list-none px-3 py-2 flex items-start justify-between gap-3 hover:bg-stone-50">
+        <div className="min-w-0">
+          <div className="text-sm font-medium text-stone-900 truncate">{title}</div>
+          {meta ? <div className="mt-1">{meta}</div> : null}
+        </div>
+
+        <div className="mt-0.5 text-stone-500 transition-transform group-open:rotate-180">
+          <ChevronDown className="h-4 w-4" />
+        </div>
+      </summary>
+
+      <div className="px-3 pb-3">{children}</div>
+    </details>
+  );
+}
+
+export function ExtractionPanel({ extractionRun }: { extractionRun: ExtractionResponse | null }) {
+  const [query, setQuery] = useState("");
+
+  const extracted = extractionRun?.extracted_elements ?? [];
+  const mergedTables = extractionRun?.tables?.merged ?? [];
+  const pageTables = extractionRun?.tables?.page ?? [];
+
+  const filteredFields = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return extracted;
+    return extracted.filter((f) => {
+      const key = (f.field_key ?? f.field_name ?? "").toLowerCase();
+      const val = prettyValue(f.value).toLowerCase();
+      return key.includes(q) || val.includes(q);
+    });
+  }, [extracted, query]);
+
+  return (
+    <div className="space-y-4">
+      {/* Header / Run summary */}
+      <SectionCard
+        title="Document Analysis"
+        icon={<FileText className="h-4 w-4" />}
+        right={<StatusPill status={extractionRun?.extraction_run?.status} />}
+      >
+        {!extractionRun ? (
+          <div className="text-sm text-stone-600">No analysis has been run yet.</div>
+        ) : (
+          <div className="space-y-3">
+            <div className="flex flex-wrap gap-2">
+              {extractionRun.extraction_run?.standard ? (
+                <Badge>Standard: {extractionRun.extraction_run.standard}</Badge>
+              ) : null}
+              {extractionRun.extraction_run?.pipeline_version ? (
+                <Badge>Pipeline: {extractionRun.extraction_run.pipeline_version}</Badge>
+              ) : null}
+              {extractionRun.extraction_run?.completed_at ? (
+                <Badge>Completed: {extractionRun.extraction_run.completed_at}</Badge>
+              ) : null}
+            </div>
+
+            <div className="grid grid-cols-3 gap-2">
+              <div className="rounded-lg border border-stone-200 bg-white p-2">
+                <div className="text-xs text-stone-500">Fields</div>
+                <div className="text-lg font-semibold text-stone-900">{extracted.length}</div>
+              </div>
+              <div className="rounded-lg border border-stone-200 bg-white p-2">
+                <div className="text-xs text-stone-500">Merged Tables</div>
+                <div className="text-lg font-semibold text-stone-900">{mergedTables.length}</div>
+              </div>
+              <div className="rounded-lg border border-stone-200 bg-white p-2">
+                <div className="text-xs text-stone-500">Page Tables</div>
+                <div className="text-lg font-semibold text-stone-900">{pageTables.length}</div>
+              </div>
+            </div>
+          </div>
+        )}
+      </SectionCard>
+
+      {/* Fields */}
+      <SectionCard
+        title="Fields"
+        icon={<ListTree className="h-4 w-4" />}
+        right={
+          <div className="relative">
+            <Search className="h-4 w-4 text-stone-400 absolute left-2 top-1.5" />
+            <input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Search fields…"
+              className="w-44 pl-8 rounded-md border border-stone-200 bg-white px-2 py-1 text-xs outline-none focus:ring-2 focus:ring-emerald-200"
+            />
+          </div>
+        }
+      >
+        {!extractionRun ? null : filteredFields.length === 0 ? (
+          <div className="text-sm text-stone-600">No matching fields.</div>
+        ) : (
+          <div className="space-y-2">
+            {filteredFields.map((f, idx) => (
+              <AccordionItem
+                key={f.id ?? `${f.field_key ?? f.field_name}_${idx}`}
+                title={f.field_key ?? f.field_name ?? "field"}
+                meta={
+                  <div className="flex flex-wrap items-center gap-2">
+                    {typeof f.page === "number" ? <Badge>Page {f.page}</Badge> : null}
+                    <ConfidenceBar value={f.confidence} />
+                  </div>
+                }
+              >
+                {/* Value */}
+                <div className="rounded-md border border-stone-200 bg-white p-2">
+                  <div className="text-xs font-semibold text-stone-700 mb-1">Value</div>
+
+                  {typeof f.value === "string" ? (
+                    <div className="text-sm text-stone-900 whitespace-pre-wrap leading-5">
+                      {normalizeText(f.value)}
+                    </div>
+                  ) : (
+                    <pre className="text-xs text-stone-700 whitespace-pre-wrap bg-stone-50 border border-stone-200 rounded-md p-2 overflow-auto">
+                      {prettyValue(f.value)}
+                    </pre>
+                  )}
+                </div>
+
+                {/* Evidence */}
+                {f.evidence?.length ? (
+                  <div className="mt-3 space-y-2">
+                    <div className="text-xs font-semibold text-stone-700">Evidence</div>
+
+                    {f.evidence.map((ev, eidx) => (
+                      <div
+                        key={ev.id ?? `${f.id}_ev_${eidx}`}
+                        className="rounded-md border border-stone-200 bg-white p-2"
+                      >
+                        <div className="flex items-center gap-2 mb-1">
+                          {typeof ev.page === "number" ? <Badge>Page {ev.page}</Badge> : null}
+                          {ev.id ? <Badge>ID: {ev.id.slice(0, 8)}…</Badge> : null}
+                        </div>
+
+                        {ev.snippet ? (
+                          <div className="text-sm text-stone-900 whitespace-pre-wrap leading-5">
+                            {normalizeText(ev.snippet)}
+                          </div>
+                        ) : null}
+
+                        {ev.page_markdown ? (
+                          <details className="mt-2">
+                            <summary className="cursor-pointer text-xs text-emerald-700 hover:text-emerald-800">
+                              View extracted markdown
+                            </summary>
+                            <pre className="mt-2 text-xs whitespace-pre-wrap text-stone-700 bg-stone-50 border border-stone-200 rounded-md p-2 overflow-auto">
+                              {ev.page_markdown}
+                            </pre>
+                          </details>
+                        ) : null}
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+              </AccordionItem>
+            ))}
+          </div>
+        )}
+      </SectionCard>
+
+      {/* Tables */}
+      <SectionCard title="Tables" icon={<TableIcon className="h-4 w-4" />}>
+        {!extractionRun ? null : mergedTables.length === 0 && pageTables.length === 0 ? (
+          <div className="text-sm text-stone-600">No tables extracted.</div>
+        ) : (
+          <div className="space-y-3">
+            {mergedTables.length ? (
+              <div className="space-y-2">
+                <div className="text-xs font-semibold text-stone-700">Merged</div>
+                {mergedTables.map((t, idx) => (
+                  <AccordionItem
+                    key={t.id ?? `merged_${idx}`}
+                    title={t.title ?? `Merged table ${idx + 1}`}
+                    meta={
+                      <div className="flex flex-wrap gap-2">
+                        {typeof t.source_page === "number" ? (
+                          <Badge>Source p{t.source_page}</Badge>
+                        ) : null}
+                        {typeof t.row_count === "number" ? <Badge>{t.row_count} rows</Badge> : null}
+                        {t.has_unreadable ? <Badge>Unreadable parts</Badge> : null}
+                      </div>
+                    }
+                  >
+                    <TablePreview table={t} />
+                  </AccordionItem>
+                ))}
+              </div>
+            ) : null}
+
+            {pageTables.length ? (
+              <div className="space-y-2">
+                <div className="text-xs font-semibold text-stone-700">By page</div>
+                {pageTables.map((t, idx) => (
+                  <AccordionItem
+                    key={t.id ?? `page_${idx}`}
+                    title={t.title ?? `Page table ${idx + 1}`}
+                    meta={
+                      <div className="flex flex-wrap gap-2">
+                        {typeof t.source_page === "number" ? <Badge>Page {t.source_page}</Badge> : null}
+                        {typeof t.row_count === "number" ? <Badge>{t.row_count} rows</Badge> : null}
+                        {t.has_unreadable ? <Badge>Unreadable parts</Badge> : null}
+                      </div>
+                    }
+                  >
+                    <TablePreview table={t} />
+                  </AccordionItem>
+                ))}
+              </div>
+            ) : null}
+          </div>
+        )}
+      </SectionCard>
+    </div>
+  );
+}
+
+function TablePreview({ table }: { table: TableItem }) {
+  let rows: any[] = [];
+  try {
+    if (Array.isArray(table.rows)) rows = table.rows;
+    else if (typeof table.rows === "string") rows = JSON.parse(table.rows);
+  } catch {
+    rows = [];
+  }
+
+  const cols = table.columns ?? (rows[0] ? Object.keys(rows[0]) : []);
+  const previewRows = rows.slice(0, 10);
+
+  if (!cols.length) {
+    return (
+      <pre className="text-xs whitespace-pre-wrap text-stone-700 bg-stone-50 border border-stone-200 rounded-md p-2 overflow-auto">
+        {JSON.stringify(table, null, 2)}
+      </pre>
+    );
+  }
+
+  return (
+    <div className="overflow-auto rounded-md border border-stone-200 bg-white">
+      <table className="min-w-full text-xs">
+        <thead className="bg-stone-50 sticky top-0">
+          <tr>
+            {cols.map((c) => (
+              <th
+                key={c}
+                className="text-left px-2 py-2 font-semibold text-stone-800 border-b border-stone-200 whitespace-nowrap"
+              >
+                {normalizeText(String(c))}
+              </th>
+            ))}
+          </tr>
+        </thead>
+
+        <tbody>
+          {previewRows.map((r, idx) => (
+            <tr key={idx} className="border-b border-stone-100 hover:bg-stone-50/50">
+              {cols.map((c) => {
+                const cell = renderCell(r?.[c]);
+                const isMultiLine = typeof cell === "string" && cell.includes("\n");
+                return (
+                  <td key={c} className="px-2 py-2 text-stone-900 align-top">
+                    {isMultiLine ? (
+                      <div className="whitespace-pre-wrap leading-5">{cell}</div>
+                    ) : (
+                      <div className="whitespace-nowrap max-w-[340px] overflow-hidden text-ellipsis">
+                        {cell}
+                      </div>
+                    )}
+                  </td>
+                );
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      {rows.length > previewRows.length ? (
+        <div className="px-2 py-2 text-xs text-stone-500">
+          Showing {previewRows.length} of {rows.length} rows
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+
+
+<div className="w-[420px] border-l border-stone-200 overflow-y-auto p-4 bg-stone-50">
+  <ExtractionPanel extractionRun={extractionRun} />
+</div>
+
+
+<div className="w-[420px] min-w-[320px] max-w-[720px] resize-x overflow-auto border-l border-stone-200 bg-stone-50 p-4">
+  <ExtractionPanel extractionRun={extractionRun} />
+</div>
+
+
+<div className="h-full w-[420px] min-w-[320px] max-w-[720px] resize-x overflow-auto border-l border-stone-200 bg-stone-50 p-4">
+  <ExtractionPanel extractionRun={extractionRun} />
+</div>
+
