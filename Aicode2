@@ -1,0 +1,376 @@
+type FieldGroup = {
+  key: string;
+  title: string;
+  items: ExtractedElement[];
+};
+
+const safePage = (p: any) =>
+  typeof p === "number" ? p : Number.POSITIVE_INFINITY;
+
+const sortByPage = <T extends { page?: number }>(a: T, b: T) =>
+  safePage(a.page) - safePage(b.page);
+
+const sortByPageThenConf = (a: ExtractedElement, b: ExtractedElement) => {
+  const d = sortByPage(a, b);
+  if (d !== 0) return d;
+  const ac = typeof a.confidence === "number" ? a.confidence : -1;
+  const bc = typeof b.confidence === "number" ? b.confidence : -1;
+  return bc - ac;
+};
+
+const fieldTitle = (f: ExtractedElement) =>
+  (f.field_key ?? f.field_name ?? "field").trim();
+
+const groupKey = (f: ExtractedElement) => fieldTitle(f).toLowerCase();
+
+
+
+const filteredFields = useMemo(() => { ... return extracted.filter(...) }, [extracted, query]);
+
+const groups = useMemo<FieldGroup[]>(() => {
+  const map = new Map<string, FieldGroup>();
+
+  for (const f of extracted) {
+    const title = fieldTitle(f);
+    const key = groupKey(f);
+
+    const g = map.get(key) ?? { key, title, items: [] };
+    g.items.push(f);
+    map.set(key, g);
+  }
+
+  const out = Array.from(map.values());
+  out.forEach(g => g.items.sort(sortByPageThenConf));
+
+  // optional: sort groups by name (or by first page)
+  out.sort((a, b) => a.title.localeCompare(b.title));
+
+  return out;
+}, [extracted]);
+
+const filteredGroups = useMemo(() => {
+  const q = query.trim().toLowerCase();
+  if (!q) return groups;
+
+  return groups.filter(g => {
+    // match in title
+    if (g.title.toLowerCase().includes(q)) return true;
+
+    // match in values/snippets/evidence
+    return g.items.some(it => {
+      const val = prettyValue(it.value).toLowerCase();
+      const snip = (it.source_snippet ?? "").toLowerCase();
+      const evHit = (it.evidence ?? []).some(e =>
+        (e.snippet ?? "").toLowerCase().includes(q)
+      );
+      return val.includes(q) || snip.includes(q) || evHit;
+    });
+  });
+}, [groups, query]);
+
+
+
+<div className="space-y-2">
+  {filteredGroups.map((g, gidx) => {
+    const firstPage = g.items.find(x => typeof x.page === "number")?.page;
+
+    return (
+      <AccordionItem
+        key={`${g.key}_${gidx}`}
+        title={
+          <div className="flex items-center justify-between gap-2 w-full">
+            <button
+              type="button"
+              onClick={(e) => {
+                e.preventDefault(); // don't toggle details
+                jump(firstPage);
+              }}
+              className={cn(
+                "min-w-0 text-left font-medium text-stone-900 truncate",
+                typeof firstPage === "number" ? "hover:text-emerald-700" : "cursor-default"
+              )}
+              title={typeof firstPage === "number" ? `Jump to page ${firstPage}` : undefined}
+            >
+              {g.title}
+            </button>
+
+            <span className="text-xs text-stone-500">{g.items.length}</span>
+          </div>
+        }
+        meta={null}
+        defaultOpen={false}
+      >
+        <div className="space-y-3">
+          {g.items.map((f, idx) => {
+            const evSorted = [...(f.evidence ?? [])].sort((a, b) => {
+              const ap = typeof a.page === "number" ? a.page : Number.POSITIVE_INFINITY;
+              const bp = typeof b.page === "number" ? b.page : Number.POSITIVE_INFINITY;
+              return ap - bp;
+            });
+
+            return (
+              <div key={f.id ?? `${g.key}_${idx}`} className="rounded-md border border-stone-200 bg-white p-2">
+                {/* meta row (your existing style) */}
+                <div className="flex flex-wrap items-center gap-2 mb-2">
+                  {typeof f.page === "number" ? (
+                    <Badge onClick={() => jump(f.page)} title={`Jump to page ${f.page}`}>
+                      Page {f.page}
+                    </Badge>
+                  ) : null}
+                  {typeof f.confidence === "number" ? <ConfidenceBar value={f.confidence} /> : null}
+                  {g.items.length > 1 ? (
+                    <Badge title={`Occurrence ${idx + 1}`}>Value {idx + 1}</Badge>
+                  ) : null}
+                </div>
+
+                {/* VALUE (keep your exact rendering) */}
+                <div className="rounded-md border border-stone-200 bg-white p-2">
+                  {typeof f.value === "string" ? (
+                    <div className="text-sm text-stone-900 whitespace-pre-wrap leading-5">
+                      <b>{normalizeText(f.value)}</b>
+                    </div>
+                  ) : (
+                    <pre className="text-xs text-stone-700 whitespace-pre-wrap bg-stone-50 border border-stone-200 rounded-md p-2 overflow-auto">
+                      <b>{prettyValue(f.value)}</b>
+                    </pre>
+                  )}
+                </div>
+
+                {/* EVIDENCE (sorted + in order) */}
+                {evSorted.length ? (
+                  <div className="mt-4 space-y-3">
+                    <div className="text-xs font-semibold text-stone-700 flex items-center gap-1">
+                      <Info className="h-3.5 w-3.5 text-emerald-700" />
+                      Evidence
+                    </div>
+
+                    {evSorted.map((ev, eidx) => (
+                      <button
+                        type="button"
+                        key={ev.id ?? `${f.id}_ev_${eidx}`}
+                        onClick={() => jump(ev.page ?? f.page)}
+                        className="w-full text-left rounded-md border border-stone-200 bg-white p-2 hover:border-emerald-200 hover:bg-emerald-50/30 transition"
+                        title={
+                          typeof (ev.page ?? f.page) === "number"
+                            ? `Jump to page ${ev.page ?? f.page}`
+                            : undefined
+                        }
+                      >
+                        <div className="flex items-center gap-2 mb-1 flex-wrap">
+                          {typeof ev.page === "number" ? (
+                            <Badge>Page {ev.page}</Badge>
+                          ) : typeof f.page === "number" ? (
+                            <Badge>Page {f.page}</Badge>
+                          ) : null}
+
+                          {ev.id ? <Badge>ID: {ev.id.slice(0, 8)}…</Badge> : null}
+                        </div>
+
+                        {ev.snippet ? (
+                          <div className="mt-2 text-sm text-stone-900 whitespace-pre-wrap leading-5">
+                            {normalizeText(ev.snippet)}
+                          </div>
+                        ) : null}
+
+                        {ev.page_markdown ? (
+                          <details
+                            className="mt-4"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <summary className="cursor-pointer text-xs text-emerald-700 hover:text-emerald-800 inline-flex items-center gap-1">
+                              <BookOpenText className="h-3.5 w-3.5" />
+                              References
+                            </summary>
+                            <div className="mt-4 text-xs whitespace-pre-wrap text-stone-700 bg-yellow-50 border border-stone-200 rounded-md p-2 overflow-auto leading-5">
+                              {normalizeText(ev.page_markdown)}
+                            </div>
+                          </details>
+                        ) : null}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            );
+          })}
+        </div>
+      </AccordionItem>
+    );
+  })}
+</div>
+
+
+
+function getTablePage(t: TableItem): number | undefined {
+  // best: if backend provides it
+  if (typeof t.source_page === "number") return t.source_page;
+
+  // fallback: parse from table_id like "page_13_table_1"
+  const id = t.table_id ?? "";
+  const m = id.match(/page_(\d+)_/i);
+  if (m) {
+    const n = Number(m[1]);
+    if (Number.isFinite(n)) return n;
+  }
+
+  return undefined;
+}
+
+function tableDisplayTitle(t: TableItem, idx: number) {
+  const raw = (t.title ?? "").trim();
+  if (raw) return raw;
+
+  const kind = t.table_type === "merged" ? "Merged table" : "Page table";
+  return `${kind} ${idx + 1}`;
+}
+
+
+{mergedTables.map((t, idx) => {
+  const page = getTablePage(t);
+  const title = tableDisplayTitle(t, idx);
+
+  return (
+    <AccordionItem
+      key={t.id ?? `merged_${idx}`}
+      title={
+        <div className="text-sm font-medium text-stone-900 truncate">
+          {title}
+        </div>
+      }
+      meta={
+        <div className="flex flex-wrap gap-2">
+          {typeof page === "number" ? (
+            <Badge onClick={() => jump(page)} title={`Jump to page ${page}`}>
+              Page {page}
+            </Badge>
+          ) : null}
+          {typeof t.row_count === "number" ? <Badge>{t.row_count} rows</Badge> : null}
+          {t.has_unreadable ? <Badge>Unreadable parts</Badge> : null}
+        </div>
+      }
+    >
+      <TablePreview table={t} />
+    </AccordionItem>
+  );
+})}
+
+
+{pageTables.map((t, idx) => {
+  const page = getTablePage(t);
+  const title = tableDisplayTitle(t, idx);
+
+  return (
+    <AccordionItem
+      key={t.id ?? `page_${idx}`}
+      title={
+        <div className="text-sm font-medium text-stone-900 truncate">
+          {title}
+        </div>
+      }
+      meta={
+        <div className="flex flex-wrap gap-2">
+          {typeof page === "number" ? (
+            <Badge onClick={() => jump(page)} title={`Jump to page ${page}`}>
+              Page {page}
+            </Badge>
+          ) : null}
+          {typeof t.row_count === "number" ? <Badge>{t.row_count} rows</Badge> : null}
+          {t.has_unreadable ? <Badge>Unreadable parts</Badge> : null}
+        </div>
+      }
+    >
+      <TablePreview table={t} />
+    </AccordionItem>
+  );
+})}
+
+
+function getTablePage(t: TableItem): number | undefined {
+  if (typeof t.source_page === "number") return t.source_page;
+
+  const id = (t.table_id ?? "").trim();
+  const m = id.match(/page_(\d+)_/i);
+  if (m) {
+    const n = Number(m[1]);
+    if (Number.isFinite(n)) return n;
+  }
+  return undefined;
+}
+
+function tableDisplayTitle(t: TableItem, idx: number) {
+  const raw = (t.title ?? "").trim();
+  if (raw) return raw;
+
+  const kind = t.table_type === "merged" ? "Table" : "Table"; // keep generic if you prefer
+  return `${kind} ${idx + 1}`;
+}
+
+const page = getTablePage(t);
+const titleText = tableDisplayTitle(t, idx);
+
+title={
+  <div className="flex items-center justify-between gap-2 w-full">
+    <button
+      type="button"
+      onClick={(e) => {
+        e.preventDefault(); // don't toggle accordion
+        jump(page);
+      }}
+      className={cn(
+        "min-w-0 text-left font-medium text-stone-900 truncate",
+        typeof page === "number" ? "hover:text-emerald-700" : "cursor-default"
+      )}
+      title={typeof page === "number" ? `Jump to page ${page}` : undefined}
+    >
+      {titleText}
+    </button>
+
+    {typeof page === "number" ? (
+      <span className="inline-flex items-center gap-1 text-xs text-emerald-700">
+        <MousePointerClick className="h-3.5 w-3.5" />
+        Jump
+      </span>
+    ) : null}
+  </div>
+}
+
+
+meta={
+  <div className="flex flex-wrap gap-2">
+    {typeof page === "number" ? (
+      <Badge onClick={() => jump(page)} title={`Jump to page ${page}`}>
+        Page {page}
+      </Badge>
+    ) : null}
+    {typeof t.row_count === "number" ? <Badge>{t.row_count} rows</Badge> : null}
+    {t.has_unreadable ? <Badge>Unreadable parts</Badge> : null}
+  </div>
+}
+
+
+const page = getTablePage(t);
+const titleText = tableDisplayTitle(t, idx);
+
+
+<button
+  type="button"
+  onClick={(e) => { e.preventDefault(); jump(page); }}
+  className="inline-flex items-center gap-1 text-xs text-emerald-700 hover:underline"
+>
+  <MousePointerClick className="h-3.5 w-3.5" />
+  Jump
+</button>
+
+function tableDisplayTitle(t: TableItem, idx: number) {
+  const raw = (t.title ?? "").trim();
+  if (raw) return raw;
+
+  return `Table ${idx + 1}`;
+}
+
+
+
+
+
+
+
