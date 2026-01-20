@@ -1,0 +1,116 @@
+<PDFPage
+  pageNumber={i + 1}
+  width={800}
+  renderTextLayer={true}
+  renderAnnotationLayer={false}
+/>
+
+
+
+const [pdfHighlight, setPdfHighlight] = React.useState<{
+  page: number;
+  query: string; // phrase or keywords
+} | null>(null);
+
+const jumpToPdfPage = React.useCallback((page: number, query?: string) => {
+  if (query) setPdfHighlight({ page, query });
+  const container = pdfScrollRef.current;
+  if (!container || !page || page < 1) return;
+  const el = container.querySelector(`#pdf-page-${page}`) as HTMLElement | null;
+  if (!el) return;
+  el.scrollIntoView({ behavior: "smooth", block: "start" });
+}, []);
+
+
+function escapeRegExp(s: string) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function highlightTextInPage(page: number, query: string) {
+  const pageEl = document.getElementById(`pdf-page-${page}`);
+  if (!pageEl) return;
+
+  const textLayer = pageEl.querySelector(".react-pdf__Page__textContent");
+  if (!textLayer) return;
+
+  // Clear previous highlights
+  textLayer.querySelectorAll("mark[data-ev='1']").forEach((m) => {
+    const parent = m.parentNode;
+    if (!parent) return;
+    parent.replaceChild(document.createTextNode(m.textContent || ""), m);
+    parent.normalize();
+  });
+
+  const q = query.trim();
+  if (!q) return;
+
+  // Use keywords (more robust than full sentence match)
+  const terms = q
+    .split(/\s+/)
+    .map((t) => t.trim())
+    .filter((t) => t.length >= 4) // ignore tiny words
+    .slice(0, 8);
+
+  if (!terms.length) return;
+
+  const re = new RegExp(`(${terms.map(escapeRegExp).join("|")})`, "gi");
+
+  // Walk text nodes inside the text layer
+  const walker = document.createTreeWalker(textLayer, NodeFilter.SHOW_TEXT);
+  const nodes: Text[] = [];
+  let n: Node | null;
+  while ((n = walker.nextNode())) nodes.push(n as Text);
+
+  for (const node of nodes) {
+    const txt = node.nodeValue || "";
+    if (!re.test(txt)) continue;
+
+    const frag = document.createDocumentFragment();
+    let last = 0;
+
+    txt.replace(re, (match, _g, offset) => {
+      const start = offset as number;
+      const end = start + match.length;
+
+      if (start > last) frag.appendChild(document.createTextNode(txt.slice(last, start)));
+
+      const mark = document.createElement("mark");
+      mark.setAttribute("data-ev", "1");
+      mark.className =
+        "bg-yellow-200/80 text-stone-900 rounded px-0.5";
+      mark.textContent = txt.slice(start, end);
+      frag.appendChild(mark);
+
+      last = end;
+      return match;
+    });
+
+    if (last < txt.length) frag.appendChild(document.createTextNode(txt.slice(last)));
+
+    const parent = node.parentNode;
+    if (parent) parent.replaceChild(frag, node);
+  }
+}
+
+React.useEffect(() => {
+  if (!pdfHighlight) return;
+
+  let tries = 0;
+  const tick = () => {
+    tries += 1;
+    highlightTextInPage(pdfHighlight.page, pdfHighlight.query);
+    // if text layer isn't ready yet, try a few times
+    if (tries < 10) requestAnimationFrame(tick);
+  };
+
+  requestAnimationFrame(tick);
+}, [pdfHighlight]);
+
+onJumpToPage?.(ev.page ?? f.page ?? 1, ev.snippet ?? "");
+
+onJumpToPage?: (page: number, query?: string) => void;
+
+
+
+
+
