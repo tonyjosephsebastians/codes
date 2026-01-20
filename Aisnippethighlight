@@ -1,0 +1,120 @@
+export function ExtractionPanel({
+  extractionRun,
+  onJumpToPage,
+  onHighlightEvidence,
+}: {
+  extractionRun: ExtractionResponse | null;
+  onJumpToPage?: (page: number) => void;
+  onHighlightEvidence?: (payload: { page: number; snippet: string }) => void;
+}) {
+  // ...
+}
+
+
+<button
+  type="button"
+  onClick={() => {
+    const p = (ev.page ?? f.page);
+    if (typeof p === "number" && p > 0) {
+      onHighlightEvidence?.({
+        page: p,
+        snippet: ev.snippet ?? "",
+      });
+      jump(p);
+    }
+  }}
+  className="w-full text-left rounded-md border border-stone-200 bg-white p-2 hover:border-emerald-300 hover:bg-emerald-50 transition"
+  title={
+    typeof (ev.page ?? f.page) === "number"
+      ? `Jump to page ${(ev.page ?? f.page)}`
+      : undefined
+  }
+>
+  {/* keep your evidence UI */}
+</button>
+
+const [highlight, setHighlight] = React.useState<{ page: number; snippet: string } | null>(null);
+
+<ExtractionPanel
+  extractionRun={extractionRun}
+  onJumpToPage={jumpToPdfPage}
+  onHighlightEvidence={(p) => setHighlight(p)}
+/>
+
+function escapeRegExp(s: string) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function buildLooseRegex(snippet: string) {
+  // keep it forgiving: take “good” words, avoid punctuation noise
+  const words = snippet
+    .replace(/\s+/g, " ")
+    .replace(/[^\w\s'-]/g, " ")
+    .split(" ")
+    .map(w => w.trim())
+    .filter(w => w.length >= 4);
+
+  const uniq = Array.from(new Set(words)).slice(0, 12);
+  if (!uniq.length) return null;
+
+  // match any of the words
+  return new RegExp(`(${uniq.map(escapeRegExp).join("|")})`, "i");
+}
+
+function clearHighlights(container: HTMLElement) {
+  const spans = container.querySelectorAll<HTMLSpanElement>(".react-pdf__Page__textContent span");
+  spans.forEach((sp) => {
+    sp.style.background = "";
+    sp.style.borderRadius = "";
+    sp.style.boxShadow = "";
+    sp.style.padding = "";
+  });
+}
+
+function applyHighlightsForPage(wrapper: HTMLElement, snippet: string) {
+  const regex = buildLooseRegex(snippet);
+  if (!regex) return;
+
+  const textLayer = wrapper.querySelector<HTMLElement>(".react-pdf__Page__textContent");
+  if (!textLayer) return;
+
+  const spans = textLayer.querySelectorAll<HTMLSpanElement>("span");
+
+  spans.forEach((sp) => {
+    const t = sp.textContent ?? "";
+    if (regex.test(t)) {
+      // ✅ yellow highlight
+      sp.style.background = "rgba(253, 224, 71, 0.55)"; // yellow-300-ish
+      sp.style.borderRadius = "4px";
+      sp.style.boxShadow = "0 0 0 2px rgba(253, 224, 71, 0.25)";
+      sp.style.padding = "0 2px";
+    }
+  });
+}
+
+React.useEffect(() => {
+  if (!highlight?.page || !highlight.snippet) return;
+
+  // wait for react-pdf to paint textLayer
+  const id = window.requestAnimationFrame(() => {
+    const wrapper = document.getElementById(`pdf-page-${highlight.page}`);
+    if (!wrapper) return;
+
+    clearHighlights(wrapper);
+    applyHighlightsForPage(wrapper, highlight.snippet);
+  });
+
+  return () => window.cancelAnimationFrame(id);
+}, [highlight]);
+
+
+{ev.snippet ? (
+  <div className="mt-2 rounded-md border border-stone-200 bg-white p-3 text-sm text-stone-800 leading-relaxed">
+    {ev.snippet}
+  </div>
+) : null}
+
+
+
+
+
