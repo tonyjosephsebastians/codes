@@ -1,0 +1,47 @@
+function pythonishToJsonString(s: string): string {
+  let out = s.trim();
+
+  // Convert Python literals
+  out = out
+    .replace(/\bNone\b/g, "null")
+    .replace(/\bTrue\b/g, "true")
+    .replace(/\bFalse\b/g, "false");
+
+  // 1) Quote keys:  {'name': ...}  -> {"name": ...}
+  out = out.replace(/([{,]\s*)'([^']+?)'\s*:/g, '$1"$2":');
+
+  // 2) Quote string values:  : 'text'  -> : "text"
+  //    This only targets value positions (after :)
+  out = out.replace(/:\s*'([^']*?)'(\s*[},])/g, (m, val, tail) => {
+    const escaped = String(val)
+      .replace(/\\/g, "\\\\")
+      .replace(/"/g, '\\"'); // escape double quotes inside values
+    return `: "${escaped}"${tail}`;
+  });
+
+  return out;
+}
+
+function parseJsonLike(v: any): any | undefined {
+  if (v == null) return undefined;
+  if (typeof v !== "string") return v;
+
+  const t = v.trim();
+  const looksJson =
+    (t.startsWith("[") && t.endsWith("]")) || (t.startsWith("{") && t.endsWith("}"));
+  if (!looksJson) return undefined;
+
+  // 1) normal JSON first
+  try {
+    return JSON.parse(t);
+  } catch {}
+
+  // 2) python-ish conversion
+  try {
+    const fixed = pythonishToJsonString(t);
+    return JSON.parse(fixed);
+  } catch {}
+
+  return undefined;
+}
+
