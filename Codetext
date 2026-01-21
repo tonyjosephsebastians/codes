@@ -1,0 +1,166 @@
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import Session
+from io import BytesIO
+from datetime import datetime
+from docx import Document as DocxDocument
+from docx.shared import Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+import json
+import re
+
+router = APIRouter()
+
+DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
+# ---------------- SAFE HELPERS ---------------- #
+
+def safe_text(val) -> str:
+    """Always return Word-safe text"""
+    if val is None:
+        return ""
+    if isinstance(val, (dict, list)):
+        return json.dumps(val, ensure_ascii=False)
+    return str(val)
+
+
+def safe_filename(name: str) -> str:
+    """Remove characters that break Content-Disposition"""
+    name = re.sub(r"[^a-zA-Z0-9_.-]", "_", name)
+    return name
+
+
+def add_kv_table(doc: DocxDocument, rows: list[tuple[str, str]]):
+    table = doc.add_table(rows=1, cols=2)
+    table.style = "Table Grid"
+
+    hdr = table.rows[0].cells
+    hdr[0].text = "Key"
+    hdr[1].text = "Value"
+
+    for k, v in rows:
+        r = table.add_row().cells
+        r[0].text = safe_text(k)
+        r[1].text = safe_text(v)
+
+
+# ---------------- MAIN ENDPOINT ---------------- #
+
+@router.get("/documents/{doc_id}/report")
+def generate_docx_report(
+    doc_id: str,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    # 1️⃣ Fetch document
+    doc_obj = db.query(Document).filter(Document.id == doc_id).first()
+    if not doc_obj:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    # 2️⃣ Permissions
+    if current_user.role.value not in ["admin", "superuser"] and \
+       doc_obj.uploaded_by != current_user.username:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    # 3️⃣ Latest completed extraction
+    run = _get_latest_completed_run(
+        db=db,
+        document_id=doc_id,
+        username=doc_obj.uploaded_by,
+        standard="SOC2",
+    )
+    if not run:
+        raise HTTPException(status_code=404, detail="No completed extraction run")
+
+    payload = _format_extraction_run_response(run)
+
+    # 4️⃣ Build DOCX safely
+    doc = DocxDocument()
+
+    title = doc.add_paragraph()
+    t = title.add_run("Document Analysis Report")
+    t.bold = True
+    t.font.size = Pt(16)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    meta = payload.get("extraction_run", {})
+    doc.add_paragraph(f"Document: {safe_text(doc_obj.original_filename or doc_id)}")
+    doc.add_paragraph(f"Standard: {safe_text(meta.get('standard'))}")
+    doc.add_paragraph(f"Pipeline: {safe_text(meta.get('pipeline_version'))}")
+    doc.add_paragraph(f"Completed: {safe_text(meta.get('completed_at'))}")
+    doc.add_paragraph("")
+
+    # ---------- Fields ----------
+    doc.add_paragraph("Fields", style="Heading 2")
+    for f in payload.get("extracted_elements", []):
+        doc.add_paragraph(safe_text(f.get("field_name")), style="Heading 3")
+
+        rows = []
+        for k in ["value", "confidence", "page"]:
+            if f.get(k) is not None:
+                rows.append((k.capitalize(), f.get(k)))
+
+        if rows:
+            add_kv_table(doc, rows)
+
+        doc.add_paragraph("")
+
+    # ---------- Tables ----------
+    doc.add_paragraph("Tables", style="Heading 2")
+
+    for group in ["merged", "page"]:
+        tables = payload.get("tables", {}).get(group, [])
+        if not tables:
+            continue
+
+        doc.add_paragraph(group.capitalize(), style="Heading 3")
+
+        for t in tables:
+            doc.add_paragraph(
+                safe_text(t.get("title") or f"Table {t.get('id')}"),
+                style="Heading 4"
+            )
+
+            cols = t.get("columns") or []
+            rows = t.get("rows") or []
+
+            if isinstance(rows, str):
+                try:
+                    rows = json.loads(rows)
+                except Exception:
+                    rows = []
+
+            if cols and isinstance(rows, list):
+                table = doc.add_table(rows=1, cols=len(cols))
+                table.style = "Table Grid"
+
+                for i, c in enumerate(cols):
+                    table.rows[0].cells[i].text = safe_text(c)
+
+                for r in rows:
+                    rr = table.add_row().cells
+                    for i, c in enumerate(cols):
+                        rr[i].text = safe_text(r.get(c))
+            else:
+                doc.add_paragraph("(No readable table data)")
+
+            doc.add_paragraph("")
+
+    # 5️⃣ FINAL SAFE RETURN (THIS FIXES WORD ERROR)
+    buf = BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+
+    filename = safe_filename(
+        f"report_{doc_id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.docx"
+    )
+
+    return StreamingResponse(
+        buf,
+        media_type=DOCX_MIME,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"'
+        },
+    )
+
