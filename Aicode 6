@@ -1,0 +1,320 @@
+# --- DOCX report generation (safe) ---
+
+from __future__ import annotations
+
+import json
+import re
+from datetime import datetime
+from io import BytesIO
+
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import Response
+from sqlalchemy.orm import Session
+
+# python-docx
+from docx import Document as DocxDocument
+from docx.shared import Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+# your imports (keep your existing ones)
+# from src.database import get_db
+# from src.auth import get_current_user
+# from src.database.models import Document
+# from src.database.models.extracted_elements import ExtractionRun
+# from src.database.persist.extraction_store import _get_latest_completed_run
+
+router = APIRouter(prefix="/documents", tags=["documents"])
+
+# =========================
+# 1) XML / DOCX sanitization
+# =========================
+
+# Illegal XML 1.0 characters that corrupt DOCX
+_INVALID_XML_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
+
+def clean_docx_text(value) -> str:
+    """
+    Remove characters that make Word DOCX unreadable.
+    MUST be applied to every paragraph/cell text.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    text = str(value)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return _INVALID_XML_RE.sub("", text)
+
+def _safe_json_loads(v):
+    """
+    Parse JSON-like strings when possible, otherwise return as-is.
+    IMPORTANT: do NOT do naive quote replacement (breaks don't / etc).
+    """
+    if isinstance(v, (dict, list)):
+        return v
+    if not isinstance(v, str):
+        return v
+
+    t = v.strip()
+    if not ((t.startswith("{") and t.endswith("}")) or (t.startswith("[") and t.endswith("]"))):
+        return v
+
+    try:
+        return json.loads(t)
+    except Exception:
+        return v
+
+def _safe_str(val) -> str:
+    return clean_docx_text(val)
+
+def _safe_cell(val) -> str:
+    if isinstance(val, (dict, list)):
+        return clean_docx_text(json.dumps(val, ensure_ascii=False))
+    return clean_docx_text(val)
+
+# =========================
+# 2) Helpers for formatting
+# =========================
+
+def _flatten(obj, prefix: str = "", max_depth: int = 8):
+    """
+    Flatten nested dict/list into (key,value) rows like your UI vertical table.
+    """
+    rows: list[tuple[str, str]] = []
+
+    def walk(node, pfx: str, depth: int):
+        if depth > max_depth:
+            rows.append((pfx or "(value)", _safe_cell(node)))
+            return
+
+        if isinstance(node, dict):
+            if not node:
+                rows.append((pfx or "(empty)", ""))
+                return
+            for k, v in node.items():
+                key = f"{pfx}.{k}" if pfx else str(k)
+                walk(v, key, depth + 1)
+            return
+
+        if isinstance(node, list):
+            # Keep lists readable
+            rows.append((pfx or "(list)", _safe_cell(node)))
+            return
+
+        rows.append((pfx or "(value)", _safe_cell(node)))
+
+    walk(obj, prefix, 1)
+    return rows
+
+def _add_kv_table(doc: DocxDocument, rows: list[tuple[str, str]]):
+    """
+    Key/Value table used for nested objects (like UI vertical table).
+    """
+    table = doc.add_table(rows=1, cols=2)
+    table.style = "Table Grid"
+
+    hdr = table.rows[0].cells
+    hdr[0].text = "Key"
+    hdr[1].text = "Value"
+
+    for k, v in rows:
+        r = table.add_row().cells
+        r[0].text = _safe_str(k)
+        r[1].text = _safe_str(v)
+
+def _add_evidence(doc: DocxDocument, field: dict):
+    """
+    Evidence section + references. Sanitized.
+    """
+    ev = field.get("evidence") or []
+    if not ev:
+        return
+
+    doc.add_paragraph("Evidence", style="Heading 3")
+
+    # Sort evidence by page number (missing pages go last)
+    def page_key(x):
+        p = x.get("page")
+        return p if isinstance(p, int) else 10**9
+
+    for e in sorted(ev, key=page_key):
+        p = doc.add_paragraph()
+        run = p.add_run(f"Page: {e.get('page', '')}  ")
+        run.bold = True
+
+        if e.get("id"):
+            p.add_run(f"ID: {str(e['id'])[:8]}…  ")
+
+        if e.get("snippet"):
+            doc.add_paragraph(_safe_str(e["snippet"]))
+
+        # References / page_markdown
+        if e.get("page_markdown"):
+            refp = doc.add_paragraph("References:")
+            if refp.runs:
+                refp.runs[0].bold = True
+            doc.add_paragraph(_safe_str(e["page_markdown"]))
+
+def _add_table_block(doc: DocxDocument, table_obj: dict):
+    """
+    Render a merged/page table in DOCX: title + metadata + grid table.
+    """
+    title = table_obj.get("title") or f"Table {table_obj.get('id', '')}"
+    doc.add_paragraph(_safe_str(title), style="Heading 4")
+
+    meta_bits = []
+    if table_obj.get("source_page") is not None:
+        meta_bits.append(f"Page: {table_obj.get('source_page')}")
+    if table_obj.get("row_count") is not None:
+        meta_bits.append(f"Rows: {table_obj.get('row_count')}")
+    if meta_bits:
+        doc.add_paragraph(_safe_str(" | ".join(meta_bits)))
+
+    cols = table_obj.get("columns") or []
+    rows = table_obj.get("rows") or []
+
+    # rows might be JSON string
+    if isinstance(rows, str):
+        try:
+            rows = json.loads(rows)
+        except Exception:
+            rows = []
+
+    if not (isinstance(cols, list) and isinstance(rows, list) and cols):
+        doc.add_paragraph("(No readable table content)")
+        doc.add_paragraph("")
+        return
+
+    # Create DOCX table
+    wtable = doc.add_table(rows=1, cols=len(cols))
+    wtable.style = "Table Grid"
+
+    for j, c in enumerate(cols):
+        wtable.rows[0].cells[j].text = _safe_str(c)
+
+    # Rows may be list[dict] or list[list]
+    for r in rows:
+        rr = wtable.add_row().cells
+        if isinstance(r, dict):
+            for j, c in enumerate(cols):
+                rr[j].text = _safe_cell(r.get(c))
+        elif isinstance(r, list):
+            for j in range(min(len(cols), len(r))):
+                rr[j].text = _safe_cell(r[j])
+        else:
+            # fallback: put whole row into first cell
+            rr[0].text = _safe_cell(r)
+
+    doc.add_paragraph("")
+
+# =========================
+# 3) Endpoint: generate report
+# =========================
+
+@router.get("/documents/{doc_id}/report")
+def generate_docx_report(
+    doc_id: str,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    # 1) Find document
+    doc_obj = db.query(Document).filter(Document.id == doc_id).first()
+    if not doc_obj:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    # 2) Permissions (same as your screenshot)
+    if current_user.role.value not in ["admin", "superuser"] and doc_obj.uploaded_by != current_user.username:
+        raise HTTPException(status_code=403, detail="Not authorized to access this document")
+
+    # 3) Latest completed extraction run
+    run = _get_latest_completed_run(
+        db=db,
+        document_id=doc_id,
+        username=doc_obj.uploaded_by,
+        standard="SOC2",
+    )
+    if not run:
+        raise HTTPException(status_code=404, detail="No completed extraction run found")
+
+    payload = _format_extraction_run_response(run)
+    if not payload:
+        raise HTTPException(status_code=500, detail="Run serialization missing")
+
+    # 4) Build DOCX
+    d = DocxDocument()
+
+    title = d.add_paragraph()
+    title_run = title.add_run("Document Analysis Report")
+    title_run.bold = True
+    title_run.font.size = Pt(16)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    meta = payload.get("extraction_run", {}) or {}
+    d.add_paragraph(_safe_str(f"Document: {getattr(doc_obj, 'original_filename', '') or doc_id}"))
+    d.add_paragraph(_safe_str(f"Standard: {meta.get('standard', '')}"))
+    d.add_paragraph(_safe_str(f"Pipeline: {meta.get('pipeline_version', '')}"))
+    d.add_paragraph(_safe_str(f"Completed: {meta.get('completed_at', '') or ''}"))
+    d.add_paragraph("")
+
+    # Fields
+    d.add_paragraph("Fields", style="Heading 2")
+    fields = payload.get("extracted_elements") or []
+
+    for f in fields:
+        field_name = f.get("field_name") or "Field"
+        d.add_paragraph(_safe_str(field_name), style="Heading 3")
+
+        # confidence/page
+        info_bits = []
+        if f.get("confidence") is not None:
+            info_bits.append(f"Confidence: {f.get('confidence')}")
+        if f.get("page") is not None:
+            info_bits.append(f"Page: {f.get('page')}")
+        if info_bits:
+            d.add_paragraph(_safe_str(" | ".join(info_bits)))
+
+        raw_val = f.get("value")
+        parsed = _safe_json_loads(raw_val)
+
+        # Render like UI: dict => kv table, list[dict] => item sections, list => bullets, scalar => paragraph
+        if isinstance(parsed, dict):
+            _add_kv_table(d, _flatten(parsed))
+        elif isinstance(parsed, list):
+            if parsed and all(isinstance(x, dict) for x in parsed):
+                for i, item in enumerate(parsed, start=1):
+                    d.add_paragraph(f"Item {i}", style="Heading 4")
+                    _add_kv_table(d, _flatten(item))
+            else:
+                for x in parsed:
+                    d.add_paragraph(_safe_str(f"- {x}"))
+        else:
+            d.add_paragraph(_safe_str(parsed))
+
+        _add_evidence(d, f)
+        d.add_paragraph("")
+
+    # Tables
+    d.add_paragraph("Tables", style="Heading 2")
+    tables = payload.get("tables") or {}
+
+    for group_name in ["merged", "page"]:
+        group = tables.get(group_name) or []
+        if not group:
+            continue
+
+        d.add_paragraph(group_name.capitalize(), style="Heading 3")
+        for t in group:
+            _add_table_block(d, t)
+
+    # 5) Return as download (bytes) — avoids corrupted streaming
+    buf = BytesIO()
+    d.save(buf)
+    doc_bytes = buf.getvalue()
+
+    filename = f"report_{doc_id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.docx"
+    return Response(
+        content=doc_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
