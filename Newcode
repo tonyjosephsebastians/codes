@@ -1,0 +1,172 @@
+from docx import Document
+from docx.shared import Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from fastapi import Response
+from io import BytesIO
+import json
+from datetime import datetime
+
+
+
+def safe_text(val) -> str:
+    """Absolutely safe text for DOCX"""
+    if val is None:
+        return ""
+    if isinstance(val, bytes):
+        return val.decode("utf-8", errors="replace")
+    if isinstance(val, (dict, list)):
+        return json.dumps(val, ensure_ascii=False)
+    return str(val)
+
+
+def add_kv_table(doc: Document, rows: list[tuple[str, str]]):
+    if not rows:
+        return
+    table = doc.add_table(rows=1, cols=2)
+    table.style = "Table Grid"
+    hdr = table.rows[0].cells
+    hdr[0].text = "Key"
+    hdr[1].text = "Value"
+
+    for k, v in rows:
+        r = table.add_row().cells
+        r[0].text = safe_text(k)
+        r[1].text = safe_text(v)
+
+
+@router.get("/documents/{doc_id}/report")
+def generate_docx_report(
+    doc_id: str,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    # 1. Load document
+    doc_obj = db.query(DocumentModel).filter(DocumentModel.id == doc_id).first()
+    if not doc_obj:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    # 2. Permissions
+    if current_user.role.value not in ["admin", "superuser"] and doc_obj.uploaded_by != current_user.username:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    # 3. Load latest extraction
+    run = _get_latest_completed_run(
+        db=db,
+        document_id=doc_id,
+        username=doc_obj.uploaded_by,
+        standard="SOC2",
+    )
+    if not run:
+        raise HTTPException(status_code=404, detail="No completed extraction run")
+
+    payload = _format_extraction_run_response(run)
+
+    # 4. Build DOCX safely
+    d = Document()
+
+    # Title
+    title = d.add_paragraph()
+    tr = title.add_run("Document Analysis Report")
+    tr.bold = True
+    tr.font.size = Pt(16)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    meta = payload.get("extraction_run", {})
+    d.add_paragraph(f"Document: {safe_text(doc_obj.original_filename or doc_id)}")
+    d.add_paragraph(f"Standard: {safe_text(meta.get('standard'))}")
+    d.add_paragraph(f"Pipeline: {safe_text(meta.get('pipeline_version'))}")
+    d.add_paragraph(f"Completed: {safe_text(meta.get('completed_at'))}")
+    d.add_paragraph("")
+
+    # -------- Fields --------
+    d.add_paragraph("Fields", style="Heading 2")
+    for f in payload.get("extracted_elements", []):
+        d.add_paragraph(safe_text(f.get("field_name", "Field")), style="Heading 3")
+
+        info = []
+        if f.get("confidence") is not None:
+            info.append(f"Confidence: {f['confidence']}")
+        if f.get("page") is not None:
+            info.append(f"Page: {f['page']}")
+        if info:
+            d.add_paragraph(" | ".join(info))
+
+        val = f.get("value")
+        if isinstance(val, dict):
+            add_kv_table(d, [(k, v) for k, v in val.items()])
+        elif isinstance(val, list):
+            for i, item in enumerate(val, 1):
+                d.add_paragraph(f"Item {i}", style="Heading 4")
+                if isinstance(item, dict):
+                    add_kv_table(d, [(k, v) for k, v in item.items()])
+                else:
+                    d.add_paragraph(safe_text(item))
+        else:
+            d.add_paragraph(safe_text(val))
+
+        if f.get("source_snippet"):
+            d.add_paragraph("Evidence:", style="Heading 4")
+            d.add_paragraph(safe_text(f["source_snippet"]))
+
+        d.add_paragraph("")
+
+    # -------- Tables --------
+    d.add_paragraph("Tables", style="Heading 2")
+    tables = payload.get("tables", {})
+
+    for group_name in ["merged", "page"]:
+        group = tables.get(group_name, [])
+        if not group:
+            continue
+
+        d.add_paragraph(group_name.capitalize(), style="Heading 3")
+
+        for t in group:
+            d.add_paragraph(safe_text(t.get("title") or f"Table {t.get('id')}"), style="Heading 4")
+
+            meta_bits = []
+            if t.get("source_page") is not None:
+                meta_bits.append(f"Page: {t['source_page']}")
+            if t.get("row_count") is not None:
+                meta_bits.append(f"Rows: {t['row_count']}")
+            if meta_bits:
+                d.add_paragraph(" | ".join(meta_bits))
+
+            cols = t.get("columns") or []
+            rows = t.get("rows")
+
+            if isinstance(rows, str):
+                try:
+                    rows = json.loads(rows)
+                except Exception:
+                    rows = []
+
+            if cols and isinstance(rows, list):
+                wt = d.add_table(rows=1, cols=len(cols))
+                wt.style = "Table Grid"
+                for i, c in enumerate(cols):
+                    wt.rows[0].cells[i].text = safe_text(c)
+
+                for r in rows:
+                    rr = wt.add_row().cells
+                    for i, c in enumerate(cols):
+                        rr[i].text = safe_text(r.get(c))
+            else:
+                d.add_paragraph("(No readable table content)")
+
+            d.add_paragraph("")
+
+    # 5. Return SAFE bytes
+    buf = BytesIO()
+    d.save(buf)
+    doc_bytes = buf.getvalue()
+
+    filename = f"report_{doc_id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.docx"
+
+    return Response(
+        content=doc_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
