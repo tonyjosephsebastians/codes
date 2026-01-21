@@ -1,0 +1,178 @@
+import os
+import re
+import json
+import tempfile
+from datetime import datetime
+from typing import Any
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
+from sqlalchemy.orm import Session
+
+from docx import Document as DocxDocument
+from docx.shared import Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+
+router = APIRouter()
+
+DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
+def safe_text(val: Any) -> str:
+    if val is None:
+        return ""
+    if isinstance(val, (dict, list)):
+        return json.dumps(val, ensure_ascii=False)
+    return str(val)
+
+
+def safe_filename(name: str) -> str:
+    # keep it super safe for Word + Windows + headers
+    name = re.sub(r"[^a-zA-Z0-9_.-]", "_", name)
+    return name
+
+
+def add_kv_table(doc: DocxDocument, rows: list[tuple[str, Any]]):
+    table = doc.add_table(rows=1, cols=2)
+    table.style = "Table Grid"
+    hdr = table.rows[0].cells
+    hdr[0].text = "Key"
+    hdr[1].text = "Value"
+    for k, v in rows:
+        r = table.add_row().cells
+        r[0].text = safe_text(k)
+        r[1].text = safe_text(v)
+
+
+@router.get("/documents/{doc_id}/report")
+def generate_docx_report(
+    doc_id: str,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    # 1) Find document
+    doc_obj = db.query(Document).filter(Document.id == doc_id).first()
+    if not doc_obj:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    # 2) Permissions
+    if current_user.role.value not in ["admin", "superuser"] and doc_obj.uploaded_by != current_user.username:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    # 3) Get latest completed run
+    run = _get_latest_completed_run(
+        db=db,
+        document_id=doc_id,
+        username=doc_obj.uploaded_by,
+        standard="SOC2",
+    )
+    if not run:
+        raise HTTPException(status_code=404, detail="No completed extraction run found")
+
+    payload = _format_extraction_run_response(run)
+    if not payload:
+        raise HTTPException(status_code=500, detail="Extraction payload missing")
+
+    # 4) Build DOCX
+    doc = DocxDocument()
+
+    title = doc.add_paragraph()
+    run_title = title.add_run("Document Analysis Report")
+    run_title.bold = True
+    run_title.font.size = Pt(16)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    meta = payload.get("extraction_run", {}) or {}
+    doc.add_paragraph(f"Document: {safe_text(getattr(doc_obj, 'original_filename', '') or doc_id)}")
+    doc.add_paragraph(f"Standard: {safe_text(meta.get('standard'))}")
+    doc.add_paragraph(f"Pipeline: {safe_text(meta.get('pipeline_version'))}")
+    doc.add_paragraph(f"Completed: {safe_text(meta.get('completed_at'))}")
+    doc.add_paragraph("")
+
+    # Fields
+    doc.add_paragraph("Fields", style="Heading 2")
+    for f in (payload.get("extracted_elements") or []):
+        doc.add_paragraph(safe_text(f.get("field_name") or "Field"), style="Heading 3")
+
+        rows = []
+        if f.get("confidence") is not None:
+            rows.append(("Confidence", f.get("confidence")))
+        if f.get("page") is not None:
+            rows.append(("Page", f.get("page")))
+        rows.append(("Value", f.get("value")))
+
+        add_kv_table(doc, rows)
+        doc.add_paragraph("")
+
+    # Tables
+    doc.add_paragraph("Tables", style="Heading 2")
+    tables_obj = payload.get("tables") or {}
+    for group_name in ["merged", "page"]:
+        group = tables_obj.get(group_name) or []
+        if not group:
+            continue
+
+        doc.add_paragraph(group_name.capitalize(), style="Heading 3")
+
+        for t in group:
+            doc.add_paragraph(safe_text(t.get("title") or f"Table {t.get('id')}"), style="Heading 4")
+
+            cols = t.get("columns") or []
+            rows = t.get("rows") or []
+
+            # rows might be JSON string
+            if isinstance(rows, str):
+                try:
+                    rows = json.loads(rows)
+                except Exception:
+                    rows = []
+
+            if cols and isinstance(rows, list):
+                table = doc.add_table(rows=1, cols=len(cols))
+                table.style = "Table Grid"
+
+                for i, c in enumerate(cols):
+                    table.rows[0].cells[i].text = safe_text(c)
+
+                for r in rows:
+                    rr = table.add_row().cells
+                    for i, c in enumerate(cols):
+                        # IMPORTANT: only strings in Word cells
+                        rr[i].text = safe_text((r or {}).get(c))
+            else:
+                doc.add_paragraph("(No readable table data)")
+
+            doc.add_paragraph("")
+
+    # 5) Write to a REAL temp .docx file (most reliable)
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    download_name = safe_filename(f"report_{doc_id}_{ts}.docx")
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".docx", prefix="report_")
+    os.close(fd)
+
+    try:
+        doc.save(tmp_path)
+
+        # 6) HARD VALIDATION: DOCX MUST start with PK (zip)
+        with open(tmp_path, "rb") as f:
+            head = f.read(2)
+        if head != b"PK":
+            raise HTTPException(
+                status_code=500,
+                detail=f"Generated file is not a valid DOCX (magic={head!r})"
+            )
+
+        # 7) Return as FileResponse (sets Content-Length, streams correctly)
+        return FileResponse(
+            path=tmp_path,
+            media_type=DOCX_MIME,
+            filename=download_name,
+        )
+
+    except HTTPException:
+        # re-raise cleanly
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Report generation failed: {e}")
+
