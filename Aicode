@@ -1,0 +1,290 @@
+# app/api/reports.py
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import Session
+from io import BytesIO
+from datetime import datetime
+import json
+
+from docx import Document
+from docx.shared import Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+from app.db import get_db
+from app.models import Document as DbDocument, ExtractionRun  # adjust imports
+from app.auth import get_current_user  # adjust
+
+router = APIRouter()
+
+def _add_kv_table(doc: Document, rows: list[tuple[str, str]]):
+    table = doc.add_table(rows=1, cols=2)
+    table.style = "Table Grid"
+    hdr = table.rows[0].cells
+    hdr[0].text = "Key"
+    hdr[1].text = "Value"
+    for k, v in rows:
+        r = table.add_row().cells
+        r[0].text = str(k)
+        r[1].text = "" if v is None else str(v)
+
+def _safe_json_loads(v):
+    # Best case: backend already stores dict/list
+    if isinstance(v, (dict, list)):
+        return v
+    if not isinstance(v, str):
+        return v
+    t = v.strip()
+    if not ((t.startswith("{") and t.endswith("}")) or (t.startswith("[") and t.endswith("]"))):
+        return v
+    try:
+        return json.loads(t)
+    except Exception:
+        # NOTE: We intentionally DO NOT do naive quote replacement here,
+        # because it breaks "don't" etc. If backend sends python repr strings,
+        # fix it at the backend earlier in pipeline.
+        return v
+
+def _flatten(obj, prefix=""):
+    rows = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            key = f"{prefix}.{k}" if prefix else str(k)
+            if isinstance(v, dict):
+                rows.extend(_flatten(v, key))
+            elif isinstance(v, list):
+                rows.append((key, json.dumps(v, ensure_ascii=False)))
+            else:
+                rows.append((key, "" if v is None else str(v)))
+    else:
+        rows.append((prefix or "(value)", "" if obj is None else str(obj)))
+    return rows
+
+def _add_evidence(doc: Document, field):
+    ev = field.get("evidence") or []
+    if not ev:
+        return
+
+    doc.add_paragraph("Evidence", style="Heading 3")
+    for e in sorted(ev, key=lambda x: x.get("page") or 10**9):
+        p = doc.add_paragraph()
+        run = p.add_run(f"Page {e.get('page', '')}  ")
+        run.bold = True
+
+        if e.get("id"):
+            p.add_run(f"ID: {str(e['id'])[:8]}…  ")
+
+        if e.get("snippet"):
+            doc.add_paragraph(str(e["snippet"]))
+
+        # References / page_markdown
+        if e.get("page_markdown"):
+            refp = doc.add_paragraph("References:")
+            refp.runs[0].bold = True
+            doc.add_paragraph(str(e["page_markdown"]))
+
+@router.get("/documents/{doc_id}/report")
+def generate_docx_report(
+    doc_id: str,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    # 1) Find document
+    doc_obj = db.query(DbDocument).filter(DbDocument.id == doc_id).first()
+    if not doc_obj:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    # 2) Latest completed extraction run
+    run = (
+        db.query(ExtractionRun)
+        .filter(ExtractionRun.document_id == doc_id)
+        .order_by(ExtractionRun.completed_at.desc().nullslast(), ExtractionRun.created_at.desc())
+        .first()
+    )
+    if not run:
+        raise HTTPException(status_code=404, detail="No extraction run found")
+
+    # If you have a status field, enforce completed
+    if getattr(run, "status", None) and run.status != "completed":
+        raise HTTPException(status_code=400, detail="Extraction not completed")
+
+    # 3) Build frontend-friendly structure if you already have it
+    # If you already have _format_extraction_run_response(run), use it.
+    # Here I assume you return something like:
+    # { extraction_run: {...}, extracted_elements: [...], tables: {...} }
+    payload = run.to_frontend_dict() if hasattr(run, "to_frontend_dict") else None
+    if payload is None:
+        raise HTTPException(status_code=500, detail="Run serialization missing")
+
+    # 4) Build DOCX
+    d = Document()
+
+    title = d.add_paragraph()
+    title_run = title.add_run(f"Document Analysis Report")
+    title_run.bold = True
+    title_run.font.size = Pt(16)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    meta = payload.get("extraction_run", {})
+    d.add_paragraph(f"Document: {getattr(doc_obj, 'filename', '') or doc_id}")
+    d.add_paragraph(f"Standard: {meta.get('standard', '')}")
+    d.add_paragraph(f"Pipeline: {meta.get('pipeline_version', '')}")
+    d.add_paragraph(f"Completed: {meta.get('completed_at', '') or ''}")
+    d.add_paragraph("")
+
+    # Fields
+    d.add_paragraph("Fields", style="Heading 2")
+    fields = payload.get("extracted_elements", []) or []
+    for f in fields:
+        field_name = f.get("field_name", "Field")
+        d.add_paragraph(field_name, style="Heading 3")
+
+        # confidence/page
+        info_line = []
+        if f.get("confidence") is not None:
+            info_line.append(f"Confidence: {f.get('confidence')}")
+        if f.get("page") is not None:
+            info_line.append(f"Page: {f.get('page')}")
+        if info_line:
+            d.add_paragraph(" | ".join(info_line))
+
+        raw_val = f.get("value")
+        parsed = _safe_json_loads(raw_val)
+
+        # Render like your UI:
+        # - object => vertical key/value table (no "Section/Key/Value" headings)
+        # - array of objects => Item 1, Item 2 tables
+        # - array primitive => bullet list
+        # - string => paragraph
+        if isinstance(parsed, dict):
+            rows = _flatten(parsed)
+            _add_kv_table(d, rows)
+        elif isinstance(parsed, list):
+            if parsed and all(isinstance(x, dict) for x in parsed):
+                for i, item in enumerate(parsed, start=1):
+                    d.add_paragraph(f"Item {i}", style="Heading 4")
+                    _add_kv_table(d, _flatten(item))
+            else:
+                for x in parsed:
+                    d.add_paragraph(f"- {x}")
+        else:
+            d.add_paragraph("" if parsed is None else str(parsed))
+
+        _add_evidence(d, f)
+        d.add_paragraph("")
+
+    # Tables (merged + page)
+    d.add_paragraph("Tables", style="Heading 2")
+    tables = payload.get("tables", {}) or {}
+    for group_name in ["merged", "page"]:
+        group = tables.get(group_name) or []
+        if not group:
+            continue
+        d.add_paragraph(group_name.capitalize(), style="Heading 3")
+
+        for t in group:
+            # title/meta
+            d.add_paragraph(t.get("title") or f"Table {t.get('id','')}", style="Heading 4")
+            meta_bits = []
+            if t.get("source_page") is not None:
+                meta_bits.append(f"Page: {t.get('source_page')}")
+            if t.get("row_count") is not None:
+                meta_bits.append(f"Rows: {t.get('row_count')}")
+            if meta_bits:
+                d.add_paragraph(" | ".join(meta_bits))
+
+            cols = t.get("columns") or []
+            rows = t.get("rows") or []
+            # if rows_json stored as string, parse
+            if isinstance(rows, str):
+                try:
+                    rows = json.loads(rows)
+                except Exception:
+                    rows = []
+
+            if cols and isinstance(rows, list):
+                wtable = d.add_table(rows=1, cols=len(cols))
+                wtable.style = "Table Grid"
+                for j, c in enumerate(cols):
+                    wtable.rows[0].cells[j].text = str(c)
+                for r in rows:
+                    rr = wtable.add_row().cells
+                    for j, c in enumerate(cols):
+                        rr[j].text = "" if r.get(c) is None else str(r.get(c))
+            else:
+                d.add_paragraph("(No readable table content)")
+
+            d.add_paragraph("")
+
+    # 5) Return as download
+    buf = BytesIO()
+    d.save(buf)
+    buf.seek(0)
+
+    filename = f"report_{doc_id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.docx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+// api/documentsAPI.ts
+import axios from "axios";
+
+export async function downloadReport(docId: string) {
+  const res = await axios.get(`/documents/${docId}/report`, {
+    responseType: "blob",
+  });
+
+  const blob = new Blob([res.data], {
+    type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  });
+
+  const url = window.URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+
+  // try to read filename from header
+  const cd = res.headers["content-disposition"];
+  const match = cd?.match(/filename="(.+?)"/);
+  a.download = match?.[1] || `report_${docId}.docx`;
+
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.URL.revokeObjectURL(url);
+}
+
+
+const [isGeneratingReport, setIsGeneratingReport] = useState(false);
+
+const canGenerate =
+  !!selectedDocId &&
+  !!extractionRun &&
+  (extractionRun.status === "completed" || !!extractionRun.completed_at);
+
+async function onGenerateReport() {
+  if (!selectedDocId) return;
+  setIsGeneratingReport(true);
+  try {
+    await documentsAPI.downloadReport(selectedDocId);
+  } catch (e: any) {
+    console.error(e);
+    setExtractError(e?.response?.data?.detail || "Report download failed");
+  } finally {
+    setIsGeneratingReport(false);
+  }
+}
+
+
+for (const id of selectedDocIds) {
+  await documentsAPI.downloadReport(id);
+}
+
+
+
+
+
+
+
+
