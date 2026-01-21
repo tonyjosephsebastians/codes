@@ -1,0 +1,107 @@
+def safe_text(val) -> str:
+    """
+    Ensures Word-safe text.
+    Prevents corrupted XML.
+    """
+    if val is None:
+        return ""
+    if isinstance(val, (dict, list)):
+        return str(val)
+    text = str(val)
+    # Remove invalid XML characters
+    return re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", text)
+
+
+
+@router.get("/documents/{doc_id}/report")
+def generate_docx_report(
+    doc_id: str,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    # 1️⃣ Validate document
+    doc_obj = db.query(DocumentModel).filter(DocumentModel.id == doc_id).first()
+    if not doc_obj:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    # 2️⃣ Fetch latest extraction
+    run = _get_latest_completed_run(db=db, document_id=doc_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="No completed extraction found")
+
+    payload = run.payload or {}
+
+    # 3️⃣ Create DOCX
+    d = Document()
+
+    # ---- Title ----
+    title = d.add_heading("SOC 2 Analysis Report", level=1)
+    title.alignment = 1  # center
+
+    d.add_paragraph(f"Generated on: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+    d.add_paragraph("")
+
+    # ---- Fields ----
+    d.add_heading("Extracted Fields", level=2)
+
+    fields = payload.get("fields", {})
+    for field_name, field_value in fields.items():
+        d.add_heading(safe_text(field_name), level=3)
+        p = d.add_paragraph(safe_text(field_value))
+        p.paragraph_format.space_after = Pt(10)
+
+    # ---- Tables ----
+    tables = payload.get("tables", {}).get("merged", [])
+
+    if tables:
+        d.add_heading("Tables", level=2)
+
+    for table_block in tables:
+        rows = table_block.get("rows", [])
+        if not rows:
+            continue
+
+        table = d.add_table(rows=len(rows) + 1, cols=len(rows[0]))
+        table.style = "Table Grid"
+
+        # Header
+        for col_idx, header in enumerate(rows[0]):
+            table.rows[0].cells[col_idx].text = safe_text(header)
+
+        # Body
+        for r_idx, row in enumerate(rows[1:], start=1):
+            for c_idx, cell in enumerate(row):
+                table.rows[r_idx].cells[c_idx].text = safe_text(cell)
+
+        d.add_paragraph("")
+
+    # ---- Evidence ----
+    evidence = payload.get("evidence", [])
+    if evidence:
+        d.add_heading("Evidence & References", level=2)
+
+    for ev in evidence:
+        p = d.add_paragraph()
+        p.add_run(f"Page {ev.get('page', '-')}: ").bold = True
+        p.add_run(safe_text(ev.get("snippet", "")))
+
+    # 4️⃣ SAVE CORRECTLY (THIS IS THE KEY)
+    buf = BytesIO()
+    d.save(buf)
+    buf.seek(0)  # 🚨 ABSOLUTELY REQUIRED
+
+    doc_bytes = buf.read()
+    buf.close()
+
+    filename = f"report_{doc_id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.docx"
+
+    # 5️⃣ RETURN AS RAW BYTES (NO STREAMING)
+    return Response(
+        content=doc_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(doc_bytes)),
+        },
+    )
+
