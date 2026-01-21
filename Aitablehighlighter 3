@@ -1,0 +1,456 @@
+function tryParseJson(s: string): any | undefined {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return undefined;
+  }
+}
+
+function parseJsonLike(v: any): any | undefined {
+  if (v == null) return undefined;
+  if (typeof v !== "string") return v;
+
+  const t = v.trim();
+  const looksJson =
+    (t.startsWith("[") && t.endsWith("]")) || (t.startsWith("{") && t.endsWith("}"));
+
+  if (!looksJson) return undefined;
+
+  // 1) normal JSON
+  const parsed = tryParseJson(t);
+  if (parsed !== undefined) return parsed;
+
+  // 2) best-effort python-ish single quotes -> JSON
+  const fixed = t.replace(/'/g, '"');
+  return tryParseJson(fixed);
+}
+
+function isPlainObject(x: any): x is Record<string, any> {
+  return !!x && typeof x === "object" && !Array.isArray(x);
+}
+
+function isRecordArray(x: any): x is Array<Record<string, any>> {
+  return Array.isArray(x) && x.length > 0 && x.every((r) => isPlainObject(r));
+}
+
+
+type KVRow = { section: string; key: string; value: string };
+
+function stringifyCell(v: any): string {
+  if (v == null) return "";
+  if (typeof v === "string") return v;
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  return JSON.stringify(v);
+}
+
+// Root key = "section", next-level keys become rows.
+// If deeper nesting exists, we keep drilling and use dot-paths for the "key".
+function objectToVerticalRows(
+  obj: Record<string, any>,
+  opts?: { maxDepth?: number }
+): KVRow[] {
+  const maxDepth = opts?.maxDepth ?? 6;
+  const rows: KVRow[] = [];
+
+  const walk = (section: string, node: any, depth: number, prefix: string) => {
+    if (depth > maxDepth) {
+      rows.push({ section, key: prefix || "(value)", value: stringifyCell(node) });
+      return;
+    }
+
+    if (Array.isArray(node)) {
+      // Arrays: show as JSON (or you can expand if you want)
+      rows.push({ section, key: prefix || "(list)", value: stringifyCell(node) });
+      return;
+    }
+
+    if (!isPlainObject(node)) {
+      rows.push({ section, key: prefix || "(value)", value: stringifyCell(node) });
+      return;
+    }
+
+    const entries = Object.entries(node);
+    if (entries.length === 0) {
+      rows.push({ section, key: prefix || "(empty)", value: "" });
+      return;
+    }
+
+    for (const [k, v] of entries) {
+      const nextPrefix = prefix ? `${prefix}.${k}` : k;
+      if (isPlainObject(v)) {
+        walk(section, v, depth + 1, nextPrefix);
+      } else if (Array.isArray(v)) {
+        rows.push({ section, key: nextPrefix, value: stringifyCell(v) });
+      } else {
+        rows.push({ section, key: nextPrefix, value: stringifyCell(v) });
+      }
+    }
+  };
+
+  for (const [section, node] of Object.entries(obj)) {
+    // root is section; if root value is scalar, still show it
+    if (isPlainObject(node)) {
+      walk(section, node, 1, "");
+    } else {
+      rows.push({ section, key: "(value)", value: stringifyCell(node) });
+    }
+  }
+
+  return rows;
+}
+
+
+function VerticalKVTable({ rows }: { rows: KVRow[] }) {
+  return (
+    <div className="overflow-auto rounded-md border border-stone-200 bg-white">
+      <table className="w-full text-left text-sm">
+        <thead className="bg-stone-50 text-stone-700">
+          <tr>
+            <th className="px-3 py-2 w-56">Section</th>
+            <th className="px-3 py-2 w-56">Key</th>
+            <th className="px-3 py-2">Value</th>
+          </tr>
+        </thead>
+
+        <tbody className="divide-y divide-stone-200">
+          {rows.map((r, idx) => (
+            <tr key={idx} className="align-top">
+              <td className="px-3 py-2 font-medium text-stone-900 whitespace-nowrap">
+                {r.section}
+              </td>
+              <td className="px-3 py-2 text-stone-800 whitespace-nowrap">
+                {r.key}
+              </td>
+              <td className="px-3 py-2 text-stone-900 whitespace-pre-wrap">
+                {normalizeText(r.value)}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+const evSorted = [...(f.evidence ?? [])].sort((a, b) => {
+  const ap = typeof a.page === "number" ? a.page : Number.POSITIVE_INFINITY;
+  const bp = typeof b.page === "number" ? b.page : Number.POSITIVE_INFINITY;
+  return ap - bp;
+});
+
+const parsed = parseJsonLike(f.value);
+const isArray = Array.isArray(parsed);
+const isObj = isPlainObject(parsed);
+
+const multiArray = isArray ? (parsed as any[]) : null;          // array values
+const objValue = isObj ? (parsed as Record<string, any>) : null; // object values
+
+const multiIsRecordTable = isRecordArray(multiArray);
+
+
+
+{/* VALUE */}
+{multiArray && multiArray.length > 0 ? (
+  <>
+    {/* If array-of-records => vertical table */}
+    {multiIsRecordTable ? (
+      <div className="space-y-2">
+        <VerticalKVTable
+          rows={objectToVerticalRows(
+            // merge array records into sections like: "Item 1", "Item 2"
+            Object.fromEntries(
+              multiArray.map((rec, i) => [`Item ${i + 1}`, rec])
+            )
+          )}
+        />
+      </div>
+    ) : (
+      // array but not record-table => keep your existing multi item rendering
+      <div className="space-y-3">
+        {multiArray.map((item, i) => (
+          <div
+            key={`${f.id ?? "field"}_item_${i}`}
+            className="rounded-md border border-stone-200 bg-white p-3"
+          >
+            {renderMultiItem(item)}
+          </div>
+        ))}
+      </div>
+    )}
+
+    {/* Evidence shown AFTER the table/list (separate), keep jump/highlight */}
+    {evSorted.length ? (
+      <div className="mt-4 space-y-3">
+        <div className="text-xs font-semibold text-stone-700 flex items-center gap-1">
+          <Info className="h-3.5 w-3.5 text-emerald-700" />
+          Evidence
+        </div>
+
+        {evSorted.map((ev, eidx) => (
+          <button
+            key={ev.id ?? `${f.id}_ev_${eidx}`}
+            type="button"
+            onClick={() => {
+              const p = ev.page ?? f.page;
+              if (typeof p === "number" && p > 0) {
+                onHighlightEvidence?.({ page: p, phrases: [ev.snippet ?? ""] });
+                jump(p);
+              }
+            }}
+            className="w-full text-left rounded-md border border-stone-200 bg-white p-2 hover:border-emerald-200 hover:bg-emerald-50/30 transition"
+            title={typeof (ev.page ?? f.page) === "number" ? `Jump to page ${ev.page ?? f.page}` : undefined}
+          >
+            <div className="flex items-center gap-2 mb-1">
+              {typeof (ev.page ?? f.page) === "number" ? <Badge>Page {ev.page ?? f.page}</Badge> : null}
+              {ev.id ? <Badge>ID: {ev.id.slice(0, 8)}…</Badge> : null}
+            </div>
+
+            {ev.snippet ? (
+              <div className="text-sm text-stone-900 whitespace-pre-wrap leading-5">
+                {normalizeText(ev.snippet)}
+              </div>
+            ) : null}
+
+            {ev.page_markdown ? (
+              <details className="mt-2" onClick={(e) => e.stopPropagation()}>
+                <summary className="cursor-pointer text-xs text-emerald-700 hover:text-emerald-800 inline-flex items-center gap-1">
+                  <BookOpenText className="h-3.5 w-3.5" />
+                  References
+                </summary>
+                <div className="mt-2 text-xs whitespace-pre-wrap text-stone-700 bg-yellow-50 border border-stone-200 rounded-md p-2 overflow-auto leading-5">
+                  {normalizeText(ev.page_markdown)}
+                </div>
+              </details>
+            ) : null}
+          </button>
+        ))}
+      </div>
+    ) : null}
+  </>
+) : objValue ? (
+  <>
+    {/* Object (2D / nested) => vertical table */}
+    <VerticalKVTable rows={objectToVerticalRows(objValue)} />
+
+    {/* Evidence after */}
+    {evSorted.length ? (
+      <div className="mt-4 space-y-3">
+        <div className="text-xs font-semibold text-stone-700 flex items-center gap-1">
+          <Info className="h-3.5 w-3.5 text-emerald-700" />
+          Evidence
+        </div>
+
+        {evSorted.map((ev, eidx) => (
+          <button
+            key={ev.id ?? `${f.id}_ev_${eidx}`}
+            type="button"
+            onClick={() => {
+              const p = ev.page ?? f.page;
+              if (typeof p === "number" && p > 0) {
+                onHighlightEvidence?.({ page: p, phrases: [ev.snippet ?? ""] });
+                jump(p);
+              }
+            }}
+            className="w-full text-left rounded-md border border-stone-200 bg-white p-2 hover:border-emerald-200 hover:bg-emerald-50/30 transition"
+          >
+            <div className="flex items-center gap-2 mb-1">
+              {typeof (ev.page ?? f.page) === "number" ? <Badge>Page {ev.page ?? f.page}</Badge> : null}
+              {ev.id ? <Badge>ID: {ev.id.slice(0, 8)}…</Badge> : null}
+            </div>
+            {ev.snippet ? (
+              <div className="text-sm text-stone-900 whitespace-pre-wrap leading-5">
+                {normalizeText(ev.snippet)}
+              </div>
+            ) : null}
+          </button>
+        ))}
+      </div>
+    ) : null}
+  </>
+) : (
+  <>
+    {/* Single value: keep EXACTLY your existing single rendering */}
+    <div className="rounded-md border border-stone-200 bg-white p-2">
+      {typeof f.value === "string" ? (
+        <div className="text-sm text-stone-900 whitespace-pre-wrap leading-5">
+          <b>{normalizeText(f.value)}</b>
+        </div>
+      ) : (
+        <pre className="text-xs text-stone-700 whitespace-pre-wrap bg-stone-50 border border-stone-200 rounded-md p-2 overflow-auto">
+          <b>{prettyValue(f.value)}</b>
+        </pre>
+      )}
+    </div>
+
+    {/* Existing evidence list for single values */}
+    {evSorted.length ? (
+      <div className="mt-4 space-y-3">
+        <div className="text-xs font-semibold text-stone-700 flex items-center gap-1">
+          <Info className="h-3.5 w-3.5 text-emerald-700" />
+          Evidence
+        </div>
+
+        {evSorted.map((ev, eidx) => (
+          <button
+            key={ev.id ?? `${f.id}_ev_${eidx}`}
+            type="button"
+            onClick={() => {
+              const p = ev.page ?? f.page;
+              if (typeof p === "number" && p > 0) {
+                onHighlightEvidence?.({ page: p, phrases: [ev.snippet ?? ""] });
+                jump(p);
+              }
+            }}
+            className="w-full text-left rounded-md border border-stone-200 bg-white p-2 hover:border-emerald-200 hover:bg-emerald-50/30 transition"
+          >
+            <div className="flex items-center gap-2 mb-1">
+              {typeof (ev.page ?? f.page) === "number" ? <Badge>Page {ev.page ?? f.page}</Badge> : null}
+              {ev.id ? <Badge>ID: {ev.id.slice(0, 8)}…</Badge> : null}
+            </div>
+            {ev.snippet ? (
+              <div className="text-sm text-stone-900 whitespace-pre-wrap leading-5">
+                {normalizeText(ev.snippet)}
+              </div>
+            ) : null}
+          </button>
+        ))}
+      </div>
+    ) : null}
+  </>
+)}
+
+
+function isPlainObject(x: any): x is Record<string, any> {
+  return !!x && typeof x === "object" && !Array.isArray(x);
+}
+
+function stringifyCell(v: any): string {
+  if (v == null) return "";
+  if (typeof v === "string") return v;
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  return JSON.stringify(v);
+}
+
+type FlatRow = { key: string; value: string };
+
+function flattenObjectToRows(obj: Record<string, any>, maxDepth = 8): FlatRow[] {
+  const rows: FlatRow[] = [];
+
+  const walk = (node: any, prefix: string, depth: number) => {
+    if (depth > maxDepth) {
+      rows.push({ key: prefix || "(value)", value: stringifyCell(node) });
+      return;
+    }
+
+    if (Array.isArray(node)) {
+      rows.push({ key: prefix || "(list)", value: stringifyCell(node) });
+      return;
+    }
+
+    if (!isPlainObject(node)) {
+      rows.push({ key: prefix || "(value)", value: stringifyCell(node) });
+      return;
+    }
+
+    const entries = Object.entries(node);
+    if (!entries.length) {
+      rows.push({ key: prefix || "(empty)", value: "" });
+      return;
+    }
+
+    for (const [k, v] of entries) {
+      const next = prefix ? `${prefix}.${k}` : k;
+      walk(v, next, depth + 1);
+    }
+  };
+
+  walk(obj, "", 1);
+  return rows;
+}
+
+function InlineVerticalTable({ rows }: { rows: FlatRow[] }) {
+  return (
+    <div className="overflow-auto rounded-md border border-stone-200 bg-white">
+      <table className="w-full text-left text-sm">
+        <thead className="bg-stone-50 text-stone-700">
+          <tr>
+            <th className="px-3 py-2 w-72">Key</th>
+            <th className="px-3 py-2">Value</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-stone-200">
+          {rows.map((r, i) => (
+            <tr key={i} className="align-top">
+              <td className="px-3 py-2 font-medium text-stone-900 whitespace-nowrap">
+                {r.key}
+              </td>
+              <td className="px-3 py-2 text-stone-900 whitespace-pre-wrap">
+                {normalizeText(r.value)}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+
+function renderMultiItem(item: any) {
+  // Special formatting for security_organizations style objects
+  if (item && typeof item === "object" && !Array.isArray(item)) {
+    const name = item.name ?? item.title ?? item.label;
+    const type = item.type;
+    const resp = item.responsibility ?? item.description ?? item.details;
+
+    // If it looks like your "security org" structure, keep your existing UI
+    const looksLikeSecurityOrg = name || type || resp;
+
+    if (looksLikeSecurityOrg) {
+      return (
+        <div className="space-y-1">
+          <div className="flex items-center gap-2 min-w-0">
+            <div className="font-semibold text-stone-900 truncate">
+              {name ? normalizeText(String(name)) : "Item"}
+            </div>
+            {type ? (
+              <span className="text-xs px-2 py-0.5 rounded-full border border-stone-200 bg-white text-stone-600">
+                {normalizeText(String(type))}
+              </span>
+            ) : null}
+          </div>
+
+          {resp ? (
+            <div className="text-sm text-stone-700 whitespace-pre-wrap leading-5">
+              {normalizeText(String(resp))}
+            </div>
+          ) : (
+            <InlineVerticalTable rows={flattenObjectToRows(item, 8)} />
+          )}
+        </div>
+      );
+    }
+
+    // Generic deep object (2D/5D/etc) => vertical table instead of JSON blob
+    return <InlineVerticalTable rows={flattenObjectToRows(item, 8)} />;
+  }
+
+  // primitive / unknown
+  if (typeof item === "string") {
+    return (
+      <div className="text-sm text-stone-900 whitespace-pre-wrap leading-5">
+        {normalizeText(item)}
+      </div>
+    );
+  }
+
+  return (
+    <pre className="text-xs text-stone-700 whitespace-pre-wrap bg-stone-50 border border-stone-200 rounded-md p-2 overflow-auto">
+      {JSON.stringify(item, null, 2)}
+    </pre>
+  );
+}
+
+
+
+
