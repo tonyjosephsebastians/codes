@@ -1,0 +1,235 @@
+import re
+import json
+from io import BytesIO
+from datetime import datetime
+from fastapi import HTTPException, Depends
+from fastapi.responses import Response
+
+# Removes invalid XML 1.0 control chars (these break DOCX)
+_INVALID_XML_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
+
+def _clean_docx_text(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, bytes):
+        s = v.decode("utf-8", errors="replace")
+    else:
+        s = str(v)
+
+    # normalize line breaks + remove invalid controls
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = _INVALID_XML_RE.sub("", s)
+
+    # optional: trim super long runs if needed
+    return s
+
+
+
+def _safe_json_loads(v):
+    # Best case: backend already stores dict/list
+    if isinstance(v, (dict, list)):
+        return v
+    if not isinstance(v, str):
+        return v
+
+    t = v.strip()
+    if not ((t.startswith("{") and t.endswith("}")) or (t.startswith("[") and t.endswith("]"))):
+        return v
+    try:
+        return json.loads(t)
+    except Exception:
+        # IMPORTANT: do not naive-replace quotes here
+        return v
+
+def _safe_str(val) -> str:
+    return _clean_docx_text(val)
+
+def _safe_cell(val) -> str:
+    if isinstance(val, (dict, list)):
+        # dumps can include weird chars too, so clean it
+        return _clean_docx_text(json.dumps(val, ensure_ascii=False))
+    return _clean_docx_text(val)
+
+
+def _add_kv_table(doc, rows: list[tuple[str, str]]):
+    table = doc.add_table(rows=1, cols=2)
+    table.style = "Table Grid"
+
+    hdr = table.rows[0].cells
+    hdr[0].text = "Key"
+    hdr[1].text = "Value"
+
+    for k, v in rows:
+        r = table.add_row().cells
+        r[0].text = _safe_str(k)
+        r[1].text = _safe_str(v)
+
+
+def _add_evidence(doc, field):
+    ev = field.get("evidence") or []
+    if not ev:
+        return
+
+    doc.add_paragraph("Evidence", style="Heading 3")
+
+    ev_sorted = sorted(ev, key=lambda x: x.get("page") if isinstance(x.get("page"), int) else 10**9)
+    for e in ev_sorted:
+        p = doc.add_paragraph()
+        run = p.add_run(f"Page {e.get('page', '')} ")
+        run.bold = True
+
+        if e.get("id"):
+            p.add_run(f"ID: {_safe_str(e['id'])[:8]}… ")
+
+        if e.get("snippet"):
+            doc.add_paragraph(_safe_str(e["snippet"]))
+
+        # References / page_markdown
+        if e.get("page_markdown"):
+            refp = doc.add_paragraph("References:")
+            if refp.runs:
+                refp.runs[0].bold = True
+            doc.add_paragraph(_safe_str(e["page_markdown"]))
+
+
+@router.get("/documents/{doc_id}/report")
+def generate_docx_report(
+    doc_id: str,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    # 1) Find document
+    doc_obj = db.query(Document).filter(Document.id == doc_id).first()
+    if not doc_obj:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    # 2) Permissions
+    if current_user.role.value not in ["admin", "superuser"] and doc_obj.uploaded_by != current_user.username:
+        raise HTTPException(status_code=403, detail="Not authorized to access this document")
+
+    # 3) Latest completed run
+    run = _get_latest_completed_run(
+        db, document_id=doc_id, username=doc_obj.uploaded_by, standard="SOC2"
+    )
+    if not run:
+        raise HTTPException(status_code=404, detail="No completed extraction run found")
+
+    payload = _format_extraction_run_response(run)
+    if payload is None:
+        raise HTTPException(status_code=500, detail="Run serialization missing")
+
+    # 4) Build DOCX
+    d = DocxDocument()
+
+    title = d.add_paragraph()
+    title_run = title.add_run("Document Analysis Report")
+    title_run.bold = True
+    title_run.font.size = Pt(16)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    meta = payload.get("extraction_run", {}) or {}
+    d.add_paragraph(_safe_str(f"Document: {getattr(doc_obj, 'original_filename', '') or doc_id}"))
+    d.add_paragraph(_safe_str(f"Standard: {meta.get('standard', '')}"))
+    d.add_paragraph(_safe_str(f"Pipeline: {meta.get('pipeline_version', '')}"))
+    d.add_paragraph(_safe_str(f"Completed: {meta.get('completed_at', '')}"))
+    d.add_paragraph("")
+
+    # Fields
+    d.add_paragraph("Fields", style="Heading 2")
+    fields = payload.get("extracted_elements") or []
+    for f in fields:
+        field_name = _safe_str(f.get("field_name", "Field"))
+        d.add_paragraph(field_name, style="Heading 3")
+
+        info_line = []
+        if f.get("confidence") is not None:
+            info_line.append(f"Confidence: {f.get('confidence')}")
+        if f.get("page") is not None:
+            info_line.append(f"Page: {f.get('page')}")
+        if info_line:
+            d.add_paragraph(_safe_str(" | ".join(info_line)))
+
+        raw_val = f.get("value")
+        parsed = _safe_json_loads(raw_val)
+
+        # Render like your UI
+        if isinstance(parsed, dict):
+            rows = _flatten(parsed)  # your existing flatten returns list[(k,v)]
+            _add_kv_table(d, rows)
+
+        elif isinstance(parsed, list):
+            if parsed and all(isinstance(x, dict) for x in parsed):
+                for i, item in enumerate(parsed, start=1):
+                    d.add_paragraph(f"Item {i}", style="Heading 4")
+                    _add_kv_table(d, _flatten(item))
+            else:
+                for x in parsed:
+                    d.add_paragraph(_safe_str(f"- {x}"))
+        else:
+            d.add_paragraph(_safe_str("" if parsed is None else parsed))
+
+        _add_evidence(d, f)
+        d.add_paragraph("")
+
+    # Tables (merged + page)
+    d.add_paragraph("Tables", style="Heading 2")
+    tables = payload.get("tables", {}) or {}
+    for group_name in ["merged", "page"]:
+        group = tables.get(group_name) or []
+        if not group:
+            continue
+
+        d.add_paragraph(group_name.capitalize(), style="Heading 3")
+
+        for t in group:
+            d.add_paragraph(_safe_str(t.get("title") or f"Table {t.get('id','')}"), style="Heading 4")
+
+            meta_bits = []
+            if t.get("source_page") is not None:
+                meta_bits.append(f"Page: {t.get('source_page')}")
+            if t.get("row_count") is not None:
+                meta_bits.append(f"Rows: {t.get('row_count')}")
+            if meta_bits:
+                d.add_paragraph(_safe_str(" | ".join(meta_bits)))
+
+            cols = t.get("columns") or []
+            rows = t.get("rows") or []
+            if isinstance(rows, str):
+                try:
+                    rows = json.loads(rows)
+                except Exception:
+                    rows = []
+
+            if cols and isinstance(rows, list):
+                wtable = d.add_table(rows=1, cols=len(cols))
+                wtable.style = "Table Grid"
+
+                for j, c in enumerate(cols):
+                    wtable.rows[0].cells[j].text = _safe_str(c)
+
+                for r in rows:
+                    rr = wtable.add_row().cells
+                    for j, c in enumerate(cols):
+                        rr[j].text = _safe_cell((r or {}).get(c))
+            else:
+                d.add_paragraph(_safe_str("(No readable table content)"))
+
+            d.add_paragraph("")
+
+    # 5) Return bytes safely
+    buf = BytesIO()
+    d.save(buf)
+    docx_bytes = buf.getvalue()
+
+    filename = f"report_{doc_id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.docx"
+    return Response(
+        content=docx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+
+
+
+
