@@ -282,6 +282,32 @@ for (const id of selectedDocIds) {
 }
 
 
+<button
+  onClick={canGenerate ? onGenerateReport : runExtraction}
+  disabled={!selectedDocId || docLoading || isExtracting || isGeneratingReport}
+  className={cn(
+    "px-3 py-2 rounded-lg text-sm font-medium transition-colors flex items-center gap-2",
+    !selectedDocId || docLoading || isExtracting || isGeneratingReport
+      ? "bg-stone-200 text-stone-500 cursor-not-allowed"
+      : "bg-emerald-600 text-white hover:bg-emerald-700"
+  )}
+  title={!selectedDocId ? "Select a document first" : canGenerate ? "Generate report" : "Run extraction"}
+>
+  {isExtracting || isGeneratingReport ? (
+    <>
+      <Loader2 className="w-4 h-4 animate-spin" />
+      {isExtracting ? "Analyzing..." : "Generating..."}
+    </>
+  ) : (
+    <>
+      <Target className="w-4 h-4" />
+      {canGenerate ? "Generate report" : "AI Analyze"}
+    </>
+  )}
+</button>
+
+
+
 
 
 
