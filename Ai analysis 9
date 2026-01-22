@@ -1,0 +1,596 @@
+from __future__ import annotations
+
+import json
+import re
+import tempfile
+import ast
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse
+from docx import Document as DocxDocument
+from docx.shared import Inches, Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.section import WD_ORIENT
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+
+try:
+    from zoneinfo import ZoneInfo  # py3.9+
+except Exception:
+    ZoneInfo = None  # type: ignore
+
+router = APIRouter()
+
+# ---------------------------- text utils -----------------------------
+
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+
+
+def try_parse_json_or_python_literal(s: str) -> Optional[Any]:
+    """
+    Supports:
+      - Proper JSON: {"a": 1} / ["x"]
+      - Python-literal dict/list strings: {'a': 1} / [{'x': 'y'}]
+    """
+    s = (s or "").strip()
+    if not s:
+        return None
+
+    # 1) JSON
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+
+    # 2) Python literal
+    try:
+        # ast.literal_eval safely parses dict/list/str/int/etc. from Python literal syntax
+        return ast.literal_eval(s)
+    except Exception:
+        return None
+
+
+def safe_text(value: Any) -> str:
+    """
+    Convert ANY python value to a safe string for python-docx.
+    - Removes illegal control chars
+    - Pretty prints dict/list
+    - Attempts to parse JSON/Python-literal string values and pretty print
+    """
+    if value is None:
+        return ""
+
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            value = value.decode("utf-8", errors="replace")
+        except Exception:
+            value = str(value)
+
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return ""
+        # parse JSON OR python-literal dict/list string
+        if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
+            parsed = try_parse_json_or_python_literal(s)
+            if parsed is not None:
+                return safe_text(parsed)
+        return _CONTROL_CHARS.sub("", s)
+
+    if isinstance(value, (dict, list, tuple)):
+        try:
+            return _CONTROL_CHARS.sub("", json.dumps(value, ensure_ascii=False, indent=2))
+        except Exception:
+            return _CONTROL_CHARS.sub("", str(value))
+
+    return _CONTROL_CHARS.sub("", str(value))
+
+
+def shorten(v: Any, max_len: int = 2000) -> str:
+    t = safe_text(v)
+    if len(t) <= max_len:
+        return t
+    return t[: max_len - 3] + "..."
+
+
+def normalize_value(value: Any) -> Any:
+    """
+    If value is a JSON-string or Python-literal dict/list string, parse it.
+    Otherwise return as-is.
+    """
+    if isinstance(value, str):
+        s = value.strip()
+        if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
+            parsed = try_parse_json_or_python_literal(s)
+            if parsed is not None:
+                return parsed
+    return value
+
+
+# -------------------------- docx helpers ----------------------------
+
+def set_doc_margins(doc: DocxDocument, inches: float = 1.0) -> None:
+    for section in doc.sections:
+        section.top_margin = Inches(inches)
+        section.bottom_margin = Inches(inches)
+        section.left_margin = Inches(inches)
+        section.right_margin = Inches(inches)
+
+
+def add_title(doc: DocxDocument, title: str, subtitle: str = "") -> None:
+    p = doc.add_paragraph()
+    run = p.add_run(title)
+    run.bold = True
+    run.font.size = Pt(18)
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    if subtitle:
+        p2 = doc.add_paragraph()
+        r2 = p2.add_run(subtitle)
+        r2.font.size = Pt(10)
+        p2.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    doc.add_paragraph()
+
+
+def add_heading(doc: DocxDocument, text: str, level: int = 1) -> None:
+    doc.add_heading(safe_text(text) if text else " ", level=level)
+
+
+def add_kv_table(doc: DocxDocument, rows: Sequence[Tuple[str, Any]]) -> None:
+    table = doc.add_table(rows=len(rows), cols=2)
+    table.style = "Table Grid"
+    for i, (k, v) in enumerate(rows):
+        table.cell(i, 0).text = safe_text(k)
+        table.cell(i, 1).text = safe_text(v)
+
+
+def _set_cell_shading(cell, fill: str) -> None:
+    tcPr = cell._tc.get_or_add_tcPr()
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), fill)
+    tcPr.append(shd)
+
+
+def _clear_cell(cell) -> None:
+    for p in list(cell.paragraphs):
+        try:
+            p._p.getparent().remove(p._p)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    if not cell.paragraphs:
+        cell.add_paragraph("")
+
+
+def _add_cell_lines(cell, lines: List[Tuple[str, Dict[str, bool]]], *, default_italic: bool = False) -> None:
+    _clear_cell(cell)
+    for idx, (txt, flags) in enumerate(lines):
+        p = cell.paragraphs[0] if idx == 0 else cell.add_paragraph()
+        run = p.add_run(safe_text(txt))
+        run.bold = bool(flags.get("bold", False))
+        run.italic = bool(flags.get("italic", default_italic))
+
+
+def _cell_set_label(cell, label: str) -> None:
+    _add_cell_lines(cell, [(label, {"bold": False, "italic": False})])
+
+
+def _cell_set_bold_value(cell, value_text: str) -> None:
+    _add_cell_lines(cell, [(value_text, {"bold": True, "italic": False})])
+
+
+def _format_evidence_lines(evidence_list: List[Dict[str, Any]]) -> List[Tuple[str, Dict[str, bool]]]:
+    lines: List[Tuple[str, Dict[str, bool]]] = []
+    if not evidence_list:
+        lines.append(("(none)", {"italic": True, "bold": False}))
+        return lines
+
+    for ev in evidence_list:
+        page = ev.get("page")
+        snippet = ev.get("snippet") or ""
+        page_md = ev.get("page_markdown") or ""
+
+        if page is not None:
+            lines.append((f"Page: {safe_text(page)}", {"italic": True, "bold": False}))
+
+        if snippet:
+            lines.append((f"“{shorten(snippet, max_len=8000)}”", {"italic": True, "bold": False}))
+
+        if page_md:
+            lines.append(("Page (markdown extract):", {"italic": True, "bold": False}))
+            lines.append((shorten(page_md, max_len=8000), {"italic": True, "bold": False}))
+
+        lines.append(("", {"italic": True, "bold": False}))
+
+    while lines and lines[-1][0] == "":
+        lines.pop()
+
+    return lines
+
+
+def _evidence_pages(evidence_list: List[Dict[str, Any]]) -> List[int]:
+    pages: List[int] = []
+    for ev in evidence_list or []:
+        p = ev.get("page")
+        if isinstance(p, int):
+            pages.append(p)
+        else:
+            try:
+                pages.append(int(str(p)))
+            except Exception:
+                pass
+    seen = set()
+    out: List[int] = []
+    for p in pages:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def _now_et_str() -> str:
+    if ZoneInfo is not None:
+        try:
+            dt = datetime.now(ZoneInfo("America/Toronto"))
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ------------------- Value rendering (UI-like) -----------------------
+
+def _dict_to_ui_bullet_lines(d: Dict[str, Any], indent: int = 0) -> List[str]:
+    lines: List[str] = []
+    prefix = "  " * indent
+    for k, v in d.items():
+        v_norm = normalize_value(v)
+        if v_norm is None or safe_text(v_norm) == "":
+            continue
+
+        if isinstance(v_norm, dict):
+            lines.append(f"{prefix}• {safe_text(k)}:")
+            lines.extend(_dict_to_ui_bullet_lines(v_norm, indent=indent + 1))
+        elif isinstance(v_norm, list):
+            lines.append(f"{prefix}• {safe_text(k)}:")
+            for item in v_norm:
+                item_norm = normalize_value(item)
+                if isinstance(item_norm, dict):
+                    lines.append(f"{prefix}  • (item)")
+                    lines.extend(_dict_to_ui_bullet_lines(item_norm, indent=indent + 2))
+                else:
+                    lines.append(f"{prefix}  • {safe_text(item_norm)}")
+        else:
+            lines.append(f"{prefix}• {safe_text(k)}: {safe_text(v_norm)}")
+
+    return lines if lines else [f"{'  '*indent}• (empty)"]
+
+
+def add_value_evidence_reference_table_single(doc: DocxDocument, *, value: Any, evidence_list: List[Dict[str, Any]]) -> None:
+    table = doc.add_table(rows=3, cols=2)
+    table.style = "Table Grid"
+
+    _cell_set_label(table.cell(0, 0), "Value")
+    _cell_set_label(table.cell(1, 0), "Evidence")
+    _cell_set_label(table.cell(2, 0), "Reference")
+
+    v_norm = normalize_value(value)
+
+    if isinstance(v_norm, dict):
+        bullet_lines = _dict_to_ui_bullet_lines(v_norm)
+        _add_cell_lines(table.cell(0, 1), [(ln, {"bold": False, "italic": False}) for ln in bullet_lines])
+    else:
+        _cell_set_bold_value(table.cell(0, 1), safe_text(v_norm))
+
+    _add_cell_lines(table.cell(1, 1), _format_evidence_lines(evidence_list), default_italic=True)
+
+    pages = _evidence_pages(evidence_list)
+    table.cell(2, 1).text = ", ".join(str(p) for p in pages) if pages else ""
+    doc.add_paragraph()
+
+
+def add_value_evidence_reference_table_multi_dict(
+    doc: DocxDocument,
+    *,
+    value_dict: Dict[str, Any],
+    evidence_list: List[Dict[str, Any]],
+) -> None:
+    """
+    Dict fields:
+      Section | Value | Evidence | Reference
+    """
+    keys = list(value_dict.keys())
+
+    table = doc.add_table(rows=1, cols=4)
+    table.style = "Table Grid"
+    hdr = table.rows[0].cells
+    hdr[0].text = "Section"
+    hdr[1].text = "Value"
+    hdr[2].text = "Evidence"
+    hdr[3].text = "Reference"
+    for c in hdr:
+        _set_cell_shading(c, "EFEFEF")
+
+    def pick_ev(idx: int) -> List[Dict[str, Any]]:
+        if not evidence_list:
+            return []
+        if len(evidence_list) == len(keys):
+            return [evidence_list[idx]]
+        if len(evidence_list) == 1:
+            return [evidence_list[0]]
+        if idx == 0:
+            return [evidence_list[0]]
+        return []
+
+    for idx, k in enumerate(keys):
+        v = normalize_value(value_dict.get(k))
+        row_cells = table.add_row().cells
+        row_cells[0].text = safe_text(k)
+
+        if isinstance(v, dict):
+            bullet_lines = _dict_to_ui_bullet_lines(v)
+            _add_cell_lines(row_cells[1], [(ln, {"bold": False, "italic": False}) for ln in bullet_lines])
+        elif isinstance(v, list):
+            lines: List[str] = []
+            for it in v:
+                itn = normalize_value(it)
+                if isinstance(itn, dict):
+                    lines.append("• (item)")
+                    lines.extend(["  " + ln for ln in _dict_to_ui_bullet_lines(itn, indent=0)])
+                else:
+                    lines.append(f"• {safe_text(itn)}")
+            _add_cell_lines(row_cells[1], [(ln, {"bold": False, "italic": False}) for ln in (lines or ["• (empty)"])])
+        else:
+            _cell_set_bold_value(row_cells[1], safe_text(v))
+
+        ev_for_row = pick_ev(idx)
+        _add_cell_lines(row_cells[2], _format_evidence_lines(ev_for_row), default_italic=True)
+
+        pages = _evidence_pages(ev_for_row)
+        row_cells[3].text = ", ".join(str(p) for p in pages) if pages else ""
+
+    doc.add_paragraph()
+
+
+# -------------------------- table extraction -------------------------
+
+def add_table_matrix(
+    doc: DocxDocument,
+    columns: List[str],
+    rows: List[List[Any]],
+    title: str = "",
+    force_landscape_if_wide: bool = True,
+    landscape_threshold_cols: int = 7,
+) -> None:
+    columns = [safe_text(c) for c in (columns or [])]
+    rows = rows or []
+
+    if title:
+        add_heading(doc, title, level=2)
+
+    if not columns and rows:
+        max_len = max((len(r) for r in rows), default=0)
+        columns = [f"Column {i+1}" for i in range(max_len)]
+
+    if force_landscape_if_wide and len(columns) >= landscape_threshold_cols:
+        section = doc.add_section()
+        section.orientation = WD_ORIENT.LANDSCAPE
+        new_width, new_height = section.page_height, section.page_width
+        section.page_width = new_width
+        section.page_height = new_height
+
+    table = doc.add_table(rows=1, cols=max(1, len(columns)))
+    table.style = "Table Grid"
+
+    hdr = table.rows[0].cells
+    for j, col in enumerate(columns):
+        hdr[j].text = safe_text(col)
+        _set_cell_shading(hdr[j], "EFEFEF")
+
+    for r in rows:
+        row_cells = table.add_row().cells
+        for j in range(len(columns)):
+            val = r[j] if j < len(r) else ""
+            row_cells[j].text = shorten(val, max_len=5000)
+
+    doc.add_paragraph()
+
+
+def extract_table_rows_any_shape(table_obj: Dict[str, Any]) -> Tuple[List[str], List[List[Any]]]:
+    cols = table_obj.get("columns") or []
+    rows_matrix: List[List[Any]] = []
+
+    rows = table_obj.get("rows")
+    if isinstance(rows, list) and rows and isinstance(rows[0], dict) and "cells" in rows[0]:
+        for r in rows:
+            cells = r.get("cells") or []
+            rows_matrix.append(list(cells))
+        return cols, rows_matrix
+
+    rows_json = table_obj.get("rows_json")
+    if isinstance(rows_json, list) and rows_json:
+        if isinstance(rows_json[0], dict):
+            if not cols:
+                cols = list(rows_json[0].keys())
+            for r in rows_json:
+                rows_matrix.append([r.get(c, "") for c in cols])
+            return cols, rows_matrix
+
+        if isinstance(rows_json[0], list):
+            rows_matrix = rows_json
+            return cols, rows_matrix
+
+    return cols, rows_matrix
+
+
+# ----------------------- main report builder -------------------------
+
+def build_docx_report(payload: Dict[str, Any], document_title: str = "") -> DocxDocument:
+    doc = DocxDocument()
+    set_doc_margins(doc, inches=1.0)
+
+    run_meta = payload.get("extraction_run") or {}
+    std = safe_text(run_meta.get("standard", "")) or "SOC2"
+    pipeline = safe_text(run_meta.get("pipeline_version", ""))
+    run_id = safe_text(run_meta.get("id", ""))
+    doc_id = safe_text(run_meta.get("document_id", ""))
+    status = safe_text(run_meta.get("status", ""))
+    created_at = safe_text(run_meta.get("created_at", ""))
+    completed_at = safe_text(run_meta.get("completed_at", ""))
+
+    add_title(doc, "SOC2 Document Report", subtitle=document_title or (f"Document ID: {doc_id}" if doc_id else ""))
+
+    add_heading(doc, "Metadata", level=1)
+    add_kv_table(doc, [
+        ("Document ID", doc_id),
+        ("Extraction Run ID", run_id),
+        ("Standard", std),
+        ("Pipeline Version", pipeline),
+        ("Status", status),
+        ("Created At", created_at),
+        ("Completed At", completed_at),
+        ("Generated At (ET)", _now_et_str()),
+    ])
+    doc.add_paragraph()
+
+    add_heading(doc, "Extracted Fields", level=1)
+    elements = payload.get("extracted_elements") or []
+    if not elements:
+        doc.add_paragraph("No extracted fields found.")
+    else:
+        for el in elements:
+            field_key = safe_text(el.get("field_key") or el.get("field_name") or "Field")
+            raw_value = el.get("value")
+            value_norm = normalize_value(raw_value)
+
+            evidence_list = el.get("evidence") or []
+            if not isinstance(evidence_list, list):
+                evidence_list = []
+
+            add_heading(doc, field_key, level=2)
+
+            # ✅ This will now work even when value is "{'a': 1}" (python-literal string)
+            if isinstance(value_norm, dict) and value_norm:
+                add_value_evidence_reference_table_multi_dict(
+                    doc,
+                    value_dict=value_norm,
+                    evidence_list=evidence_list,
+                )
+            else:
+                add_value_evidence_reference_table_single(
+                    doc,
+                    value=value_norm,
+                    evidence_list=evidence_list,
+                )
+
+    add_heading(doc, "Tables", level=1)
+    tables_obj = payload.get("tables") or {}
+    merged_tables = tables_obj.get("merged") or []
+    page_tables = tables_obj.get("page") or []
+
+    if not merged_tables and not page_tables:
+        doc.add_paragraph("No tables found.")
+        return doc
+
+    def emit_tables(group_name: str, tables_list: List[Dict[str, Any]]) -> None:
+        if not tables_list:
+            return
+        add_heading(doc, group_name, level=2)
+
+        for i, t in enumerate(tables_list, start=1):
+            t_title = safe_text(t.get("title")) or f"{group_name} Table {i}"
+            t_id = safe_text(t.get("id", ""))
+            src_page = t.get("source_page", None)
+            row_count = t.get("row_count", None)
+            has_unreadable = t.get("has_unreadable", None)
+
+            doc.add_paragraph()
+            add_heading(doc, t_title, level=3)
+
+            meta_bits = []
+            if t_id:
+                meta_bits.append(f"id={t_id}")
+            if src_page is not None:
+                meta_bits.append(f"source_page={src_page}")
+            if row_count is not None:
+                meta_bits.append(f"rows={row_count}")
+            if has_unreadable is not None:
+                meta_bits.append(f"has_unreadable={has_unreadable}")
+            if meta_bits:
+                doc.add_paragraph(" | ".join(meta_bits))
+
+            cols, rows_matrix = extract_table_rows_any_shape(t)
+            if not cols and not rows_matrix:
+                doc.add_paragraph("(empty table)")
+                continue
+
+            add_table_matrix(
+                doc,
+                columns=cols,
+                rows=rows_matrix,
+                title="",
+                force_landscape_if_wide=True,
+                landscape_threshold_cols=7,
+            )
+
+    emit_tables("Merged Tables", merged_tables)
+    emit_tables("Page Tables", page_tables)
+
+    return doc
+
+
+def cleanup_file(path: str) -> None:
+    try:
+        import os
+        os.remove(path)
+    except Exception:
+        pass
+
+
+@router.get("/{doc_id}/report")
+def generate_docx_report(
+    doc_id: str,
+    background_tasks: BackgroundTasks,
+    db=Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    doc_obj = db.query(Document).filter(Document.id == doc_id).first()
+    if not doc_obj:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    latest = _get_latest_completed_run(
+        db=db,
+        document_id=doc_id,
+        username=current_user.username,
+        standard="SOC2",
+    )
+    if not latest:
+        raise HTTPException(status_code=404, detail="No completed extraction run found for this document")
+
+    payload = _format_extraction_run_response(latest)
+
+    original_name = safe_text(getattr(doc_obj, "original_filename", "")) or safe_text(getattr(doc_obj, "filename", "")) or doc_id
+    report_doc = build_docx_report(payload, document_title=original_name)
+
+    safe_base = re.sub(r"[^A-Za-z0-9._-]+", "_", original_name)[:80]
+    filename = f"{safe_base}_SOC2_report_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.docx"
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".docx")
+    tmp_path = tmp.name
+    tmp.close()
+
+    report_doc.save(tmp_path)
+    background_tasks.add_task(cleanup_file, tmp_path)
+
+    return FileResponse(
+        tmp_path,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        filename=filename,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
