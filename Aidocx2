@@ -1,0 +1,528 @@
+# soc2_docx_report.py
+# Complete single-file backend implementation for DOCX report generation.
+#
+# Updates requested:
+# ✅ Field name as Heading
+# ✅ Under it:
+#    - **Value:** <value>   (both label and scalar value in bold)
+#    - **Evidence:** quoted (docx "Quote" style)
+# ✅ Evidence includes snippet + page (+ optional page_markdown)
+# ✅ Multi-value (list/dict/JSON-ish) -> render as a table
+#    - Evidence shown in the NEXT column aligned row-by-row (by index)
+#      (if evidence count != rows, falls back to first evidence for all rows)
+# ✅ Title: "Soc2 Document Report"
+# ✅ Metadata "Generated At (EST)" using America/Toronto time zone
+# ✅ Remove Extracted Fields "Summary" table
+# ✅ Table extraction section unchanged (renders merged + page tables)
+
+from __future__ import annotations
+
+import ast
+import json
+import re
+import tempfile
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+from docx import Document as DocxDocument
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.shared import Inches
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
+from zoneinfo import ZoneInfo
+
+router = APIRouter()
+
+TORONTO_TZ = ZoneInfo("America/Toronto")  # EST/EDT depending on date
+
+
+# -----------------------------
+# Helpers: safe text + parsing
+# -----------------------------
+def safe_text(v: Any) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, (int, float, bool)):
+        return str(v)
+    if isinstance(v, str):
+        return v
+    try:
+        return json.dumps(v, ensure_ascii=False, indent=2)
+    except Exception:
+        return str(v)
+
+
+_JSONISH_FIX_SINGLE_QUOTES = re.compile(r"(?<!\\)'")  # crude but useful
+
+
+def try_parse_jsonish(value: Any) -> Any:
+    """
+    Parses:
+      - dict/list already
+      - JSON string
+      - python-literal string with single quotes (e.g. "[{'a':1}]")
+    """
+    if value is None:
+        return None
+    if isinstance(value, (dict, list)):
+        return value
+    if not isinstance(value, str):
+        return value
+
+    s = value.strip()
+    if not s:
+        return ""
+
+    if not (s.startswith("{") or s.startswith("[")):
+        return value
+
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+
+    try:
+        return ast.literal_eval(s)
+    except Exception:
+        pass
+
+    try:
+        s2 = _JSONISH_FIX_SINGLE_QUOTES.sub('"', s)
+        return json.loads(s2)
+    except Exception:
+        return value
+
+
+def flatten_dict(d: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in (d or {}).items():
+        key = f"{prefix}{k}" if not prefix else f"{prefix}.{k}"
+        if isinstance(v, dict):
+            out.update(flatten_dict(v, key))
+        else:
+            out[key] = v
+    return out
+
+
+# -----------------------------
+# DOCX formatting primitives
+# -----------------------------
+def add_title(doc: DocxDocument, title: str, subtitle: str = "") -> None:
+    p = doc.add_paragraph()
+    r = p.add_run(title)
+    r.bold = True
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    if subtitle:
+        p2 = doc.add_paragraph()
+        r2 = p2.add_run(subtitle)
+        r2.italic = True
+        p2.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    doc.add_paragraph()
+
+
+def add_kv_table(doc: DocxDocument, rows: List[Tuple[str, str]], title: str = "") -> None:
+    if title:
+        doc.add_heading(title, level=2)
+    table = doc.add_table(rows=1, cols=2)
+    hdr = table.rows[0].cells
+    hdr[0].text = "Key"
+    hdr[1].text = "Value"
+    for k, v in rows:
+        row = table.add_row().cells
+        row[0].text = safe_text(k)
+        row[1].text = safe_text(v)
+
+
+def add_table_from_cells(doc: DocxDocument, columns: List[str], rows: List[Any], title: str = "") -> None:
+    """
+    Keeps your table extraction behavior unchanged:
+    - columns: list[str]
+    - rows: list[{"cells":[...]}] or list[list]
+    """
+    if title:
+        doc.add_heading(title, level=2)
+
+    if not columns:
+        doc.add_paragraph("No columns.")
+        return
+
+    table = doc.add_table(rows=1, cols=len(columns))
+    hdr = table.rows[0].cells
+    for i, c in enumerate(columns):
+        hdr[i].text = safe_text(c)
+
+    for r in rows or []:
+        if isinstance(r, dict) and "cells" in r:
+            cells = r.get("cells") or []
+        else:
+            cells = r or []
+
+        row_cells = table.add_row().cells
+        for i in range(len(columns)):
+            row_cells[i].text = safe_text(cells[i] if i < len(cells) else "")
+
+
+def format_dt_est(dt_value: Any) -> str:
+    """
+    Accepts ISO string or datetime or None.
+    If naive datetime, assume UTC.
+    Outputs Toronto time formatted.
+    """
+    if not dt_value:
+        return ""
+
+    dt: Optional[datetime] = None
+    if isinstance(dt_value, datetime):
+        dt = dt_value
+    elif isinstance(dt_value, str):
+        s = dt_value.strip()
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except Exception:
+            return s
+    else:
+        return safe_text(dt_value)
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+
+    return dt.astimezone(TORONTO_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def add_bold_label_and_value_paragraph(doc: DocxDocument, label: str, value: str) -> None:
+    """
+    Adds: **Label:** **value**
+    """
+    p = doc.add_paragraph()
+    r1 = p.add_run(f"{label}: ")
+    r1.bold = True
+    r2 = p.add_run(value if value.strip() else "—")
+    r2.bold = True
+
+
+def evidence_to_text(ev: Dict[str, Any]) -> str:
+    """
+    Build readable evidence block text.
+    """
+    page = ev.get("page")
+    snippet = ev.get("snippet") or ""
+    page_md = ev.get("page_markdown") or ""
+
+    parts: List[str] = []
+    if page is not None:
+        parts.append(f"Page: {page}")
+    if snippet:
+        parts.append("Snippet:")
+        parts.append(safe_text(snippet))
+    if page_md:
+        parts.append("Page (markdown extract):")
+        parts.append(safe_text(page_md))
+    return "\n".join(parts).strip()
+
+
+def add_evidence_block(doc: DocxDocument, evidence: List[Dict[str, Any]]) -> None:
+    """
+    Adds:
+      **Evidence:** (label bold on its own line)
+      then quoted paragraphs for each evidence item.
+    """
+    # label line
+    p = doc.add_paragraph()
+    r = p.add_run("Evidence:")
+    r.bold = True
+
+    if not evidence:
+        qp = doc.add_paragraph("—", style="Quote")
+        return
+
+    for idx, ev in enumerate(evidence, start=1):
+        txt = evidence_to_text(ev)
+        if not txt:
+            txt = "—"
+        # One quote block per evidence item
+        q = doc.add_paragraph(f"Evidence {idx}\n{txt}", style="Quote")
+        # keep as quote, no need extra formatting
+
+
+# -----------------------------
+# Multi-value -> table (with evidence aligned)
+# -----------------------------
+def build_evidence_column_for_rows(
+    evidence: List[Dict[str, Any]],
+    row_count: int,
+) -> List[str]:
+    """
+    Align evidence to rows by index if possible.
+    If counts mismatch, use first evidence for all rows.
+    """
+    if row_count <= 0:
+        return []
+
+    if not evidence:
+        return [""] * row_count
+
+    if len(evidence) == row_count:
+        return [evidence_to_text(e) for e in evidence]
+
+    # fallback: replicate first evidence
+    first = evidence_to_text(evidence[0])
+    return [first] * row_count
+
+
+def add_list_of_dicts_table_with_evidence(
+    doc: DocxDocument,
+    items: List[Dict[str, Any]],
+    evidence: List[Dict[str, Any]],
+) -> None:
+    flat_items = [flatten_dict(i or {}) for i in items]
+    # union columns in stable order
+    cols: List[str] = []
+    seen = set()
+    for it in flat_items:
+        for k in it.keys():
+            if k not in seen:
+                seen.add(k)
+                cols.append(k)
+
+    # add Evidence column
+    cols_plus = cols + ["Evidence"]
+
+    table = doc.add_table(rows=1, cols=len(cols_plus))
+    hdr = table.rows[0].cells
+    for j, c in enumerate(cols_plus):
+        hdr[j].text = safe_text(c)
+
+    ev_col = build_evidence_column_for_rows(evidence, len(flat_items))
+
+    for idx, it in enumerate(flat_items):
+        row_cells = table.add_row().cells
+        for j, c in enumerate(cols):
+            row_cells[j].text = safe_text(it.get(c, ""))
+        row_cells[len(cols)].text = safe_text(ev_col[idx])
+
+
+def add_list_of_values_table_with_evidence(
+    doc: DocxDocument,
+    values: List[Any],
+    evidence: List[Dict[str, Any]],
+) -> None:
+    table = doc.add_table(rows=1, cols=2)
+    hdr = table.rows[0].cells
+    hdr[0].text = "Value"
+    hdr[1].text = "Evidence"
+
+    ev_col = build_evidence_column_for_rows(evidence, len(values))
+    for i, v in enumerate(values):
+        row = table.add_row().cells
+        row[0].text = safe_text(v)
+        row[1].text = safe_text(ev_col[i])
+
+
+def add_dict_table_with_evidence(
+    doc: DocxDocument,
+    d: Dict[str, Any],
+    evidence: List[Dict[str, Any]],
+) -> None:
+    flat = flatten_dict(d)
+    table = doc.add_table(rows=1, cols=3)
+    hdr = table.rows[0].cells
+    hdr[0].text = "Key"
+    hdr[1].text = "Value"
+    hdr[2].text = "Evidence"
+
+    # replicate first evidence for all keys (unless evidence empty)
+    ev_text = evidence_to_text(evidence[0]) if evidence else ""
+
+    for k in sorted(flat.keys()):
+        row = table.add_row().cells
+        row[0].text = safe_text(k)
+        row[1].text = safe_text(flat[k])
+        row[2].text = safe_text(ev_text)
+
+
+def add_value_and_evidence(
+    doc: DocxDocument,
+    value: Any,
+    evidence: List[Dict[str, Any]],
+) -> None:
+    """
+    Rule:
+    - Scalar: show **Value:** **...** then **Evidence:** quoted blocks
+    - Multi (list/dict/jsonish): show table with Evidence as next column aligned,
+      and still also show Evidence quote blocks below (keeps full evidence readable).
+    """
+    parsed = try_parse_jsonish(value)
+
+    # Multi: dict
+    if isinstance(parsed, dict):
+        # render table with evidence col
+        add_dict_table_with_evidence(doc, parsed, evidence)
+        doc.add_paragraph()
+        add_evidence_block(doc, evidence)
+        return
+
+    # Multi: list
+    if isinstance(parsed, list):
+        if all(isinstance(x, dict) for x in parsed):
+            add_list_of_dicts_table_with_evidence(doc, parsed, evidence)
+            doc.add_paragraph()
+            add_evidence_block(doc, evidence)
+            return
+
+        # list of primitives -> table Value/Evidence aligned by index
+        add_list_of_values_table_with_evidence(doc, parsed, evidence)
+        doc.add_paragraph()
+        add_evidence_block(doc, evidence)
+        return
+
+    # Scalar
+    add_bold_label_and_value_paragraph(doc, "Value", safe_text(parsed))
+    add_evidence_block(doc, evidence)
+
+
+# -----------------------------
+# Main DOCX builder
+# -----------------------------
+def build_soc2_docx_report(payload: Dict[str, Any], original_filename: str = "") -> DocxDocument:
+    """
+    payload is your _format_extraction_run_response(...) output:
+    {
+      "extracted_elements": [...],
+      "tables": {"merged":[...], "page":[...]},
+      "extraction_run": {...}
+    }
+    """
+    doc = DocxDocument()
+
+    # margins
+    for section in doc.sections:
+        section.top_margin = Inches(1)
+        section.bottom_margin = Inches(1)
+        section.left_margin = Inches(1)
+        section.right_margin = Inches(1)
+
+    # Title change requested
+    add_title(doc, "Soc2 Document Report", original_filename)
+
+    extraction_run = payload.get("extraction_run") or {}
+    extracted = payload.get("extracted_elements") or []
+    tables_obj = payload.get("tables") or {}
+    merged_tables = tables_obj.get("merged") or []
+    page_tables = tables_obj.get("page") or []
+
+    generated_est = datetime.now(TORONTO_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+    meta_rows = [
+        ("Document ID", safe_text(extraction_run.get("document_id") or payload.get("document_id") or "")),
+        ("Extraction Run ID", safe_text(extraction_run.get("id") or "")),
+        ("Standard", safe_text(extraction_run.get("standard") or "")),
+        ("Pipeline Version", safe_text(extraction_run.get("pipeline_version") or "")),
+        ("Status", safe_text(extraction_run.get("status") or "")),
+        ("Created At (EST)", format_dt_est(extraction_run.get("created_at"))),
+        ("Completed At (EST)", format_dt_est(extraction_run.get("completed_at"))),
+        ("Generated At (EST)", generated_est),
+        ("Generated By", safe_text(extraction_run.get("uploaded_by") or "")),
+    ]
+    add_kv_table(doc, meta_rows, title="Metadata")
+    doc.add_paragraph()
+
+    # Extracted Fields (NO summary table)
+    doc.add_heading("Extracted Fields", level=1)
+
+    if not extracted:
+        doc.add_paragraph("No extracted fields found.")
+    else:
+        for f in extracted:
+            field_key = safe_text(f.get("field_key") or f.get("field_name") or "Field").strip() or "Field"
+            doc.add_heading(field_key, level=2)
+
+            value = f.get("value")
+            evidence = f.get("evidence") or []
+
+            # Value + Evidence formatting per your new rule
+            add_value_and_evidence(doc, value, evidence)
+            doc.add_paragraph()
+
+    # Tables section (unchanged behavior)
+    doc.add_heading("Tables", level=1)
+
+    if not merged_tables and not page_tables:
+        doc.add_paragraph("No tables found.")
+        return doc
+
+    def render_table_block(t: Dict[str, Any], prefix: str) -> None:
+        title = safe_text(t.get("title") or t.get("table_id") or f"{prefix} Table")
+        cols = t.get("columns") or []
+        rows = t.get("rows") or t.get("rows_json") or []
+        add_table_from_cells(doc, columns=cols, rows=rows, title=title)
+        doc.add_paragraph()
+
+    if merged_tables:
+        doc.add_heading("Merged Tables", level=2)
+        for t in merged_tables:
+            if isinstance(t, dict):
+                render_table_block(t, "Merged")
+
+    if page_tables:
+        doc.add_heading("Page Tables", level=2)
+        for t in page_tables:
+            if isinstance(t, dict):
+                render_table_block(t, "Page")
+
+    return doc
+
+
+# -----------------------------
+# FastAPI endpoint (copy/paste)
+# -----------------------------
+@router.get("/{doc_id}/report")
+def generate_docx_report(
+    doc_id: str,
+    db=Depends(lambda: None),  # TODO: replace with your get_db
+    current_user=Depends(lambda: None),  # TODO: replace with your get_current_user
+):
+    """
+    Replace ONLY the marked TODO blocks with your app code:
+      - Document lookup
+      - _get_latest_completed_run(...)
+      - _format_extraction_run_response(...)
+      - permission checks
+    """
+    # TODO 1) Find document
+    # doc_obj = db.query(Document).filter(Document.id == doc_id).first()
+    doc_obj = None  # <-- replace
+    if not doc_obj:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    # TODO 2) Permissions
+    # if not allowed: raise HTTPException(status_code=403, detail="Not allowed")
+
+    # TODO 3) latest extraction run
+    # latest = _get_latest_completed_run(db=db, document_id=doc_id, username=current_user.username, standard="SOC2")
+    latest = None  # <-- replace
+    if not latest:
+        raise HTTPException(status_code=404, detail="No completed extraction run found for this document")
+
+    # TODO 4) format response payload
+    # payload = _format_extraction_run_response(latest)
+    payload = {}  # <-- replace
+
+    original_filename = getattr(doc_obj, "original_filename", "") or getattr(doc_obj, "filename", "") or doc_id
+    doc = build_soc2_docx_report(payload, original_filename=original_filename)
+
+    filename = f"soc2_document_report_{doc_id}_{datetime.now(TORONTO_TZ).strftime('%Y%m%d_%H%M%S')}.docx"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".docx")
+    tmp_path = tmp.name
+    tmp.close()
+    doc.save(tmp_path)
+
+    return FileResponse(
+        tmp_path,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        filename=filename,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
