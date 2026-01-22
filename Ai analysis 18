@@ -1,0 +1,103 @@
+def add_ui_style_multi_dict_table(
+    doc: DocxDocument,
+    items: List[Dict[str, Any]],
+    evidence_list: List[Dict[str, Any]],
+    max_headers: int = 30,
+) -> None:
+    """
+    UI-style multi-value table:
+    Columns = union(keys across items) + Evidence + Reference
+    Each item -> one row
+    Evidence + Reference appear as last columns.
+    """
+    headers = _collect_headers_for_list_of_dicts(items, max_headers=max_headers)
+    evidence_text, ref_text = _format_evidence_lines(evidence_list)
+
+    cols = headers + ["Evidence", "Reference"]
+    table = doc.add_table(rows=1, cols=len(cols))
+    table.style = "Table Grid"
+
+    # header row
+    hdr = table.rows[0].cells
+    for i, h in enumerate(cols):
+        hdr[i].text = safe_text(h)
+        _set_cell_shading(hdr[i], "EFEFEF")
+
+    # data rows
+    for it in items:
+        row = table.add_row().cells
+
+        # dict fields (render nested if needed)
+        for i, h in enumerate(headers):
+            v = it.get(h)
+            v = normalize_value(v)
+            if isinstance(v, (dict, list)):
+                render_value_as_table_in_cell(row[i], v, depth=0, max_depth=6)
+            else:
+                _set_cell_text(row[i], _safe_scalar(v))
+
+        # Evidence (italic)
+        if evidence_text:
+            _set_cell_text(row[len(headers)], evidence_text, italic=True)
+        else:
+            _set_cell_text(row[len(headers)], "")
+
+        # Reference
+        row[len(headers) + 1].text = ref_text
+
+
+value_obj = normalize_value(el.get("value"))
+evidence_list = el.get("evidence") or []
+
+# ✅ If it's a list of dicts => UI-style horizontal table + evidence columns
+if isinstance(value_obj, list) and value_obj and all(isinstance(x, dict) for x in value_obj):
+    add_ui_style_multi_dict_table(doc, value_obj, evidence_list)
+
+# ✅ Any other list => keep your generic multi table (Item | Value | Evidence | Reference)
+elif isinstance(value_obj, list):
+    add_multi_value_table(doc, value_obj, evidence_list)
+
+# ✅ single scalar/dict => Value/Evidence/Reference 3-row table
+else:
+    add_single_field_table(doc, value_obj, evidence_list)
+
+
+
+import ast
+
+def try_parse_python_literal(s: str) -> Optional[Any]:
+    try:
+        return ast.literal_eval(s)
+    except Exception:
+        return None
+
+def normalize_value(v: Any) -> Any:
+    """
+    Convert stringified JSON or Python-repr into real objects.
+    """
+    if v is None:
+        return None
+
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return ""
+
+        # Try JSON first
+        if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
+            parsed = try_parse_json(s)
+            if parsed is not None:
+                return parsed
+
+            # Try Python literal second (single quotes)
+            parsed2 = try_parse_python_literal(s)
+            if parsed2 is not None:
+                return parsed2
+
+        return s
+
+    return v
+
+
+
+
