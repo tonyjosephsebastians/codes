@@ -34,7 +34,6 @@ useEffect(() => {
     return;
   }
 
-  // 🔒 LOCK sync scroll
   clauseScrollLock.current = true;
   pauseSyncScroll.current = true;
   isSyncingRef.current = true;
