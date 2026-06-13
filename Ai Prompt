@@ -15,11 +15,3 @@ SUBSECTION BOUNDARY RULES (CRITICAL — FOLLOW EXACTLY):
 
 3) Bracket blocks "[...]" are NOT subsection labels.
    They are ALWAYS part of the CURRENT subsection (usually continuing subsection (2)).
-
-4) Paragraph order is POSITION-BOUND:
-   - Do NOT move any paragraph from subsection (2) into subsection (3).
-   - If subsection (2) contains multiple paragraphs, keep them in the same subsection_text
-     in the same order (including blank lines).
-
-5) When unsure whether a line belongs to (2) or (3), use the NEXT explicit label rule:
-   - If the next explicit label "(3)" has not appeared yet, KEEP the text inside (2).
